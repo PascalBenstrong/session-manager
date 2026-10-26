@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Session Manager — preview</title>
+    <link rel="stylesheet" href="../web/ui.css" />
+  </head>
+  <!-- Runs background + UI in one normal page against the mock browser API.
+       node tools/serve.mjs, then open http://localhost:8123/tools/preview.html (add ?popup for popup size) -->
+  <body data-popup="false">
+    <canvas id="sm-canvas"></canvas>
+    <div id="sm-loading">Loading…</div>
+    <script type="module" src="preview.js"></script>
+  </body>
+</html>
