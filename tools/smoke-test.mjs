@@ -655,9 +655,28 @@ await step('ad tabs: tabs opened by a page to a blocked site are closed and logg
   assert.deepEqual(stored().popup_log, []);
 });
 
-await step('inspector: opens a window for a web page, not for browser pages', async () => {
+await step('inspector: docks in the page by default, or opens a window; not for browser pages', async () => {
   const page = await api.tabs.create({ url: 'https://inspect.example/', active: true });
+  // Docked (the default): the content script is injected and asked to dock the inspector.
+  const { executeScript } = api.scripting;
+  const { sendMessage } = api.tabs;
+  const injected = [];
+  const asked = [];
+  api.scripting.executeScript = async (o) => (injected.push(o.files), [{ frameId: 0 }]);
+  api.tabs.sendMessage = async (_tabId, msg) => (asked.push(msg.smInspect), { ok: true, result: null });
+  try {
+    await send({ cmd: 'OpenInspector', tab: page.id });
+  } finally {
+    api.scripting.executeScript = executeScript;
+    api.tabs.sendMessage = sendMessage;
+  }
+  assert.deepEqual(injected, [['inspect.js']]);
+  assert.equal(asked[0].op, 'dock');
+  assert.equal(asked[0].url, `moz-extension://test/inspector.html?tab=${page.id}`);
+  // After choosing a window once.
+  storage.smInspectorDock = false;
   await send({ cmd: 'OpenInspector', tab: page.id });
+  delete storage.smInspectorDock;
   const w = createdWindows[createdWindows.length - 1];
   assert.equal(w.url, `moz-extension://test/inspector.html?tab=${page.id}`);
   assert.equal(w.type, 'popup');

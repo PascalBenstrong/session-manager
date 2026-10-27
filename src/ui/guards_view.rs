@@ -266,7 +266,7 @@ impl GuardsView {
         section_card(
             ui,
             "Inspector",
-            "Inspect a page in a separate window, without the browser's developer tools: pick elements, see the DOM, \
+            "Inspect a page (docked at the bottom of it, or in a window) without the browser's developer tools: pick elements, see the DOM, \
              styles and HTML, list its videos, frames and scripts, and read its source.",
             |ui| {
                 ui.label(RichText::new("Shortcut: Alt+Shift+I inspects the current tab. Or choose an open tab:").small().color(p.muted));

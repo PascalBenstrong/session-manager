@@ -1086,7 +1086,7 @@ impl TabsView {
                         acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: true });
                     }
                     if matches!(crate::url::scheme(&e.url).as_str(), "http" | "https" | "file")
-                        && icon_button(ui, "🔬", "Inspect this page in a separate window").clicked()
+                        && icon_button(ui, "🔬", "Inspect this page").clicked()
                     {
                         acts.send(Command::OpenInspector { tab: e.tab_id });
                     }

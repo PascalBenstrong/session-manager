@@ -1,6 +1,6 @@
 //! Inspector (`inspector.html?tab=ID`): inspects a tab's page without the browser's
 //! developer tools, through a content script in the extension's isolated world
-//! (`web/inspect.js`). It runs in its own window, or docked at the bottom of the page (an
+//! (`web/inspect.js`). It runs docked at the bottom of the page (the default; an
 //! iframe the content script adds, `&dock=TOKEN`). Panes: Elements (live DOM tree, picker,
 //! details, context menus, screenshots), Media & frames (video, frame, script... URLs of
 //! every frame), Ads (the ad networks the page runs) and Source.

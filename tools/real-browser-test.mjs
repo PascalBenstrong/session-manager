@@ -152,6 +152,9 @@ async function chromium() {
   // ---- inspector
   const tabId = await extPage.eval(`chrome.tabs.query({}).then((t) => t.find((x) => (x.url || '').includes('hostile.html')).id)`);
   await command({ cmd: 'OpenInspector', tab: tabId });
+  check('the inspector opens docked by default', await until('the dock', () => page.eval(`!!document.querySelector('sm-inspector-dock')`)).catch(() => false));
+  await extPage.eval(`smPlatform.undockInspector(${tabId}).then(() => chrome.storage.local.set({ smInspectorDock: false })).then(() => true)`);
+  await command({ cmd: 'OpenInspector', tab: tabId });
   const inspector = await until('the inspector window', async () => (await pageTargets()).find((t) => t.url.includes('inspector.html')));
   const insp = await attach(cdp, inspector.targetId);
   await sleep(4000);
@@ -453,7 +456,10 @@ async function firefox() {
   // ---- inspector
   const tabId = await ext.eval(`browser.tabs.query({}).then((t) => t.find((x) => (x.url || '').includes('hostile.html')).id)`);
   await command({ cmd: 'OpenInspector', tab: tabId });
-  await until('the inspector window', async () => (await tabsOpen()).some((u) => u.includes('inspector.html?tab=')));
+  check('the inspector opens docked by default', await until('the dock', () => page.eval(`!!document.querySelector('sm-inspector-dock')`)).catch(() => false));
+  await ext.eval(`smPlatform.undockInspector(${tabId}).then(() => browser.storage.local.set({ smInspectorDock: false })).then(() => true)`);
+  await command({ cmd: 'OpenInspector', tab: tabId });
+  await until('the inspector window', async () => (await tabsOpen()).some((u) => u.includes('inspector.html?tab=') && !u.includes('dock=')));
   await sleep(3000);
   const doc = await ext.json(`smPlatform.inspectorInject(${tabId}).then(() => smPlatform.inspect(${tabId}, { op: 'root' }))`);
   check('the inspector reads the page', doc.title === 'Hostile test page' && doc.node.tag === 'html');

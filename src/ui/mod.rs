@@ -715,7 +715,7 @@ impl App {
                 if self.popup && icon_button(ui, "⛶", "Open the full manager in a tab").clicked() {
                     open_manager("");
                 }
-                if self.popup && icon_button(ui, "🔬", "Inspect this page in a separate window (Alt+Shift+I)").clicked() {
+                if self.popup && icon_button(ui, "🔬", "Inspect this page (Alt+Shift+I)").clicked() {
                     self.send(Command::OpenInspector { tab: None });
                     self.close_when_done = true;
                 }

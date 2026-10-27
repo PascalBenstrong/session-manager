@@ -361,10 +361,10 @@ export function installPlatform(api, overrides = {}) {
 
     // ---- inspector ----
 
-    /** Opens the inspector for a tab where the user last had it: in a window, or docked. */
+    /** Opens the inspector for a tab where the user last had it: docked (the default) or in a window. */
     async openInspector(tabId) {
       const { smInspectorDock } = await api.storage.local.get('smInspectorDock');
-      if (smInspectorDock) return platform.dockInspector(tabId);
+      if (smInspectorDock !== false) return platform.dockInspector(tabId);
       const url = api.runtime.getURL(`inspector.html?tab=${tabId}`);
       await api.windows.create({ url, type: 'popup', width: 1100, height: 780 });
     },
