@@ -34,6 +34,10 @@ extern "C" {
     fn js_group_tabs(ids: JsValue, title: &str, window_id: f64) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = ungroupTabs)]
     fn js_ungroup_tabs(ids: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = discardTabs)]
+    fn js_discard_tabs(ids: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = mediaCommand)]
+    fn js_media_command(tab_id: f64, cmd: &str, audio: bool) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getAllCookies)]
     fn js_get_all_cookies() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = removeCookie)]
@@ -171,6 +175,24 @@ pub async fn group_tabs(ids: &[TabId], title: &str, window_id: TabId) -> Result<
 
 pub async fn ungroup_tabs(ids: &[TabId]) -> Result<()> {
     call(js_ungroup_tabs(to_js(ids))).await.map(drop)
+}
+
+#[derive(Deserialize)]
+pub struct Discarded {
+    /// Ids of the hibernated tabs (Chromium may give a tab a new id when discarding it).
+    pub discarded: Vec<TabId>,
+    pub errors: Vec<String>,
+}
+
+/// Unloads tabs (keeping them in the tab strip).
+pub async fn discard_tabs(ids: &[TabId]) -> Result<Discarded> {
+    call_as(js_discard_tabs(to_js(ids))).await
+}
+
+/// Sends `"pause"` / `"resume"` to the media content script of every frame of a tab.
+/// `audio` includes audio-only media. Tabs without the content script are ignored.
+pub async fn media_command(tab_id: TabId, cmd: &str, audio: bool) {
+    let _ = call(js_media_command(tab_id as f64, cmd, audio)).await;
 }
 
 // ---- cookies / site data ----

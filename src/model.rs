@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::cleanup::{CleanupReport, CleanupRule};
 use crate::dedupe::DedupeOptions;
+use crate::media::{MediaSettings, MediaState};
 use crate::organize::OrganizeKey;
 use crate::pattern::SitePattern;
 use crate::url;
+use crate::workspace::Workspace;
 
 pub type Id = u64;
 /// Browser-assigned tab / window id.
@@ -31,6 +33,13 @@ pub struct TabEntry {
     pub created_at: f64,
     /// Last time the tab was activated (ms since epoch). Used for "find last open tab".
     pub last_accessed: f64,
+    /// The open tab is hibernated (discarded by the browser: kept, but not loaded).
+    pub discarded: bool,
+    /// Title of the native browser tab group the open tab is in.
+    pub browser_group: Option<String>,
+    pub workspace: Option<Id>,
+    /// The workspace was chosen by the user; workspace rules leave the entry alone.
+    pub workspace_manual: bool,
 }
 
 impl TabEntry {
@@ -44,6 +53,11 @@ impl TabEntry {
 
     pub fn is_open(&self) -> bool {
         self.tab_id.is_some()
+    }
+
+    /// Open, but unloaded by the browser to save memory.
+    pub fn is_hibernated(&self) -> bool {
+        self.is_open() && self.discarded
     }
 
     pub fn display_title(&self) -> &str {
@@ -158,6 +172,64 @@ pub struct Settings {
     pub dedupe_on_startup: bool,
     /// Before loading a session's tabs, remove its duplicates so only one copy is opened.
     pub dedupe_on_session_load: bool,
+    /// Which tabs may play media while in the background.
+    pub media: MediaSettings,
+    /// How the tab list looks.
+    pub tab_list: TabListSettings,
+}
+
+/// How the Tabs view lists tabs.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TabGrouping {
+    #[default]
+    Workspace,
+    None,
+    Domain,
+    Host,
+    Group,
+    Tag,
+}
+
+impl TabGrouping {
+    pub const ALL: [TabGrouping; 6] =
+        [TabGrouping::Workspace, TabGrouping::None, TabGrouping::Domain, TabGrouping::Host, TabGrouping::Group, TabGrouping::Tag];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TabGrouping::Workspace => "Workspace",
+            TabGrouping::None => "None",
+            TabGrouping::Domain => "Domain",
+            TabGrouping::Host => "Host",
+            TabGrouping::Group => "Group",
+            TabGrouping::Tag => "Tag",
+        }
+    }
+
+    pub fn organize_key(self) -> Option<OrganizeKey> {
+        match self {
+            TabGrouping::Domain => Some(OrganizeKey::Domain),
+            TabGrouping::Host => Some(OrganizeKey::Host),
+            TabGrouping::Group => Some(OrganizeKey::Group),
+            TabGrouping::Tag => Some(OrganizeKey::Tag),
+            TabGrouping::Workspace | TabGrouping::None => None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct TabListSettings {
+    pub grouping: TabGrouping,
+    /// One-line rows.
+    pub compact: bool,
+    /// Show tag and group chips on rows.
+    pub show_labels: bool,
+}
+
+impl Default for TabListSettings {
+    fn default() -> Self {
+        Self { grouping: TabGrouping::Workspace, compact: false, show_labels: true }
+    }
 }
 
 impl Default for Settings {
@@ -174,6 +246,8 @@ impl Default for Settings {
             prevent_duplicates: false,
             dedupe_on_startup: false,
             dedupe_on_session_load: false,
+            media: MediaSettings::default(),
+            tab_list: TabListSettings::default(),
         }
     }
 }
@@ -192,6 +266,10 @@ pub struct AppState {
     pub ignored_tab_ids: BTreeSet<TabId>,
     /// Most recent cleanup results (newest first, bounded).
     pub cleanup_log: Vec<CleanupReport>,
+    /// Shared by all sessions, in display order.
+    pub workspaces: Vec<Workspace>,
+    /// Media currently playing in tabs, and tabs we paused (for the media limit).
+    pub media: MediaState,
 }
 
 impl Default for AppState {
@@ -206,6 +284,8 @@ impl Default for AppState {
             cleanup_rules: Vec::new(),
             ignored_tab_ids: BTreeSet::new(),
             cleanup_log: Vec::new(),
+            workspaces: Vec::new(),
+            media: MediaState::default(),
         };
         let id = s.alloc_id();
         s.sessions.push(Session { id, name: "Default".into(), ..Default::default() });
@@ -263,4 +343,10 @@ pub struct BrowserTab {
     pub pinned: bool,
     pub active: bool,
     pub discarded: bool,
+    /// Playing sound.
+    pub audible: bool,
+    /// Last time the tab was active (ms since epoch; 0 if the browser doesn't say).
+    pub last_accessed: f64,
+    /// Title of the native tab group the tab is in.
+    pub group_title: Option<String>,
 }

@@ -52,9 +52,11 @@ impl AppState {
             .chain(self.sessions.iter().flat_map(|s| s.snapshots.iter().map(|x| x.id)))
             .chain(self.auto_rules.iter().map(|r| r.id))
             .chain(self.cleanup_rules.iter().map(|r| r.id))
+            .chain(self.workspaces.iter().map(|w| w.id))
             .max()
             .unwrap_or(0);
         self.next_id = self.next_id.max(max_id + 1);
+        self.drop_dangling_workspaces();
     }
 
     pub fn locate_tab(&self, tab_id: TabId) -> Option<EntryRef> {
@@ -123,12 +125,18 @@ impl AppState {
                 e.fav_icon_url = tab.fav_icon_url.clone();
             }
             e.pinned = tab.pinned;
+            e.discarded = tab.discarded;
             e.window_id = Some(tab.window_id);
             if tab.active {
                 e.last_accessed = e.last_accessed.max(now);
             }
+            let group_changed = e.browser_group != tab.group_title;
+            e.browser_group = tab.group_title.clone();
             if url_changed {
                 self.apply_auto_rules(&mut e);
+            }
+            if url_changed || group_changed {
+                self.place_entry(&mut e);
             }
             let changed = e != before;
             *self.entry_mut(r).expect("located") = e;
@@ -140,6 +148,7 @@ impl AppState {
         let id = self.alloc_id();
         let mut e = entry_from_tab(id, tab, now);
         self.apply_auto_rules(&mut e);
+        self.place_entry(&mut e);
         let active = self.active_session;
         match self.session_mut(active) {
             Some(s) => s.entries.push(e),
@@ -151,11 +160,14 @@ impl AppState {
     /// A browser tab was closed.
     pub fn on_tab_removed(&mut self, tab_id: TabId, window_closing: bool) -> bool {
         self.ignored_tab_ids.remove(&tab_id);
-        let Some(r) = self.locate_tab(tab_id) else { return false };
+        let media = self.media.forget_tab(tab_id);
+        let Some(r) = self.locate_tab(tab_id) else { return media };
         if window_closing && self.settings.keep_tabs_on_window_close {
             let e = self.entry_mut(r).expect("located");
             e.tab_id = None;
             e.window_id = None;
+            e.discarded = false;
+            e.browser_group = None;
         } else if let Some(s) = self.session_mut(r.session) {
             s.entries.retain(|e| e.id != r.entry);
         }
@@ -177,6 +189,7 @@ impl AppState {
         if self.ignored_tab_ids.remove(&removed) {
             self.ignored_tab_ids.insert(added);
         }
+        self.media.replace_tab(added, removed);
         match self.locate_tab(removed) {
             Some(r) => {
                 self.entry_mut(r).expect("located").tab_id = Some(added);
@@ -198,6 +211,8 @@ impl AppState {
         if let Some(e) = self.entry_mut(r) {
             e.tab_id = Some(tab.id);
             e.window_id = Some(tab.window_id);
+            e.discarded = tab.discarded;
+            e.browser_group = tab.group_title.clone();
         }
     }
 
@@ -212,10 +227,14 @@ impl AppState {
                     match by_id.get(&id) {
                         Some(t) if t.url == e.url && !linked.contains(&id) => {
                             linked.insert(id);
+                            e.discarded = t.discarded;
+                            e.browser_group = t.group_title.clone();
                         }
                         _ => {
                             e.tab_id = None;
                             e.window_id = None;
+                            e.discarded = false;
+                            e.browser_group = None;
                         }
                     }
                 }
@@ -223,6 +242,7 @@ impl AppState {
         }
         let open: BTreeSet<TabId> = tabs.iter().map(|t| t.id).collect();
         self.ignored_tab_ids.retain(|id| open.contains(id));
+        self.media.retain_open(&open);
 
         for t in tabs {
             if linked.contains(&t.id) || self.ignored_tab_ids.contains(&t.id) {
@@ -256,6 +276,8 @@ impl AppState {
         let e = &mut self.sessions[si].entries[ei];
         e.tab_id = Some(t.id);
         e.window_id = Some(t.window_id);
+        e.discarded = t.discarded;
+        e.browser_group = t.group_title.clone();
         true
     }
 
@@ -330,6 +352,7 @@ impl AppState {
                 n += changed as usize;
             }
         }
+        self.auto_place(Some(refs), false);
         n
     }
 
@@ -342,6 +365,7 @@ impl AppState {
                 e.group = group.clone();
             }
         }
+        self.auto_place(Some(refs), false);
         n
     }
 
@@ -364,14 +388,18 @@ impl AppState {
 
     /// Copy of an entry with a fresh id and no live tab.
     fn fresh_entry(&mut self, e: &TabEntry) -> TabEntry {
-        TabEntry { id: self.alloc_id(), tab_id: None, window_id: None, ..e.clone() }
+        TabEntry { id: self.alloc_id(), tab_id: None, window_id: None, discarded: false, browser_group: None, ..e.clone() }
     }
 
     pub fn create_snapshot(&mut self, session: Id, name: &str, auto: bool, now: f64) -> Result<Id, String> {
         let id = self.alloc_id();
         let max_auto = self.settings.max_auto_snapshots.max(1) as usize;
         let s = self.session_mut(session).ok_or("no such session")?;
-        let entries = s.entries.iter().map(|e| TabEntry { tab_id: None, window_id: None, ..e.clone() }).collect();
+        let entries = s
+            .entries
+            .iter()
+            .map(|e| TabEntry { tab_id: None, window_id: None, discarded: false, browser_group: None, ..e.clone() })
+            .collect();
         let name = match name.trim() {
             "" => format!("Snapshot {}", s.snapshots.len() + 1),
             n => n.to_string(),
@@ -415,6 +443,7 @@ impl AppState {
                 let entries: Vec<TabEntry> = snap.entries.iter().map(|e| self.fresh_entry(e)).collect();
                 let added = entries.iter().map(|e| e.id).collect();
                 self.session_mut(target).expect("created").entries = entries;
+                self.drop_dangling_workspaces();
                 Ok((target, added))
             }
             RestoreMode::Merge => {
@@ -423,6 +452,7 @@ impl AppState {
                     snap.entries.iter().filter(|e| !existing.contains(&e.url)).map(|e| self.fresh_entry(e)).collect();
                 let added = entries.iter().map(|e| e.id).collect();
                 self.session_mut(session).expect("checked").entries.extend(entries);
+                self.drop_dangling_workspaces();
                 Ok((session, added))
             }
             RestoreMode::Replace => {
@@ -446,6 +476,7 @@ impl AppState {
                 // Tabs that are open but not part of the snapshot stay open, untracked.
                 self.ignored_tab_ids.extend(open.iter().filter_map(|e| e.tab_id));
                 self.session_mut(session).expect("checked").entries = restored;
+                self.drop_dangling_workspaces();
                 Ok((session, added))
             }
         }
@@ -483,6 +514,7 @@ impl AppState {
         for u in urls.iter().filter(|u| !existing.contains(*u)) {
             let mut e = TabEntry { id: self.alloc_id(), url: u.clone(), created_at: now, ..Default::default() };
             self.apply_auto_rules(&mut e);
+            self.place_entry(&mut e);
             entries.push(e);
         }
         let added = entries.iter().map(|e| e.id).collect();
@@ -499,12 +531,20 @@ impl AppState {
                 name = format!("{name} (imported)");
             }
             let id = self.create_session(&name, now);
-            let entries: Vec<TabEntry> = s.entries.iter().map(|e| self.fresh_entry(e)).collect();
+            // Workspace ids of another installation mean nothing here.
+            let mut entries: Vec<TabEntry> = s.entries.iter().map(|e| self.fresh_entry(e)).collect();
+            for e in &mut entries {
+                e.workspace = None;
+                e.workspace_manual = false;
+                self.place_entry(e);
+            }
             for snap in &mut s.snapshots {
                 snap.id = self.alloc_id();
                 for e in &mut snap.entries {
                     e.tab_id = None;
                     e.window_id = None;
+                    e.workspace = None;
+                    e.workspace_manual = false;
                 }
             }
             let target = self.session_mut(id).expect("created");
@@ -541,6 +581,10 @@ pub fn entry_from_tab(id: Id, tab: &BrowserTab, now: f64) -> TabEntry {
         window_id: Some(tab.window_id),
         created_at: now,
         last_accessed: if tab.active { now } else { 0.0 },
+        discarded: tab.discarded,
+        browser_group: tab.group_title.clone(),
+        workspace: None,
+        workspace_manual: false,
     }
 }
 

@@ -531,6 +531,14 @@ impl App {
                 );
                 ui.close();
             }
+            if ui
+                .button("💤 Hibernate all tabs")
+                .on_hover_text("Unload every open tab except active and pinned tabs and tabs playing media")
+                .clicked()
+            {
+                self.send(Command::Hibernate { target: crate::hibernate::HibernateTarget::All, force: false });
+                ui.close();
+            }
             if ui.button("📸 Save snapshot").on_hover_text("Save the current tab list as a revision").clicked() {
                 self.send(Command::CreateSnapshot { session: session.id, name: String::new() });
                 ui.close();

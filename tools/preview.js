@@ -40,6 +40,23 @@ await send({ cmd: 'MoveEntries', entries: ref((e) => e.url.includes('ycombinator
 const ycTab = [...mock.tabs.values()].find((t) => t.url.includes('ycombinator'));
 await mock.api.tabs.remove(ycTab.id);
 
+await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Rust', color: 'Orange', icon: '💻', auto_add: true,
+  rules: [{ Query: 'tag:rust' }, { Site: { kind: 'Domain', value: 'github.com' } }] } });
+await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Reading', color: 'Purple', icon: '📚', auto_add: true,
+  rules: [{ Group: 'Read later' }] } });
+await send({ cmd: 'AssignWorkspace', entries: ref((e) => e.url.includes('mozilla')), workspace: null });
+const mdn = [...mock.tabs.values()].find((t) => t.url.includes('mozilla'));
+await mock.api.tabs.discard(mdn.id);
+mock.ev.updated.fire(mdn.id, { discarded: true }, mock.clone(mock.tabs.get(mdn.id)));
+const { state: st2 } = await send({ cmd: 'GetState' });
+// ?compact — one-line rows; ?group=Domain — list grouping.
+const params = new URLSearchParams(location.search);
+const tabList = { ...st2.settings.tab_list, compact: params.has('compact'), grouping: params.get('group') || 'Workspace' };
+await send({ cmd: 'UpdateSettings', settings: { ...st2.settings, tab_list: tabList,
+  media: { ...st2.settings.media, policy: 'LimitBackground', max_background: 2 } } });
+const egui = [...mock.tabs.values()].find((t) => t.url.includes('emilk'));
+mock.ev.message.fire({ smMedia: { playing: true, video: true, pip: false } }, { tab: { id: egui.id }, frameId: 0 }, () => {});
+
 await send({ cmd: 'CreateSnapshot', session: s.id, name: 'Before cleanup' });
 await mock.api.tabs.create({ url: 'https://example.org/new-after-snapshot', title: 'New page' });
 

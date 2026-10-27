@@ -14,7 +14,22 @@ export function tabOut(t) {
     pinned: !!t.pinned,
     active: !!t.active,
     discarded: !!t.discarded,
+    audible: !!t.audible,
+    lastAccessed: t.lastAccessed || 0,
+    groupTitle: null,
   };
+}
+
+/** Like tabOut, with the title of the native tab group the tab is in. */
+export async function tabOutWithGroup(api, t, titles = new Map()) {
+  const out = tabOut(t);
+  if (api.tabGroups && t.groupId != null && t.groupId >= 0) {
+    if (!titles.has(t.groupId)) {
+      titles.set(t.groupId, api.tabGroups.get(t.groupId).then((g) => g.title || null, () => null));
+    }
+    out.groupTitle = await titles.get(t.groupId);
+  }
+  return out;
 }
 
 export function cookieOut(c) {
@@ -43,6 +58,16 @@ export function installPlatform(api, overrides = {}) {
     emit(ev).catch((e) => console.error('[session-manager] event failed', ev.type, e));
   }
 
+  // Tab events are fired in the order they happened, even when one has to wait for its
+  // tab group title.
+  let tabEvents = Promise.resolve();
+  function fireInOrder(make) {
+    tabEvents = tabEvents.then(make).then(
+      (ev) => ev && fire(ev),
+      (e) => console.error('[session-manager] could not read tab event', e),
+    );
+  }
+
   const platform = {
     info() {
       return { browser: 'unknown', tabGroups: !!(api.tabs.group && api.tabGroups), perHostCache: false };
@@ -50,7 +75,8 @@ export function installPlatform(api, overrides = {}) {
 
     // ---- tabs ----
     async queryTabs() {
-      return (await api.tabs.query({})).map(tabOut);
+      const titles = new Map();
+      return Promise.all((await api.tabs.query({})).map((t) => tabOutWithGroup(api, t, titles)));
     },
 
     /** A tab by id, or (id == null) the active tab of the last focused window. */
@@ -108,6 +134,31 @@ export function installPlatform(api, overrides = {}) {
 
     async ungroupTabs(ids) {
       if (api.tabs.ungroup && ids.length) await api.tabs.ungroup(ids);
+    },
+
+    /** Unloads tabs. Resolves to { discarded: ids, errors: messages }. */
+    async discardTabs(ids) {
+      const discarded = [];
+      const errors = [];
+      for (const id of ids) {
+        try {
+          // Chromium resolves to the discarded tab (whose id may change); Firefox to nothing.
+          const t = await api.tabs.discard(id);
+          discarded.push(t && t.id != null ? t.id : id);
+        } catch (e) {
+          errors.push(String(e && e.message ? e.message : e));
+        }
+      }
+      return { discarded, errors };
+    },
+
+    /** Asks the media content script in every frame of a tab to "pause" or "resume". */
+    async mediaCommand(tabId, cmd, audio) {
+      try {
+        await api.tabs.sendMessage(tabId, { smMediaCmd: cmd, audio: !!audio });
+      } catch {
+        // No content script in this tab (internal page, or opened before the install).
+      }
     },
 
     // ---- cookies / site data ----
@@ -268,25 +319,48 @@ export function installPlatform(api, overrides = {}) {
           .then(() => api.action?.setBadgeBackgroundColor({ color: '#7c6cf6' }))
           .catch(() => {});
       });
-      const TRACKED = ['url', 'title', 'favIconUrl', 'pinned', 'discarded'];
+      const TRACKED = ['url', 'title', 'favIconUrl', 'pinned', 'discarded', 'groupId'];
+      const withGroup = (tab) => tabOutWithGroup(api, tab);
       api.runtime.onStartup?.addListener(() => fire({ type: 'browserStartup' }));
-      api.tabs.onCreated.addListener((tab) => fire({ type: 'tabCreated', tab: tabOut(tab) }));
+      api.tabs.onCreated.addListener((tab) => fireInOrder(async () => ({ type: 'tabCreated', tab: await withGroup(tab) })));
       api.tabs.onUpdated.addListener((_id, change, tab) => {
         if (!TRACKED.some((k) => k in change)) return;
-        fire({ type: 'tabUpdated', tab: tabOut(tab), urlChanged: 'url' in change });
+        fireInOrder(async () => ({ type: 'tabUpdated', tab: await withGroup(tab), urlChanged: 'url' in change }));
       });
       api.tabs.onRemoved.addListener((tabId, info) =>
-        fire({ type: 'tabRemoved', tabId, windowClosing: !!(info && info.isWindowClosing) }),
+        fireInOrder(() => ({ type: 'tabRemoved', tabId, windowClosing: !!(info && info.isWindowClosing) })),
       );
-      api.tabs.onActivated.addListener((info) => fire({ type: 'tabActivated', tabId: info.tabId }));
+      api.tabs.onActivated.addListener((info) => fireInOrder(() => ({ type: 'tabActivated', tabId: info.tabId })));
       if (api.tabs.onReplaced) {
-        api.tabs.onReplaced.addListener((added, removed) => fire({ type: 'tabReplaced', added, removed }));
+        api.tabs.onReplaced.addListener((added, removed) => fireInOrder(() => ({ type: 'tabReplaced', added, removed })));
       }
+      // A renamed native tab group: its tabs' group title changed.
+      api.tabGroups?.onUpdated?.addListener((group) => {
+        fireInOrder(async () => {
+          const titles = new Map([[group.id, Promise.resolve(group.title || null)]]);
+          for (const tab of await api.tabs.query({ groupId: group.id })) {
+            fire({ type: 'tabUpdated', tab: await tabOutWithGroup(api, tab, titles), urlChanged: false });
+          }
+        });
+      });
       api.cookies.onChanged.addListener((info) => {
         if (!info.removed) fire({ type: 'cookieSet', cookie: cookieOut(info.cookie) });
       });
       api.alarms.onAlarm.addListener((alarm) => fire({ type: 'alarm', name: alarm.name }));
-      api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+        // Playback reported by the media content script (web/media.js).
+        if (msg && msg.smMedia && sender && sender.tab) {
+          const m = msg.smMedia;
+          fireInOrder(() => ({
+            type: 'mediaState',
+            tabId: sender.tab.id,
+            frameId: sender.frameId ?? 0,
+            playing: !!m.playing,
+            video: !!m.video,
+            pip: !!m.pip,
+          }));
+          return false;
+        }
         if (!msg || typeof msg.smPayload !== 'string') return false;
         emit({ type: 'message', payload: msg.smPayload }).then(
           (r) => sendResponse({ smResponse: r }),

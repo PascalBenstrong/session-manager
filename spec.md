@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.2.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.3.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -21,12 +21,29 @@ Version: 0.2.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Create, rename and delete sessions, and move tabs between sessions.
 - After a browser restart, re-link saved tabs to the open tabs.
 
+## Workspaces
+- Allow grouping tabs into workspaces. Workspaces are shared by all sessions; a tab is in at most one.
+- Each workspace has a name, a color (the browsers' tab group colors) and an icon.
+- Clicking a workspace in the tab list expands its settings. Tabs can be dragged onto a workspace, or moved with the tab editor and the bulk actions.
+- Rules add tabs to a workspace automatically when they are opened or change (page, group or tags): when the URL matches a site pattern, when the tab is added to a group (the extension's groups or the browser's native tab groups), when it has a tag, or when it matches a search. The first workspace (in display order) with a matching rule wins. Rules never take a tab out of a workspace, and leave tabs the user placed by hand alone (until the user lets the rules decide again).
+- Allow searching in one or more workspaces, or across all workspaces.
+- Deleting a workspace keeps its tabs, without a workspace.
+
+## Hibernating tabs
+- Allow hibernating (unloading) tabs: all browser tabs, a session's, a workspace's, the tabs matching a search, tabs not used for a while, or a single tab. Hibernated tabs stay open and reload when selected.
+- Active tabs are never hibernated. Pinned tabs and tabs playing media are skipped, unless hibernation is forced.
+
+## Media playback
+- Optionally allow media to play only in the active tab (of each window), or in at most N background tabs besides the active ones. When there are more, the least recently used background tabs are paused.
+- Media paused this way resumes when its tab becomes active (configurable).
+- Only video counts by default; audio can be included. Picture-in-picture video can keep playing.
+
 ## Search
-- Search tabs by keyword, title, URL, host, domain, custom tags and groups.
+- Search tabs by keyword, title, URL, host, domain, custom tags, groups and workspace.
 - Match by text appearing (contains), exact match, prefix, suffix, glob and regular expression, with optional case sensitivity.
 - Optionally search only in certain groups, or across all sessions.
-- Support negation and state filters: open, unloaded, pinned, grouped, ungrouped, tagged, duplicate.
-- Allow adding all tabs that match a search to a group or custom tag (and untagging, moving, removing or closing them).
+- Support negation and state filters: open, unloaded, hibernated, playing media, pinned, grouped, ungrouped, tagged, duplicate, and not used for a given time.
+- Allow adding all tabs that match a search to a group, custom tag or workspace (and untagging, moving, hibernating, removing or closing them).
 
 ## Organizing
 - Allow re-organizing browser tabs by domain/host, custom tags or groups, optionally as native tab groups where the browser supports them.
@@ -70,6 +87,7 @@ Version: 0.2.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
   - A compact layout on narrow windows.
 - Modern look with dark and light themes. Follows the system by default and can be switched; the choice is remembered.
 - Clicking anywhere on a tab row switches to that tab, or opens it if it is unloaded.
+- The tab list can be customized: grouped by workspace (default), domain, host, group, tag or not at all; compact rows; tag and group chips shown or hidden. The choice is remembered.
 - Destructive actions ask for confirmation. Results and errors appear as notifications.
 
 ## Release notes
@@ -83,3 +101,5 @@ Version: 0.2.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - "Clean up whenever a new value is set" applies to cookies only. Other storage has no change events extensions can observe.
 - File pickers close extension popups, so saving and importing happen in the manager page.
 - Grouping by domain uses a heuristic registrable domain (common `co.uk`-style suffixes), not the full Public Suffix List.
+- The media limit relies on a content script, which only runs in pages loaded after the extension was installed or updated, and not in browser-internal pages.
+- Browsers refuse to hibernate the active tab. Chromium may give a hibernated tab a new id; the extension follows the change.

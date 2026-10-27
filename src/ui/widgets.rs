@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Margin, RichText, Sense, Stroke, Vec2};
 
 use super::theme::{self, CARD_RADIUS, RADIUS};
-use crate::model::Session;
+use crate::model::{Session, TabEntry};
 use crate::pattern::{PatternKind, SitePattern};
+use crate::workspace::{Workspace, WorkspaceColor};
 
 pub fn session_label(s: &Session, active: bool) -> String {
     format!("{}{}", if active { "★ " } else { "" }, s.name)
@@ -17,6 +18,11 @@ pub fn label_color(text: &str) -> Color32 {
     let h = text.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
     let hue = (h % 360) as f32 / 360.0;
     egui::ecolor::Hsva::new(hue, 0.55, 0.78, 1.0).into()
+}
+
+pub fn ws_color(c: WorkspaceColor) -> Color32 {
+    let [r, g, b] = c.rgb();
+    Color32::from_rgb(r, g, b)
 }
 
 // ---------------------------------------------------------------- containers
@@ -113,6 +119,28 @@ pub fn chip(ui: &mut egui::Ui, text: &str, kind: ChipKind) -> egui::Response {
     pill(ui, &label, color, color.gamma_multiply(0.16), Sense::hover())
 }
 
+/// A workspace pill: its icon and name in its color.
+pub fn workspace_chip(ui: &mut egui::Ui, ws: &Workspace) -> egui::Response {
+    let color = ws_color(ws.color);
+    pill(ui, &ws.label(), color, color.gamma_multiply(0.16), Sense::hover())
+}
+
+/// Round color swatch for color pickers.
+pub fn color_swatch(ui: &mut egui::Ui, color: Color32, selected: bool, tooltip: &str) -> egui::Response {
+    let p = theme::palette(ui);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let c = rect.center();
+        if selected {
+            ui.painter().circle_stroke(c, 11.0, Stroke::new(2.0, p.text));
+        } else if resp.hovered() {
+            ui.painter().circle_stroke(c, 11.0, Stroke::new(1.0, p.muted));
+        }
+        ui.painter().circle_filled(c, 8.0, color);
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tooltip)
+}
+
 /// Count badge, e.g. next to navigation items.
 pub fn badge(ui: &mut egui::Ui, text: &str, highlighted: bool) {
     let p = theme::palette(ui);
@@ -122,7 +150,11 @@ pub fn badge(ui: &mut egui::Ui, text: &str, highlighted: bool) {
 
 /// Rounded square with the first letter of `text`, colored by `text` (favicon stand-in).
 pub fn avatar(ui: &mut egui::Ui, text: &str, dimmed: bool) -> egui::Rect {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+    avatar_sized(ui, text, dimmed, 30.0)
+}
+
+pub fn avatar_sized(ui: &mut egui::Ui, text: &str, dimmed: bool, size: f32) -> egui::Rect {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let mut color = label_color(text);
     if dimmed {
         color = color.gamma_multiply(0.45);
@@ -134,15 +166,26 @@ pub fn avatar(ui: &mut egui::Ui, text: &str, dimmed: bool) -> egui::Rect {
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_else(|| "•".into());
     ui.painter().rect_filled(rect, RADIUS, color.gamma_multiply(0.2));
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, letter, FontId::proportional(15.0), color);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, letter, FontId::proportional(size / 2.0), color);
     rect
 }
 
+/// Color of a tab's status dot: loaded, hibernated or not open.
+pub fn tab_state_color(ui: &egui::Ui, e: &TabEntry) -> Color32 {
+    let p = theme::palette(ui);
+    if !e.is_open() {
+        p.muted
+    } else if e.discarded {
+        p.warn
+    } else {
+        p.success
+    }
+}
+
 /// Small status dot drawn at the bottom-right corner of an avatar.
-pub fn status_dot(ui: &egui::Ui, avatar: egui::Rect, open: bool) {
+pub fn status_dot(ui: &egui::Ui, avatar: egui::Rect, fill: Color32) {
     let p = theme::palette(ui);
     let center = avatar.right_bottom() - Vec2::splat(2.0);
-    let fill = if open { p.success } else { p.muted };
     ui.painter().circle_filled(center, 5.0, p.surface);
     ui.painter().circle_filled(center, 3.5, fill);
 }

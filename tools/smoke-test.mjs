@@ -11,7 +11,7 @@ import { createMockBrowser } from './mock-browser.js';
 const browserName = process.argv[2] || 'firefox';
 const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', browserName);
 
-const { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, ev, clone } = createMockBrowser();
+const { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, ev, clone } = createMockBrowser();
 globalThis.browser = api;
 globalThis.chrome = api;
 
@@ -397,6 +397,112 @@ await step('auto-remove duplicates after the browser restarts and restores tabs'
   await tick();
   assert.ok(stored().sessions.find((s) => s.id === active).entries.some((e) => e.tab_id === late.id));
   await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, dedupe_on_startup: false } });
+});
+
+await step('workspaces: rules place new tabs, group rules, manual choice, delete', async () => {
+  const site = { Site: { kind: 'Domain', value: 'rules.example' } };
+  let r = await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Rules', color: 'Green', icon: '💻', auto_add: true, rules: [site] } });
+  const ws = r.state.workspaces.find((w) => w.name === 'Rules');
+  assert.equal(ws.color, 'Green');
+  const t = await api.tabs.create({ url: 'https://docs.rules.example/a' });
+  await tick();
+  const entry = () => stored().sessions.flatMap((s) => s.entries).find((e) => e.tab_id === t.id);
+  assert.equal(entry().workspace, ws.id, 'new tab placed by its URL');
+
+  r = await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Later', rules: [{ Group: 'read later' }] } });
+  const later = r.state.workspaces.find((w) => w.name === 'Later');
+  const t2 = await api.tabs.create({ url: 'https://plain.example/article' });
+  await tick();
+  const entry2 = () => stored().sessions.flatMap((s) => s.entries).find((e) => e.tab_id === t2.id);
+  const session = stored().sessions.find((s) => s.entries.some((e) => e.tab_id === t2.id));
+  const ref = { session: session.id, entry: entry2().id };
+  assert.equal(entry2().workspace, null);
+  // Adding a tab to a group places it in that group's workspace...
+  await send({ cmd: 'SetGroup', entries: [ref], group: 'Read Later' });
+  assert.equal(entry2().workspace, later.id);
+  // ...but a choice made by hand sticks.
+  await send({ cmd: 'AssignWorkspace', entries: [ref], workspace: ws.id });
+  await send({ cmd: 'SetGroup', entries: [ref], group: 'read later' });
+  assert.equal(entry2().workspace, ws.id);
+  assert.ok(entry2().workspace_manual);
+  r = await send({ cmd: 'AutoPlaceEntries', entries: [ref] });
+  assert.equal(entry2().workspace, later.id, 'rules decide again');
+  // A tab matching several workspaces goes to the first one.
+  await send({ cmd: 'SetGroup', entries: [{ session: session.id, entry: entry().id }], group: 'read later' });
+  assert.equal(entry().workspace, ws.id);
+
+  await send({ cmd: 'MoveWorkspace', id: later.id, delta: -1 });
+  assert.deepEqual(stored().workspaces.map((w) => w.name), ['Later', 'Rules']);
+  await send({ cmd: 'DeleteWorkspace', id: later.id });
+  assert.equal(entry2().workspace, null, 'tabs of a deleted workspace stay, without a workspace');
+  const bad = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'x', rules: [{ Query: '/(/' }] } })));
+  assert.ok(!bad.ok && /regex/.test(bad.error));
+});
+
+await step('hibernate: all tabs skips active / pinned; force includes pinned', async () => {
+  for (const t of tabs.values()) t.discarded = false;
+  const pinned = await api.tabs.create({ url: 'https://pinned.example/', pinned: true });
+  const active = await api.tabs.create({ url: 'https://active.example/', active: true });
+  await tick();
+  let r = await send({ cmd: 'Hibernate', target: 'All', force: false });
+  assert.match(r.info, /Hibernated \d+ tab/);
+  assert.ok(!tabs.get(active.id).discarded, 'active tab stays loaded');
+  assert.ok(!tabs.get(pinned.id).discarded, 'pinned tab stays loaded');
+  assert.ok([...tabs.values()].filter((t) => !t.active && !t.pinned).every((t) => t.discarded));
+  for (const e of stored().sessions.flatMap((s) => s.entries).filter((e) => e.tab_id)) {
+    assert.equal(e.discarded, tabs.get(e.tab_id).discarded, 'entries show which tabs are hibernated');
+  }
+  r = await send({ cmd: 'Hibernate', target: 'All', force: false });
+  assert.match(r.info, /No tabs to hibernate/);
+  r = await send({ cmd: 'Hibernate', target: 'All', force: true });
+  assert.ok(tabs.get(pinned.id).discarded);
+  // A target by entries only touches those tabs.
+  for (const t of tabs.values()) t.discarded = false;
+  const e = stored().sessions.flatMap((s) => s.entries.map((x) => ({ s, x }))).find(({ x }) => x.tab_id && !tabs.get(x.tab_id).active);
+  r = await send({ cmd: 'Hibernate', target: { Entries: [{ session: e.s.id, entry: e.x.id }] }, force: false });
+  assert.equal([...tabs.values()].filter((t) => t.discarded).length, 1);
+  for (const t of tabs.values()) t.discarded = false;
+});
+
+await step('media limit: background video is paused, resumed when its tab is active', async () => {
+  const settings = stored().settings;
+  await send({ cmd: 'UpdateSettings', settings: { ...settings, media: { ...settings.media, policy: 'ActiveTabOnly' } } });
+  for (const t of tabs.values()) t.active = false;
+  const fg = await api.tabs.create({ url: 'https://video.example/fg', active: true });
+  const bg = await api.tabs.create({ url: 'https://video.example/bg' });
+  const media = (tab, playing, video = true) =>
+    ev.message.fire({ smMedia: { playing, video, pip: false } }, { tab: { id: tab.id }, frameId: 0 }, () => {});
+  tabMessages.length = 0;
+  media(fg, true);
+  await tick();
+  assert.deepEqual(tabMessages, [], 'the active tab may play');
+  media(bg, true);
+  await tick();
+  assert.deepEqual(tabMessages, [{ tabId: bg.id, msg: { smMediaCmd: 'pause', audio: false } }]);
+  assert.deepEqual(stored().media.paused, [bg.id]);
+  // audio only is not limited by default
+  tabMessages.length = 0;
+  const music = await api.tabs.create({ url: 'https://music.example/' });
+  media(music, true, false);
+  await tick();
+  assert.deepEqual(tabMessages, []);
+  // switching to the paused tab resumes it, and pauses the one left behind
+  media(bg, false);
+  tabs.get(fg.id).active = false;
+  tabs.get(bg.id).active = true;
+  ev.activated.fire({ tabId: bg.id, windowId: 1 });
+  await tick();
+  assert.deepEqual(
+    tabMessages.map((m) => [m.tabId, m.msg.smMediaCmd]).sort(),
+    [[bg.id, 'resume'], [fg.id, 'pause']].sort(),
+  );
+  // turning the limit off forgets everything
+  await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, media: { ...settings.media, policy: 'Off' } } });
+  assert.deepEqual(stored().media, { playing: [], paused: [] });
+  tabMessages.length = 0;
+  media(bg, true);
+  await tick();
+  assert.deepEqual(tabMessages, []);
 });
 
 await step('install/update sets the NEW badge; viewing release notes clears it', async () => {

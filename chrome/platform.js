@@ -14,6 +14,23 @@ installPlatform(api, {
     };
   },
 
+  // Chromium resolves to the discarded tab (possibly with a new id), or to nothing when
+  // the tab could not be discarded.
+  async discardTabs(ids) {
+    const discarded = [];
+    const errors = [];
+    for (const id of ids) {
+      try {
+        const t = await api.tabs.discard(id);
+        if (t) discarded.push(t.id);
+        else errors.push(`tab ${id} could not be hibernated`);
+      } catch (e) {
+        errors.push(String(e && e.message ? e.message : e));
+      }
+    }
+    return { discarded, errors };
+  },
+
   async removeSiteData(hosts, types) {
     const dataTypes = {
       cache: !!types.cache,

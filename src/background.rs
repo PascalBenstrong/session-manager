@@ -11,6 +11,8 @@ use wasm_bindgen_futures::{future_to_promise, spawn_local};
 
 use crate::cleanup::{self, ALARM_PREFIX, CleanupReport, CleanupSpec, CleanupTarget, Cookie, SpecMatcher};
 use crate::dedupe::Scope;
+use crate::hibernate::{self, HibernateTarget};
+use crate::media::MediaReport;
 use crate::model::{AppState, BrowserTab, EntryRef, Id, TabId};
 use crate::organize::{self, OrganizeKey};
 use crate::platform::{self as pf, CreateTab};
@@ -123,6 +125,9 @@ enum Event {
     #[serde(rename_all = "camelCase")]
     TabActivated { tab_id: TabId },
     TabReplaced { added: TabId, removed: TabId },
+    /// The media content script reports playback in a frame.
+    #[serde(rename_all = "camelCase")]
+    MediaState { tab_id: TabId, frame_id: i64, playing: bool, video: bool, pip: bool },
     CookieSet { cookie: Cookie },
     Alarm { name: String },
     Message { payload: String },
@@ -177,6 +182,14 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         Event::TabActivated { tab_id } => {
             if with_state(|s| s.on_tab_activated(tab_id, now)) {
                 persist().await;
+            }
+            enforce_media().await;
+        }
+        Event::MediaState { tab_id, frame_id, playing, video, pip } => {
+            let report = MediaReport { playing, video, pip };
+            if with_state(|s| s.settings.media.enabled() && s.media.report(tab_id, frame_id, report, now)) {
+                persist().await;
+                enforce_media().await;
             }
         }
         Event::TabReplaced { added, removed } => {
@@ -442,12 +455,55 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok("Rules applied to existing tabs")
         }
         Command::UpdateSettings { settings } => {
-            with_state(|s| s.settings = settings);
+            with_state(|s| {
+                if !settings.media.enabled() {
+                    s.media = Default::default();
+                }
+                s.settings = settings;
+            });
             persist().await;
             sync_alarms().await;
             schedule_auto_organize();
+            enforce_media().await;
             ok("Settings saved")
         }
+        Command::SaveWorkspace { workspace } => {
+            let new = workspace.id == 0;
+            let (id, placed) = with_state(|s| s.save_workspace(workspace).map(|id| (id, s.auto_place(None, false))))?;
+            persist().await;
+            let name = with_state(|s| s.workspace(id).map(|w| w.name.clone()).unwrap_or_default());
+            let mut info = format!("Workspace \"{name}\" {}", if new { "created" } else { "saved" });
+            if placed > 0 {
+                info.push_str(&format!("; its rules placed {placed} tab(s)"));
+            }
+            ok(info)
+        }
+        Command::DeleteWorkspace { id } => {
+            with_state(|s| s.delete_workspace(id))?;
+            persist().await;
+            ok("Workspace deleted (its tabs were kept)")
+        }
+        Command::MoveWorkspace { id, delta } => {
+            with_state(|s| s.move_workspace(id, delta))?;
+            persist().await;
+            ok("")
+        }
+        Command::AssignWorkspace { entries, workspace } => {
+            let n = with_state(|s| s.assign_workspace(&entries, workspace))?;
+            persist().await;
+            let name = with_state(|s| workspace.and_then(|id| s.workspace(id)).map(|w| w.name.clone()));
+            ok(match name {
+                Some(name) => format!("Moved {n} tab(s) to \"{name}\""),
+                None => format!("Took {n} tab(s) out of their workspace"),
+            })
+        }
+        Command::AutoPlaceEntries { entries } => {
+            // Chosen entries go back to the rules; for all entries, manual choices stay.
+            let n = with_state(|s| s.auto_place(entries.as_deref(), entries.is_some()));
+            persist().await;
+            ok(format!("Workspace rules moved {n} tab(s)"))
+        }
+        Command::Hibernate { target, force } => hibernate_tabs(&target, force).await,
         Command::RunCleanup { label, spec } => {
             let report = run_cleanup(&label, &spec).await?;
             with_state(|s| s.push_cleanup_report(report.clone()));
@@ -688,6 +744,53 @@ async fn open_entry(r: EntryRef, discarded: bool) -> Result<(), String> {
     });
     persist().await;
     Ok(())
+}
+
+// ---------------------------------------------------------------- hibernate / media
+
+/// Unloads the target's tabs (see [`hibernate::candidates`] for which are skipped).
+async fn hibernate_tabs(target: &HibernateTarget, force: bool) -> Result<Response, String> {
+    let (wanted, playing) = with_state(|s| (s.hibernate_tabs(target), s.media.playing.iter().map(|p| p.tab_id).collect()));
+    let tabs = pf::query_tabs().await?;
+    let ids = hibernate::candidates(&tabs, wanted.as_ref(), force, &playing);
+    if ids.is_empty() {
+        let skipped = if force { "active tabs" } else { "active, pinned and playing tabs" };
+        return ok(format!("No tabs to hibernate ({skipped} and tabs already hibernated are skipped)"));
+    }
+    let result = pf::discard_tabs(&ids).await?;
+    if with_state(|s| s.mark_discarded(&result.discarded)) {
+        persist().await;
+    }
+    let mut info = format!("Hibernated {} tab(s)", result.discarded.len());
+    if let Some(e) = result.errors.first() {
+        info.push_str(&format!("; {} could not be hibernated (e.g. {e})", result.errors.len()));
+    }
+    ok(info)
+}
+
+/// Pauses background media beyond the limit, and resumes media we paused in tabs that
+/// became active again.
+async fn enforce_media() {
+    let (settings, media) = with_state(|s| (s.settings.media, s.media.clone()));
+    if !settings.enabled() || media.is_empty() {
+        return;
+    }
+    let tabs = match pf::query_tabs().await {
+        Ok(t) => t,
+        Err(e) => return log(&format!("could not query tabs: {e}")),
+    };
+    let plan = media.plan(&settings, &tabs);
+    if plan.is_empty() {
+        return;
+    }
+    for id in &plan.pause {
+        pf::media_command(*id, "pause", settings.include_audio).await;
+    }
+    for id in &plan.resume {
+        pf::media_command(*id, "resume", settings.include_audio).await;
+    }
+    with_state(|s| s.media.apply(&plan));
+    persist().await;
 }
 
 // ---------------------------------------------------------------- organize

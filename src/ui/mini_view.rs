@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use eframe::egui::{self, Align, Color32, CursorIcon, Key, Layout, Margin, Modifiers, RichText, Sense, Stroke, UiBuilder};
 
 use super::theme;
-use super::widgets::{ChipKind, avatar, chip, empty_state, icon_button, status_dot};
+use super::widgets::{ChipKind, avatar, chip, empty_state, icon_button, status_dot, tab_state_color, ws_color};
 use super::{Actions, ViewCtx};
 use crate::cleanup::DataTypes;
+use crate::hibernate::HibernateTarget;
 use crate::model::{EntryRef, Id, TabEntry, TabId};
 use crate::protocol::Command;
 use crate::search::{Query, SearchOptions};
@@ -36,7 +37,9 @@ impl MiniView {
         let p = theme::palette(ui);
         let query = Query::parse(&self.query, &SearchOptions::default());
         let error = query.as_ref().err().cloned();
-        let query = query.unwrap_or_default();
+        let names = cx.state.workspaces.iter().map(|w| (w.id, w.name.clone())).collect();
+        let playing = cx.state.media.playing.iter().map(|p| p.tab_id).collect();
+        let query = query.unwrap_or_default().with_context(names, playing, crate::platform::now());
 
         let mut owner: HashMap<Id, Id> = HashMap::new();
         let mut matched: Vec<&TabEntry> = Vec::new();
@@ -132,7 +135,7 @@ impl MiniView {
                 let session_name = self
                     .all_sessions
                     .then(|| cx.state.session(r.session).map(|s| s.name.as_str()).unwrap_or(""));
-                let resp = row(ui, e, r, i == self.selected, session_name, self.reload_after_clean, acts);
+                let resp = row(ui, cx, e, r, i == self.selected, session_name, self.reload_after_clean, acts);
                 if i == self.selected && moved {
                     resp.scroll_to_me(None);
                 }
@@ -189,8 +192,10 @@ fn clean(acts: &mut Actions, tab: Option<TabId>, site: &str, data_types: DataTyp
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row(
     ui: &mut egui::Ui,
+    cx: &ViewCtx,
     e: &TabEntry,
     r: EntryRef,
     selected: bool,
@@ -220,14 +225,17 @@ fn row(
             .layout(Layout::left_to_right(Align::Center)),
     );
     let host = e.host();
-    let av = avatar(&mut row, &host, !open);
-    status_dot(&row, av, open);
+    let av = avatar(&mut row, &host, !open || e.discarded);
+    status_dot(&row, av, tab_state_color(&row, e));
     row.add_space(2.0);
     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if hovered {
             if let Some(tab_id) = e.tab_id {
                 if icon_button(ui, "🗙", "Close tab").clicked() {
                     acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: true });
+                }
+                if !e.discarded && icon_button(ui, "💤", "Hibernate (unload) this tab").clicked() {
+                    acts.send(Command::Hibernate { target: HibernateTarget::Entries(vec![r]), force: true });
                 }
                 if icon_button(ui, "🧹", "Clear this site's cookies & data").clicked() {
                     clean(acts, Some(tab_id), &host, DataTypes::default(), reload_after_clean);
@@ -246,11 +254,20 @@ fn row(
             let mut meta = host.clone();
             if !open {
                 meta.push_str(" · unloaded");
+            } else if e.discarded {
+                meta.push_str(" · hibernated");
             }
             if let Some(n) = session_name {
                 meta.push_str(&format!(" · {n}"));
             }
-            ui.add(egui::Label::new(RichText::new(meta).small().color(p.muted)).truncate());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if let Some(ws) = e.workspace.and_then(|id| cx.state.workspace(id)) {
+                    ui.label(RichText::new(ws.label()).small().color(ws_color(ws.color)));
+                    ui.label(RichText::new("·").small().color(p.muted));
+                }
+                ui.add(egui::Label::new(RichText::new(meta).small().color(p.muted)).truncate());
+            });
         });
     });
 

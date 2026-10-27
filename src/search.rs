@@ -5,21 +5,22 @@
 //! | term              | meaning                                            |
 //! |-------------------|----------------------------------------------------|
 //! | `word`            | default field/mode (UI selectable, default: title or URL contains) |
-//! | `host:github.com` | field filter: `title:`, `url:`, `host:`, `domain:`, `tag:`, `group:` |
+//! | `host:github.com` | field filter: `title:`, `url:`, `host:`, `domain:`, `tag:`, `group:`, `ws:` (workspace) |
 //! | `=word`, `^word$` | exact match                                        |
 //! | `^word`           | prefix match                                       |
 //! | `word$`           | suffix match                                       |
 //! | `*wo?d*`          | glob (`*`, `?`)                                    |
 //! | `/re(gex)?/`      | regular expression                                 |
 //! | `-term`           | negation                                           |
-//! | `is:open` `is:unloaded` `is:pinned` `is:grouped` `is:ungrouped` `is:tagged` `is:duplicate` | state filters |
+//! | `is:open` `is:unloaded` `is:pinned` `is:grouped` `is:ungrouped` `is:tagged` `is:duplicate` `is:hibernated` `is:playing` | state filters |
+//! | `idle:30m`        | not used for 30 minutes (`s`, `m`, `h`, `d`)       |
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Id, TabEntry};
+use crate::model::{Id, TabEntry, TabId};
 use crate::pattern::glob_to_regex;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -60,11 +61,12 @@ pub enum Field {
     Domain,
     Tag,
     Group,
+    Workspace,
 }
 
 impl Field {
-    pub const ALL: [Field; 7] =
-        [Field::Any, Field::Title, Field::Url, Field::Host, Field::Domain, Field::Tag, Field::Group];
+    pub const ALL: [Field; 8] =
+        [Field::Any, Field::Title, Field::Url, Field::Host, Field::Domain, Field::Tag, Field::Group, Field::Workspace];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -75,6 +77,7 @@ impl Field {
             Field::Domain => "Domain",
             Field::Tag => "Tag",
             Field::Group => "Group",
+            Field::Workspace => "Workspace",
         }
     }
 
@@ -86,6 +89,7 @@ impl Field {
             "domain" | "d" => Field::Domain,
             "tag" => Field::Tag,
             "group" | "g" => Field::Group,
+            "workspace" | "ws" | "w" => Field::Workspace,
             "any" => Field::Any,
             _ => return None,
         })
@@ -102,6 +106,9 @@ pub struct SearchOptions {
     pub case_sensitive: bool,
     /// Restrict results to these groups. Empty = all. `""` stands for "no group".
     pub groups: BTreeSet<String>,
+    /// Restrict results to these workspaces. Empty = all.
+    /// [`NO_WORKSPACE`](crate::workspace::NO_WORKSPACE) stands for "no workspace".
+    pub workspaces: BTreeSet<Id>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +120,8 @@ enum Flag {
     Ungrouped,
     Tagged,
     Duplicate,
+    Hibernated,
+    Playing,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +129,8 @@ enum Matcher {
     Text { mode: MatchMode, needle: String },
     Pattern(Regex),
     Flag(Flag),
+    /// Not used for at least this many milliseconds.
+    Idle(f64),
 }
 
 #[derive(Debug, Clone)]
@@ -134,8 +145,15 @@ pub struct Query {
     terms: Vec<Term>,
     case_sensitive: bool,
     groups: BTreeSet<String>,
+    workspaces: BTreeSet<Id>,
     /// Entries that have duplicates (for `is:duplicate`), supplied by the caller.
     duplicates: HashSet<Id>,
+    /// Workspace names by id (for `ws:`), supplied by the caller.
+    workspace_names: HashMap<Id, String>,
+    /// Tabs playing media (for `is:playing`), supplied by the caller.
+    playing: HashSet<TabId>,
+    /// Current time in ms (for `idle:`), supplied by the caller.
+    now: f64,
 }
 
 impl Query {
@@ -159,9 +177,16 @@ impl Query {
                         "ungrouped" => Flag::Ungrouped,
                         "tagged" => Flag::Tagged,
                         "duplicate" | "dup" | "dupe" => Flag::Duplicate,
+                        "hibernated" | "sleeping" | "discarded" => Flag::Hibernated,
+                        "playing" | "audible" => Flag::Playing,
                         other => return Err(format!("unknown filter is:{other}")),
                     };
                     terms.push(Term { field, matcher: Matcher::Flag(flag), negate });
+                    continue;
+                }
+                if prefix.eq_ignore_ascii_case("idle") {
+                    let ms = parse_duration(rest).ok_or_else(|| format!("idle:{rest}: use a duration like 30m, 2h or 1d"))?;
+                    terms.push(Term { field, matcher: Matcher::Idle(ms), negate });
                     continue;
                 }
                 if let Some(f) = Field::from_prefix(prefix) {
@@ -175,7 +200,13 @@ impl Query {
             let matcher = build_matcher(tok, opts.default_mode, opts.case_sensitive)?;
             terms.push(Term { field, matcher, negate });
         }
-        Ok(Query { terms, case_sensitive: opts.case_sensitive, groups: opts.groups.clone(), duplicates: HashSet::new() })
+        Ok(Query {
+            terms,
+            case_sensitive: opts.case_sensitive,
+            groups: opts.groups.clone(),
+            workspaces: opts.workspaces.clone(),
+            ..Default::default()
+        })
     }
 
     /// Whether the query uses `is:duplicate` (so the caller should supply duplicates).
@@ -188,12 +219,23 @@ impl Query {
         self
     }
 
+    /// Supplies what `ws:`, `is:playing` and `idle:` need.
+    pub fn with_context(mut self, workspace_names: HashMap<Id, String>, playing: HashSet<TabId>, now: f64) -> Self {
+        self.workspace_names = workspace_names;
+        self.playing = playing;
+        self.now = now;
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty() && self.groups.is_empty()
+        self.terms.is_empty() && self.groups.is_empty() && self.workspaces.is_empty()
     }
 
     pub fn matches(&self, e: &TabEntry) -> bool {
         if !self.groups.is_empty() && !self.groups.contains(e.group.as_deref().unwrap_or("")) {
+            return false;
+        }
+        if !self.workspaces.is_empty() && !self.workspaces.contains(&e.workspace.unwrap_or(crate::workspace::NO_WORKSPACE)) {
             return false;
         }
         self.terms.iter().all(|t| self.term_matches(t, e) != t.negate)
@@ -209,7 +251,12 @@ impl Query {
                 Flag::Ungrouped => e.group.is_none(),
                 Flag::Tagged => !e.tags.is_empty(),
                 Flag::Duplicate => self.duplicates.contains(&e.id),
+                Flag::Hibernated => e.is_hibernated(),
+                Flag::Playing => e.tab_id.is_some_and(|t| self.playing.contains(&t)),
             };
+        }
+        if let Matcher::Idle(ms) = t.matcher {
+            return self.now > 0.0 && self.now - e.last_accessed.max(e.created_at) >= ms;
         }
         let check = |s: &str| self.text_matches(&t.matcher, s);
         match t.field {
@@ -220,6 +267,7 @@ impl Query {
             Field::Domain => check(&e.domain()),
             Field::Tag => e.tags.iter().any(|tag| check(tag)),
             Field::Group => check(e.group.as_deref().unwrap_or("")),
+            Field::Workspace => check(e.workspace.and_then(|w| self.workspace_names.get(&w)).map_or("", |n| n.as_str())),
         }
     }
 
@@ -242,9 +290,28 @@ impl Query {
                     MatchMode::Glob | MatchMode::Regex => unreachable!("compiled to Pattern"),
                 }
             }
-            Matcher::Flag(_) => false,
+            Matcher::Flag(_) | Matcher::Idle(_) => false,
         }
     }
+}
+
+/// `90s`, `30m`, `2h`, `1d` (a bare number means minutes) -> milliseconds.
+fn parse_duration(s: &str) -> Option<f64> {
+    let s = s.trim().to_ascii_lowercase();
+    let (num, unit) = match s.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(i) => s.split_at(i),
+        None => (s.as_str(), "m"),
+    };
+    let n: f64 = num.parse().ok().filter(|n: &f64| *n >= 0.0)?;
+    let unit_ms = match unit {
+        "s" | "sec" => 1_000.0,
+        "m" | "min" => 60_000.0,
+        "h" | "hr" => 3_600_000.0,
+        "d" | "day" | "days" => 86_400_000.0,
+        "w" | "week" | "weeks" => 604_800_000.0,
+        _ => return None,
+    };
+    Some(n * unit_ms)
 }
 
 fn build_matcher(tok: &str, default_mode: MatchMode, case_sensitive: bool) -> Result<Matcher, String> {
@@ -379,6 +446,30 @@ mod tests {
         let q = q.with_duplicates([1].into());
         assert!(q.matches(&a));
         assert!(!q.matches(&b));
+    }
+
+    #[test]
+    fn workspaces_hibernation_idle() {
+        let e = TabEntry {
+            id: 1,
+            tab_id: Some(9),
+            discarded: true,
+            workspace: Some(5),
+            last_accessed: 1_000.0,
+            ..Default::default()
+        };
+        let names: HashMap<Id, String> = [(5, "Deep Work".to_string())].into();
+        let ctx = |q: Query| q.with_context(names.clone(), [9].into(), 1_000.0 + 3_600_000.0);
+        assert!(ctx(q("ws:deep is:hibernated is:playing idle:30m")).matches(&e));
+        assert!(ctx(q("workspace:\"=deep work\"")).matches(&e));
+        assert!(!ctx(q("idle:2h")).matches(&e));
+        assert!(!q("idle:1s").matches(&e), "no time supplied");
+        assert!(Query::parse("idle:soon", &SearchOptions::default()).is_err());
+        let mut opts = SearchOptions::default();
+        opts.workspaces.insert(5);
+        assert!(Query::parse("", &opts).unwrap().matches(&e));
+        opts.workspaces = [crate::workspace::NO_WORKSPACE].into();
+        assert!(!Query::parse("", &opts).unwrap().matches(&e));
     }
 
     #[test]

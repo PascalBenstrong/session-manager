@@ -2,6 +2,21 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.3.0] - 2026-10-27
+
+### New
+- Workspaces: group tabs into named workspaces with a color and an icon. They are shared by all sessions, and the Tabs view lists tabs by workspace.
+- Click a workspace's header to open its settings: name, icon, color, rules, and actions. Drag tabs onto a header to move them there.
+- Workspace rules add tabs automatically when they open or change: by site (domain, host, URL prefix, glob or regex), by group (including the browser's own tab groups), by tag, or by any search. Tabs you placed by hand stay where you put them.
+- Search in one workspace or across all of them: a workspace filter in the search options, and `ws:name` in the search box.
+- Hibernate tabs to free memory: all tabs, this session's, a workspace's, the tabs matching a search, or tabs not used for a while. "Force hibernate" includes pinned tabs and tabs playing media. Hibernated tabs stay in the tab strip and are marked in the list.
+- Media limit: let videos play only in the active tab, or in at most N background tabs. Paused media resumes when you switch back to its tab. Audio and picture-in-picture can be included or exempt.
+- New search filters: `is:hibernated`, `is:playing` and `idle:30m` / `idle:2h` / `idle:1d`.
+
+### Improved
+- Customize the tab list from the View menu: group by workspace, domain, host, group, tag or nothing; compact one-line rows; show or hide tag and group chips. The choice is remembered.
+- The quick switcher shows each tab's workspace and whether it is hibernated, and can hibernate a tab.
+
 ## [0.2.0] - 2026-10-26
 
 ### New

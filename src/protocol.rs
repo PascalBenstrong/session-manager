@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cleanup::{CleanupReport, CleanupRule, CleanupSpec, DataTypes};
 use crate::dedupe::Scope;
+use crate::hibernate::HibernateTarget;
 use crate::model::{AppState, AutoRule, EntryRef, Id, Session, Settings, TabId};
+use crate::workspace::Workspace;
 use crate::state::{ImportTarget, RestoreMode};
 use crate::organize::OrganizeKey;
 
@@ -57,6 +59,19 @@ pub enum Command {
     /// Remove duplicate tabs (compared with `settings.dedupe`). `close_tabs` closes open
     /// duplicates; otherwise they stay open but untracked.
     RemoveDuplicates { scope: Scope, close_tabs: bool },
+    /// Create (`id == 0`) or update a workspace.
+    SaveWorkspace { workspace: Workspace },
+    /// Delete a workspace; its tabs are kept without a workspace.
+    DeleteWorkspace { id: Id },
+    /// Move a workspace up (`delta < 0`) or down.
+    MoveWorkspace { id: Id, delta: i32 },
+    /// Put entries in a workspace (`None` = no workspace). Rules leave them there.
+    AssignWorkspace { entries: Vec<EntryRef>, workspace: Option<Id> },
+    /// Let the workspace rules place these entries again, even if they were placed by
+    /// hand. `None` applies the rules to every entry not placed by hand.
+    AutoPlaceEntries { entries: Option<Vec<EntryRef>> },
+    /// Unload tabs to free memory. `force` includes pinned tabs and tabs playing media.
+    Hibernate { target: HibernateTarget, force: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

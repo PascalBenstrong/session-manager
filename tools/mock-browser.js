@@ -12,6 +12,7 @@ export function createMockBrowser() {
   const alarms = new Map();
   const removedSiteData = [];
   const reloaded = [];
+  const tabMessages = [];
   const ev = {
     created: listeners(), updated: listeners(), removed: listeners(), activated: listeners(),
     cookie: listeners(), alarm: listeners(), message: listeners(), storage: listeners(), installed: listeners(),
@@ -47,6 +48,8 @@ export function createMockBrowser() {
         rest.forEach((t, i) => (t.index = i));
       },
       async discard(id) { tabs.get(id).discarded = true; return clone(tabs.get(id)); },
+      // Messages to content scripts.
+      async sendMessage(tabId, msg) { tabMessages.push({ tabId, msg }); },
       onCreated: ev.created, onUpdated: ev.updated, onRemoved: ev.removed, onActivated: ev.activated,
     },
     windows: {
@@ -104,5 +107,5 @@ export function createMockBrowser() {
       async setBadgeBackgroundColor() {},
     },
   };
-  return { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, ev, clone };
+  return { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, ev, clone };
 }

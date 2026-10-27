@@ -7,6 +7,8 @@
 
 pub mod cleanup;
 pub mod dedupe;
+pub mod hibernate;
+pub mod media;
 pub mod model;
 pub mod organize;
 pub mod pattern;
@@ -16,6 +18,7 @@ pub mod search;
 pub mod state;
 pub mod transfer;
 pub mod url;
+pub mod workspace;
 
 #[cfg(target_arch = "wasm32")]
 mod background;
