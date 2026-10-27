@@ -26,6 +26,8 @@ const until = async (what, f, ms = 10000) => {
 };
 let passed = 0;
 const results = [];
+/** Console messages and log entries of attached pages (after Log.enable). */
+const consoleLog = [];
 const check = (name, ok, detail = '') => {
   results.push(`${ok ? 'ok  ' : 'FAIL'} - ${name}${detail ? ` (${detail})` : ''}`);
   console.log(results[results.length - 1]);
@@ -167,12 +169,13 @@ async function chromium() {
   check('media & frames lists the video, iframe and scripts', kinds.has('video') && kinds.has('iframe') && kinds.has('script'), [...kinds].join(', '));
   check('including those of other frames', res.some((r) => !r.top));
   check('the page cannot see the inspector', (await page.eval(`typeof window.__smInspector`)) === 'undefined');
-  await inspectorExtras(insp.eval, page.eval, tabId, () => pageTargets().then((t) => t.map((x) => x.url)), () => cdp.send('Target.getTargets').then((r) => r.targetInfos.map((x) => x.url)), () => page.screenshot(join(shots, `${which}-docked.png`)));
+  await inspectorExtras(insp.eval, page.eval, tabId, () => pageTargets().then((t) => t.map((x) => x.url)), () => cdp.send('Target.getTargets').then((r) => r.targetInfos.map((x) => x.url)), () => page.screenshot(join(shots, `${which}-docked.png`)), (x, y) => page.mouse({ x, y }), () => page.screenshot(join(shots, `${which}-docked-network.png`)));
   await page.screenshot(join(shots, `${which}-page.png`));
 
   // The inspector window itself: the tree, a node's context menu, the Ads pane.
   const winTarget = (await pageTargets()).find((t) => t.url.includes('inspector.html?tab=') && !t.url.includes('dock='));
   const win = await attach(cdp, winTarget.targetId);
+  await cdp.send('Log.enable', {}, win.sessionId);
   await win.eval('location.reload(), true');
   await sleep(4000);
   const dpr = await win.eval('devicePixelRatio');
@@ -182,13 +185,36 @@ async function chromium() {
   await sleep(600);
   await win.screenshot(join(shots, `${which}-inspector-menu.png`));
   await win.key('Escape');
-  await win.mouse(at(+process.env.SM_ADS_X || 348, +process.env.SM_ADS_Y || 98));
+  await win.mouse(at(459, 98));
   await sleep(3000);
   await win.screenshot(join(shots, `${which}-inspector-ads.png`));
+  // Network: record, make the page send requests, select one.
+  await win.mouse(at(196, 98));
+  await sleep(800);
+  await win.screenshot(join(shots, `${which}-inspector-network-empty.png`));
+  const pt = (name, fallback) => (process.env[name] || fallback).split(',').map(Number);
+  await win.mouse(at(...pt('SM_REC', '70,165')));
+  await sleep(1500);
+  await page.eval(`loadData('ui'), fetch('data.json?ui-fetch', { method: 'POST', body: JSON.stringify({ a: 1 }) }), testWs.send('hello'), true`);
+  await sleep(2000);
+  await win.mouse(at(...pt('SM_ROW', '300,330')));
+  await sleep(1000);
+  await win.screenshot(join(shots, `${which}-inspector-network.png`));
+  await win.mouse(at(...pt('SM_ROW', '300,330')), 'right');
+  await sleep(700);
+  await win.screenshot(join(shots, `${which}-inspector-network-menu.png`));
+  await win.mouse(at(...pt('SM_MENU_EDIT', '486,809')));
+  await sleep(700);
+  await win.screenshot(join(shots, `${which}-inspector-network-rule.png`));
+  await win.mouse(at(...pt('SM_SETTINGS', '1997,175')));
+  await sleep(700);
+  await win.screenshot(join(shots, `${which}-inspector-network-settings.png`));
+  const warnings = consoleLog.filter((l) => /willReadFrequently|Only permissions specified/.test(l));
+  check('the inspector logs no canvas or permission warnings', warnings.length === 0, warnings[0]?.slice(0, 160));
 }
 
 /** Live changes, copying, frames, ads, screenshots and docking, from an extension page. */
-async function inspectorExtras(evalExt, evalPage, tabId, urls, frameUrls = urls, shoot = null) {
+async function inspectorExtras(evalExt, evalPage, tabId, urls, frameUrls = urls, shoot = null, clickAt = null, shootPage = null) {
   const json = async (expr) => JSON.parse(await evalExt(`Promise.resolve(${expr}).then(JSON.stringify)`));
   const T = tabId;
   await evalPage(`setTimeout(() => document.body.append(Object.assign(document.createElement('p'), { textContent: 'added later' })), 1000), true`);
@@ -226,13 +252,116 @@ async function inspectorExtras(evalExt, evalPage, tabId, urls, frameUrls = urls,
   await sleep(3000);
   check('the inspector docks at the bottom of the page', await evalPage(`!!document.querySelector('sm-inspector-dock')`));
   if (shoot) await shoot();
-  check('the docked inspector loads', (await frameUrls()).some((u) => u.includes('inspector.html?tab=') && u.includes('dock=')));
+  // Its UI really runs (it saves the tab's state once it does), not just its frame.
+  const started = await until('the docked inspector to start', async () => (await json(`smPlatform.sessionGet('smInspector:${T}')`)) != null, 8000).catch(() => false);
+  check('the docked inspector loads and runs', (await frameUrls()).some((u) => u.includes('inspector.html?tab=') && u.includes('dock=')) && started);
+  // The docked inspector's Network view (real clicks in the dock), then a reload: it carries
+  // on where it was (view, recording, log) instead of starting over.
+  const state = async () => JSON.parse((await json(`smPlatform.sessionGet('smInspector:${T}')`)) || 'null');
+  if (clickAt) {
+    const top = await evalPage(`document.querySelector('sm-inspector-dock').getBoundingClientRect().top`);
+    await clickAt(130, top + 26);
+    await sleep(2000);
+    await evalPage(`loadData('dock'), true`);
+    await sleep(1500);
+    const before = await state();
+    check('the docked Network view records and saves its state', before?.pane === 'network' && before.network.recording && JSON.stringify(before.network.log).includes('data.json?dock'), before ? `${before.pane}, recording ${before.network.recording}` : 'nothing saved');
+  }
   await evalPage(`setTimeout(() => location.reload(), 50), true`);
-  await sleep(5000);
+  await sleep(1200);
+  check('the docked inspector is back early while the page loads', await evalPage(`!!document.querySelector('sm-inspector-dock')`));
+  await sleep(3800);
   check('the docked inspector comes back after the page reloads', await evalPage(`!!document.querySelector('sm-inspector-dock')`));
+  if (clickAt) {
+    const after = await state();
+    const log = JSON.stringify(after?.network.log || []);
+    check('after the reload it carries on: same view, still recording, log kept', after?.pane === 'network' && after.network.recording && log.includes('data.json?dock') && log.includes('data.json?load') && Object.keys(after.network.docUrls).length >= 2, after ? `${after.pane}, ${Object.keys(after.network.docUrls).length} pages` : 'nothing saved');
+    if (shootPage) await shootPage();
+  }
+  await evalExt(`smPlatform.netStop(${T}).then(() => true)`);
   await evalExt(`smPlatform.undockInspector(${T}).then(() => true)`);
   await sleep(500);
   check('and undocks', await evalPage(`!document.querySelector('sm-inspector-dock')`));
+  await networkChecks(evalExt, evalPage, T);
+}
+
+/** The Network view: recording, replaying into the page, reload and record, throttling. */
+async function networkChecks(evalExt, evalPage, T) {
+  const json = async (expr) => JSON.parse(await evalExt(`Promise.resolve(${expr}).then(JSON.stringify)`));
+  const listen = () =>
+    evalExt(`(globalThis.__net = [], smPlatform.inspectorInject(${T}).then(() => {
+      smPlatform.inspectorConnect(${T}, (j) => { const m = JSON.parse(j); if (m.net) __net.push(...m.net); });
+      return smPlatform.netStart(${T});
+    }).then(() => true))`);
+  const records = () => json('globalThis.__net');
+  const count = (id) => evalPage(`+document.getElementById('${id}').textContent`);
+  await listen();
+  await evalPage(`loadData('test'), testWs.send('ping'), fetch('data.json?fetch'), true`);
+  await sleep(1500);
+  let net = await records();
+  const xhr = net.find((r) => r.kind === 'xhr' && r.url.includes('data.json?test'));
+  const done = xhr && net.find((r) => r.update && r.id === xhr.id && r.status);
+  check('network: an XHR is recorded with its response', !!done && done.status === 200 && /"n"/.test(done.resBody || ''), done && `${done.status}`);
+  const fetched = net.find((r) => r.kind === 'fetch' && r.url.includes('data.json?fetch'));
+  check('network: a fetch is recorded', !!fetched);
+  const sent = net.find((r) => r.kind === 'frame' && r.dir === 'out' && r.reqBody === 'ping');
+  const echo = net.find((r) => r.kind === 'frame' && r.dir === 'in' && r.reqBody === 'echo:ping');
+  check('network: WebSocket messages are recorded both ways', !!sent && !!echo);
+
+  // Replays: the page's own handlers run again.
+  const before = await count('xhrCount');
+  const wsBefore = await count('wsCount');
+  await evalExt(`smPlatform.netCommand(${T}, { cmd: 'replay', ids: [${xhr.id}, ${echo.id}, ${fetched.id}], gap: 100 }).then(() => true)`);
+  await sleep(2000);
+  net = await records();
+  check('network: replaying an XHR runs the page\'s handler again', (await count('xhrCount')) === before + 1, `${before} -> ${await count('xhrCount')}`);
+  check('network: replaying a received message delivers it to the page again', (await count('wsCount')) === wsBefore + 1);
+  check('network: replays are recorded as replays', net.some((r) => r.replayOf === xhr.id) && net.some((r) => r.replayOf === fetched.id), JSON.stringify(net.filter((r) => r.replayOf).map((r) => [r.kind, r.replayOf])) + ' want ' + [xhr.id, fetched.id]);
+  check('network: replay all reports when it is done', net.some((r) => r.replayDone === 3));
+
+  // Reload and record: the page's first requests are there too.
+  await evalExt(`smPlatform.netReloadAndRecord(${T}).then(() => true)`);
+  await sleep(3500);
+  await listen();
+  await sleep(800);
+  net = await records();
+  check('network: reload and record catches the page\'s first requests', net.some((r) => r.kind === 'xhr' && r.url.includes('data.json?load')) && net.some((r) => r.kind === 'ws'));
+
+  // Throttling (a rule of this tab), also after reloading.
+  const site = await evalPage('location.hostname');
+  await evalExt(`smPlatform.setThrottle([{ id: 1, enabled: true, site: '${site}', pattern: '*data.json*', method: '', delay: 1500, tab: ${T} }]).then(() => true)`);
+  await sleep(1500);
+  await evalPage(`loadData('slow'), true`);
+  await sleep(2500);
+  net = await records();
+  const slow = net.find((r) => r.kind === 'xhr' && r.url.includes('data.json?slow'));
+  const slowDone = slow && net.find((r) => r.update && r.id === slow.id && r.end);
+  const took = slowDone ? slowDone.end - slow.start : -1;
+  check('throttling holds matching requests back', took >= 1400, `${took} ms`);
+  await evalPage(`setTimeout(() => location.reload(), 50), true`);
+  await sleep(4500);
+  const loadTook = await evalPage(`Math.round(performance.getEntriesByType('resource').find((r) => r.name.includes('data.json?load'))?.duration ?? -1)`);
+  check('throttling still applies after a reload', loadTook >= 1400, `${loadTook} ms`);
+  const other = await evalPage(`Math.round(performance.getEntriesByType('resource').find((r) => r.name.includes('ad-script.js'))?.duration ?? 0)`);
+  check('requests not matching the rule are not held', other < 1000, `${other} ms`);
+
+  // Another tab of the site: a rule of this tab doesn't apply there; a kept rule does.
+  const api = `(globalThis.browser ?? chrome)`;
+  const page2 = await evalExt(`${api}.tabs.create({ url: '${SITE}?second', active: false }).then((t) => t.id)`);
+  await sleep(4000);
+  const loadIn = async (tab) =>
+    json(`${api}.scripting.executeScript({ target: { tabId: ${tab} }, func: () => Math.round(performance.getEntriesByType('resource').find((r) => r.name.includes('data.json?load'))?.duration ?? -1) }).then((r) => r[0].result)`);
+  const otherTab = await loadIn(page2);
+  check("a tab's throttle rule doesn't apply to other tabs", otherTab >= 0 && otherTab < 1000, `${otherTab} ms`);
+  await evalExt(`smPlatform.setThrottle([{ id: 1, enabled: true, site: '${site}', pattern: '*data.json*', method: '', delay: 1500, tab: null }]).then(() => true)`);
+  await sleep(1500);
+  await evalExt(`${api}.tabs.reload(${page2}).then(() => true)`);
+  await sleep(4500);
+  const kept = await loadIn(page2);
+  check('a rule kept for every tab applies to other tabs', kept >= 1400, `${kept} ms`);
+  await evalExt(`${api}.tabs.remove(${page2}).then(() => true)`);
+  await evalExt(`smPlatform.setThrottle([]).then(() => true)`);
+  await sleep(1000);
 }
 
 /** Minimal DevTools Protocol client (flat sessions). */
@@ -246,6 +375,7 @@ async function connect(url) {
   const pending = new Map();
   ws.onmessage = (m) => {
     const msg = JSON.parse(m.data);
+    if (msg.method === 'Log.entryAdded' || msg.method === 'Runtime.consoleAPICalled') consoleLog.push(JSON.stringify(msg.params));
     const p = pending.get(msg.id);
     if (!p) return;
     pending.delete(msg.id);
@@ -303,6 +433,7 @@ async function attach(cdp, targetId) {
       writeFileSync(file, Buffer.from(data, 'base64'));
     },
     close: () => cdp.send('Target.closeTarget', { targetId }),
+    sessionId,
   };
   return p;
 }
@@ -475,7 +606,15 @@ async function firefox() {
     const walk = (cs) => cs.forEach((c) => (all.push(c.url), walk(c.children || [])));
     walk((await bidi.send('browsingContext.getTree', {})).contexts);
     return all;
-  }, undefined, () => page.screenshot(join(shots, 'firefox-docked.png')));
+  }, undefined, () => page.screenshot(join(shots, 'firefox-docked.png')), async (x, y) => {
+    await bidi.send('browsingContext.activate', { context: tab });
+    await bidi.send('input.performActions', {
+      context: tab,
+      actions: [{ type: 'pointer', id: 'mouse', actions: [
+        { type: 'pointerMove', x: Math.round(x), y: Math.round(y) }, { type: 'pointerDown', button: 0 }, { type: 'pointerUp', button: 0 },
+      ] }],
+    });
+  }, () => page.screenshot(join(shots, 'firefox-docked-network.png')));
   const inspectorCtx = (await bidi.send('browsingContext.getTree', {})).contexts.find((c) => c.url.includes('inspector.html?tab='));
   await ctx(inspectorCtx.context).screenshot(join(shots, 'firefox-inspector.png'));
   await page.screenshot(join(shots, 'firefox-page.png'));

@@ -90,6 +90,8 @@ struct Root {
     title: String,
     url: String,
     node: NodeSummary,
+    /// Names the document (each page loaded in the tab gets its own).
+    doc: String,
 }
 
 /// What the content script tells a connected inspector.
@@ -102,6 +104,8 @@ struct PageEvent {
     details: bool,
     title: Option<String>,
     disconnected: bool,
+    /// Network records (see web/net-recorder.js).
+    net: Option<Vec<Value>>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -127,6 +131,10 @@ enum Reply {
     Copy(&'static str, Result<String, String>),
     Shot(&'static str, Result<pf::ShotSize, String>),
     Done(Result<(), String>),
+    /// The state saved for this tab (see [`InspectorView::snapshot`]).
+    Restored(Option<String>),
+    /// Elements matching the selector of the element selected before a reload.
+    Reselect(Result<Vec<NodeSummary>, String>),
     /// Errors not worth showing (highlighting an element that just went away).
     Quiet,
 }
@@ -141,6 +149,7 @@ struct Inbox {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Elements,
+    Network,
     Media,
     Ads,
     Source,
@@ -201,10 +210,27 @@ pub struct InspectorView {
     ads: Option<Vec<AdSignal>>,
     source: Option<Vec<String>>,
     source_query: String,
+    network: super::network_view::NetworkPane,
+    /// After a reload: replace the tree once the new page is read, and select this again.
+    replace_tree: bool,
+    restore_selector: Option<String>,
+    /// The pane to stay in while selecting an element again.
+    keep_pane: Option<Pane>,
+    /// The tab's saved state was read (saving starts then), and what was saved last.
+    restored: bool,
+    pending_ready: Option<(String, String)>,
+    pending_net: Vec<Vec<Value>>,
+    saved: (u64, u8, Option<u64>),
+    last_save: f64,
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(r: Result<Value, String>) -> Result<T, String> {
     r.and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+}
+
+/// Where a tab's inspector state is kept for the browser session.
+fn state_key(tab: TabId) -> String {
+    format!("smInspector:{tab}")
 }
 
 impl InspectorView {
@@ -244,20 +270,53 @@ impl InspectorView {
             ads: None,
             source: None,
             source_query: String::new(),
+            network: super::network_view::NetworkPane::new(ctx, tab),
+            replace_tree: false,
+            restore_selector: None,
+            keep_pane: None,
+            restored: tab.is_none(),
+            pending_ready: None,
+            pending_net: Vec::new(),
+            saved: (0, 0, None),
+            last_save: 0.0,
         };
+        if let Some(tab) = tab {
+            let inbox = v.inbox.clone();
+            let ctx = v.ctx.clone();
+            spawn_local(async move {
+                let saved = pf::session_get(&state_key(tab)).await.ok().flatten();
+                inbox.borrow_mut().replies.push(Reply::Restored(saved));
+                ctx.request_repaint();
+            });
+        }
         v.connect();
         v
     }
 
-    /// Injects the content script, connects to it (live changes, picks) and loads the
-    /// document root.
+    /// Reads the page from scratch (Refresh, Retry).
     fn connect(&mut self) {
-        let Some(tab) = self.tab else { return };
         self.root = None;
         self.children.clear();
         self.expanded.clear();
         self.details = None;
         self.selected = None;
+        self.attach();
+    }
+
+    /// The page was reloaded or navigated: the old tree stays until the new page is read,
+    /// and the element selected before is selected again if the new page has it.
+    fn reattach(&mut self) {
+        if let Some(sel) = self.details.as_ref().map(|d| d.selector.clone()).filter(|s| !s.is_empty()) {
+            self.restore_selector = Some(sel);
+        }
+        self.replace_tree = true;
+        self.attach();
+    }
+
+    /// Injects the content script, connects to it (live changes, picks) and loads the
+    /// document root.
+    fn attach(&mut self) {
+        let Some(tab) = self.tab else { return };
         self.error = None;
         self.picking = false;
         self.connection += 1;
@@ -323,7 +382,7 @@ impl InspectorView {
 
     /// Opens the tree down to a node, selects it and scrolls the tree to it.
     fn reveal(&mut self, id: u64, path: &[u64]) {
-        self.pane = Pane::Elements;
+        self.pane = self.keep_pane.take().unwrap_or(Pane::Elements);
         for a in path.iter().filter(|a| **a != id) {
             self.expanded.insert(*a);
             if !self.children.contains_key(a) {
@@ -407,9 +466,95 @@ impl InspectorView {
         );
     }
 
+    /// What to carry on with when this tab's inspector loads again (a docked inspector
+    /// reloads with its page; the window keeps it when moved).
+    fn snapshot(&self) -> Value {
+        json!({
+            "pane": match self.pane {
+                Pane::Elements => "elements",
+                Pane::Network => "network",
+                Pane::Media => "media",
+                Pane::Ads => "ads",
+                Pane::Source => "source",
+            },
+            "selector": self.details.as_ref().map(|d| d.selector.clone()).or_else(|| self.restore_selector.clone()),
+            "network": self.network.snapshot(),
+        })
+    }
+
+    fn restore(&mut self, saved: Option<String>) {
+        if let Some(v) = saved.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+            self.apply_saved(&v);
+        }
+        // The page read meanwhile, and its requests, come after what was restored.
+        self.restored = true;
+        if let Some((doc, url)) = self.pending_ready.take() {
+            self.network.on_ready(&doc, &url);
+        }
+        for records in std::mem::take(&mut self.pending_net) {
+            self.network.apply(records);
+        }
+    }
+
+    fn apply_saved(&mut self, v: &Value) {
+        self.pane = match v["pane"].as_str() {
+            Some("network") => Pane::Network,
+            Some("media") => Pane::Media,
+            Some("ads") => Pane::Ads,
+            Some("source") => Pane::Source,
+            _ => Pane::Elements,
+        };
+        match self.pane {
+            Pane::Media => self.load_resources(),
+            Pane::Ads => self.load_ads(),
+            Pane::Source => self.refresh_pane(),
+            _ => {}
+        }
+        self.network.restore(&v["network"]);
+        if self.selected.is_none()
+            && let Some(sel) = v["selector"].as_str().filter(|s| !s.is_empty())
+        {
+            self.restore_selector = Some(sel.to_string());
+            if self.root.is_some() {
+                self.restore_selection();
+            }
+        }
+    }
+
+    /// Selects the element selected before (by its selector) in the page now read.
+    fn restore_selection(&mut self) {
+        if let Some(selector) = self.restore_selector.take() {
+            self.ask(json!({ "op": "query", "selector": selector }), |r| Reply::Reselect(parse(r)));
+        }
+    }
+
+    /// A docked inspector (which reloads with its page) saves the tab's state when it
+    /// changed, at most every 400 ms. A window keeps its state, and saves it when it moves.
+    fn save_state(&mut self) {
+        let Some(tab) = self.tab else { return };
+        if self.dock.is_none() {
+            return;
+        }
+        let key = (self.network.revision, self.pane as u8, self.selected);
+        if !self.restored || key == self.saved {
+            return;
+        }
+        let wait = 400.0 - (pf::now() - self.last_save);
+        if wait > 0.0 {
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(wait as u64 + 1));
+            return;
+        }
+        self.saved = key;
+        self.last_save = pf::now();
+        let snapshot = self.snapshot().to_string();
+        spawn_local(async move {
+            let _ = pf::session_set(&state_key(tab), &snapshot).await;
+        });
+    }
+
     fn refresh_pane(&mut self) {
         match self.pane {
-            Pane::Elements => self.connect(),
+            Pane::Elements | Pane::Network => self.connect(),
             Pane::Media => self.load_resources(),
             Pane::Ads => self.load_ads(),
             Pane::Source => self.ask(json!({ "op": "source" }), |r| Reply::Source(parse(r))),
@@ -426,8 +571,21 @@ impl InspectorView {
                 Reply::Ready(Ok(root)) => {
                     self.connected = true;
                     self.reconnect = None;
+                    if std::mem::take(&mut self.replace_tree) {
+                        self.children.clear();
+                        self.expanded.clear();
+                        self.details = None;
+                        self.selected = None;
+                        self.query_results = None;
+                    }
                     self.title = root.title;
+                    if self.restored {
+                        self.network.on_ready(&root.doc, &root.url);
+                    } else {
+                        self.pending_ready = Some((root.doc.clone(), root.url.clone()));
+                    }
                     self.url = root.url;
+                    self.restore_selection();
                     self.expanded.insert(root.node.id);
                     self.load_children(root.node.id);
                     self.root = Some(root.node);
@@ -475,6 +633,17 @@ impl InspectorView {
                     self.query_results = Some(list);
                 }
                 Reply::Reveal(id, Ok(path)) => self.reveal(id, &path),
+                Reply::Restored(saved) => self.restore(saved),
+                Reply::Reselect(Ok(list)) => {
+                    if let Some(first) = list.first() {
+                        let id = first.id;
+                        let pane = self.pane;
+                        self.ask(json!({ "op": "reveal", "id": id }), move |r| Reply::Reveal(id, parse(r)));
+                        // Selecting it again shouldn't change the pane.
+                        self.keep_pane = Some(pane);
+                    }
+                }
+                Reply::Reselect(Err(_)) => {}
                 Reply::Source(Ok(s)) => self.source = Some(s.lines().map(String::from).collect()),
                 Reply::Resources(Ok(list)) => self.resources = Some(list),
                 Reply::Ads(Ok(list)) => self.ads = Some(list),
@@ -517,6 +686,13 @@ impl InspectorView {
                 self.picking = false;
                 self.reveal(p.id, &p.path);
             }
+            if let Some(records) = e.net {
+                if self.restored {
+                    self.network.apply(records);
+                } else {
+                    self.pending_net.push(records);
+                }
+            }
             if e.pick_cancelled {
                 self.picking = false;
             }
@@ -538,11 +714,9 @@ impl InspectorView {
             let now = pf::now();
             if now >= at {
                 self.reconnect = Some((tries, f64::INFINITY));
-                self.connect();
-                self.resources = None;
-                self.ads = None;
-                self.source = None;
-                if self.pane != Pane::Elements {
+                // Panes keep showing the old page until the new one is read (no flicker).
+                self.reattach();
+                if !matches!(self.pane, Pane::Elements | Pane::Network) {
                     self.refresh_pane();
                 }
             } else if at.is_finite() {
@@ -553,6 +727,7 @@ impl InspectorView {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, acts: &mut Actions, state: Option<&AppState>) {
         self.drain(acts);
+        self.save_state();
         let p = theme::palette(ui);
         egui::Panel::top("inspector-header")
             .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, if self.dock.is_some() { 4 } else { 8 })))
@@ -575,6 +750,10 @@ impl InspectorView {
         let pad = egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12));
         match self.pane {
             Pane::Elements => self.elements(ui, acts),
+            Pane::Network => {
+                let url = self.url.clone();
+                self.network.ui(ui, acts, &url);
+            }
             Pane::Media => {
                 egui::CentralPanel::default().frame(pad).show(ui, |ui| self.media(ui, acts));
             }
@@ -606,7 +785,7 @@ impl InspectorView {
             segmented(
                 ui,
                 &mut self.pane,
-                &[(Pane::Elements, "Elements"), (Pane::Media, "Media & frames"), (Pane::Ads, "Ads"), (Pane::Source, "Source")],
+                &[(Pane::Elements, "Elements"), (Pane::Network, "Network"), (Pane::Media, "Media & frames"), (Pane::Ads, "Ads"), (Pane::Source, "Source")],
             );
             if self.pane != before {
                 match self.pane {
@@ -620,6 +799,9 @@ impl InspectorView {
                 ui.label(RichText::new("● Live").small().color(p.success)).on_hover_text("The tree follows changes to the page");
             } else if self.reconnect.is_some() {
                 ui.label(RichText::new("◌ Page loading…").small().color(p.muted));
+            }
+            if self.network.recording() && self.pane != Pane::Network {
+                ui.label(RichText::new("● Recording").small().color(p.danger)).on_hover_text("The Network view is recording the page's requests");
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.placement_buttons(ui, acts);
@@ -649,8 +831,10 @@ impl InspectorView {
     /// Dock / undock / close.
     fn placement_buttons(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
         let Some(tab) = self.tab else { return };
-        let mv = |place: &'static str| {
+        // The inspector that opens carries on with this one's state.
+        let mv = |place: &'static str, snapshot: String| {
             spawn_local(async move {
+                let _ = pf::session_set(&state_key(tab), &snapshot).await;
                 if let Err(e) = pf::move_inspector(tab, place).await {
                     web_sys::console::warn_1(&format!("could not move the inspector: {e}").into());
                 }
@@ -663,10 +847,10 @@ impl InspectorView {
                 });
             }
             if icon_button(ui, "🗗", "Open the inspector in its own window (and from now on)").clicked() {
-                mv("window");
+                mv("window", self.snapshot().to_string());
             }
         } else if icon_button(ui, "⬓", "Dock the inspector at the bottom of the page (and from now on)").clicked() {
-            mv("bottom");
+            mv("bottom", self.snapshot().to_string());
             acts.notice("Docking…");
         }
     }

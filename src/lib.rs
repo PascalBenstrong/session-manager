@@ -12,6 +12,7 @@ pub mod guards;
 pub mod hibernate;
 pub mod media;
 pub mod model;
+pub mod netlog;
 pub mod organize;
 pub mod pattern;
 pub mod protocol;

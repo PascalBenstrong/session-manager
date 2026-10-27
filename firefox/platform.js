@@ -1,5 +1,5 @@
 // Firefox implementation of `smPlatform` (overrides on top of platform-common.js).
-import { installPlatform, stripDebuggerBytes, tabOut } from './platform-common.js';
+import { installPlatform, readThrottleRules, stripDebuggerBytes, tabOut, throttleRuleFor } from './platform-common.js';
 
 const api = globalThis.browser;
 const LAZY_SCHEMES = /^(https?|ftp):/i;
@@ -34,11 +34,35 @@ function filterScript(details) {
   filter.onerror = () => {};
 }
 
+// Throttling: requests matching a rule of the page's site are held for the rule's delay
+// (a blocking listener may answer later). Covers every request type, also after reloads.
+let throttleRules = [];
+let throttling = false;
+function throttle(details) {
+  const top = details.type === 'main_frame' ? details.url : details.frameAncestors?.at(-1)?.url || details.documentUrl || details.originUrl || '';
+  const rule = throttleRuleFor(throttleRules, top, details.url, details.method, details.tabId);
+  if (!rule || !(rule.delay > 0)) return undefined;
+  return new Promise((resolve) => setTimeout(() => resolve({}), rule.delay));
+}
+async function loadThrottle() {
+  throttleRules = (await readThrottleRules(api)).filter((r) => r.enabled);
+  if (throttleRules.length && !throttling) api.webRequest.onBeforeRequest.addListener(throttle, { urls: ['<all_urls>'] }, ['blocking']);
+  else if (!throttleRules.length && throttling) api.webRequest.onBeforeRequest.removeListener(throttle);
+  throttling = throttleRules.length > 0;
+}
+
 installPlatform(api, {
+  installThrottle() {
+    loadThrottle().catch((e) => console.warn('[session-manager] throttle', e));
+    api.storage.onChanged.addListener((changes, area) => {
+      if (changes.smThrottle || changes.smThrottleTabs) loadThrottle().catch((e) => console.warn('[session-manager] throttle', e));
+    });
+  },
+
   info() {
     return {
       browser: 'firefox',
-      tabGroups: !!(api.tabs.group && api.tabGroups),
+      tabGroups: !!(api.tabs?.group && api.tabGroups),
       // browsingData.remove({hostnames}) does not support the HTTP cache in Firefox.
       perHostCache: false,
       sidebar: !!api.sidebarAction,
@@ -63,8 +87,12 @@ installPlatform(api, {
   async captureRegion(tab, m) {
     const p = m.page;
     const rect = { x: p.x, y: p.y, width: p.width, height: Math.min(p.height, 12000) };
-    const shot = await api.tabs.captureTab(tab.id, { rect, scale: m.dpr, format: 'png' });
-    return (await fetch(shot)).blob();
+    return (await fetch(await this.captureTabImage(tab.id, rect, m.dpr))).blob();
+  },
+
+  /** A PNG data: URL of a part of a tab's page (CSS pixels of the document). */
+  async captureTabImage(tabId, rect, scale) {
+    return api.tabs.captureTab(tabId, { rect, scale, format: 'png' });
   },
 
   async setTitlePreface(windowId, text) {

@@ -84,6 +84,22 @@ extern "C" {
     fn js_verify_dock(tab_id: f64, token: &str) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = collectAdSignals)]
     fn js_collect_ad_signals(tab_id: f64, selectors: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = netStart)]
+    fn js_net_start(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = netCommand)]
+    fn js_net_command(tab_id: f64, cmd: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = netReloadAndRecord)]
+    fn js_net_reload_and_record(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = netStop)]
+    fn js_net_stop(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = sessionGet)]
+    fn js_session_get(key: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = sessionSet)]
+    fn js_session_set(key: &str, value: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getThrottle)]
+    fn js_get_throttle() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = setThrottle)]
+    fn js_set_throttle(rules: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = captureElement)]
     fn js_capture_element(tab_id: f64, node: f64, action: &str) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(js_namespace = smPlatform, js_name = locationParam)]
@@ -388,6 +404,44 @@ pub struct ShotSize {
 /// A screenshot of an inspected element: `action` "download" (PNG file) or "copy".
 pub async fn capture_element(tab_id: TabId, node: u64, action: &str) -> Result<ShotSize> {
     call_as(js_capture_element(tab_id as f64, node as f64, action)).await
+}
+
+// ---- network recording / throttling (inspector) ----
+
+/// Starts recording a tab's requests (now, and from the start of every page it loads).
+pub async fn net_start(tab_id: TabId) -> Result<()> {
+    call(js_net_start(tab_id as f64)).await.map(drop)
+}
+
+/// A command for the page's recorder (`{"cmd": "stop" | "start" | "clear" | "replay", ...}`).
+pub async fn net_command(tab_id: TabId, cmd: &serde_json::Value) -> Result<()> {
+    call(js_net_command(tab_id as f64, to_js(cmd))).await.map(drop)
+}
+
+/// Starts recording a tab and reloads it, to record its page from the start.
+pub async fn net_reload_and_record(tab_id: TabId) -> Result<()> {
+    call(js_net_reload_and_record(tab_id as f64)).await.map(drop)
+}
+
+pub async fn net_stop(tab_id: TabId) -> Result<()> {
+    call(js_net_stop(tab_id as f64)).await.map(drop)
+}
+
+/// Text kept for the browser session (storage.session).
+pub async fn session_get(key: &str) -> Result<Option<String>> {
+    Ok(call(js_session_get(key)).await?.as_string())
+}
+
+pub async fn session_set(key: &str, value: &str) -> Result<()> {
+    call(js_session_set(key, value)).await.map(drop)
+}
+
+pub async fn get_throttle() -> Result<Vec<crate::netlog::ThrottleRule>> {
+    call_as(js_get_throttle()).await
+}
+
+pub async fn set_throttle(rules: &[crate::netlog::ThrottleRule]) -> Result<()> {
+    call(js_set_throttle(to_js(rules))).await.map(drop)
 }
 
 pub async fn collect_resources(tab_id: TabId) -> Result<Vec<PageResource>> {

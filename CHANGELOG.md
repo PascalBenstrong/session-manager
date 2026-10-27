@@ -2,6 +2,19 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.7.0] - 2026-10-27
+
+### New
+- Inspector, Network: record the page's requests (fetch, XHR, WebSocket connections and messages, beacons) with their headers, bodies, responses, timing and the code that made them. Filter by type or text; copy URLs, bodies, responses, or a request as cURL or fetch().
+- Replay a request, or all of those listed (with a pause between them), into the page: an XHR goes out again and the page's own code handles the new response; a received WebSocket message is delivered to the page again, a sent one sent again; fetch and beacon requests are sent again from the page.
+- Recording goes on when the page reloads or navigates, from each page's first request; the log keeps every page's requests, marked by page. Requests of an earlier page can be sent again from what was recorded. Reload and record catches the current page from its start too.
+- Throttling: hold back every request, or the requests matching a pattern ("this request", "requests like this", or your own `*` pattern, optionally one method), by a delay you choose. A rule applies to the current tab only (until it closes) unless you keep it for every tab of the site. Rules can be edited (pattern, method, delay, scope) and stay on across reloads. Firefox throttles directly; Chrome does it through its debugger (the extension now asks for that permission when installed or updated) and shows its "debugging this browser" bar while a throttled page is open.
+- Network settings (⚙): delay of new rules, pause between replays, whether new rules apply to the tab or to every tab, start recording when the view opens, keep the log across reloads.
+
+### Improved
+- Reloading the page no longer restarts the inspector: a window keeps showing the page until the new one is read and selects the same element again; a docked inspector comes back as soon as the page starts loading, on the view, selection, recording and log it had.
+- Firefox: the inspector docked at the bottom of the page now works (it showed "Loading…").
+
 ## [0.6.0] - 2026-10-27
 
 ### New

@@ -33,6 +33,18 @@ body[data-popup='true'] {
   pointer-events: none;
 }
 
+/* The docked inspector reloads with its page: no "Loading…" flash unless it takes a while. */
+body[data-mode='inspector'] #sm-loading {
+  opacity: 0;
+  animation: sm-loading-show 0s linear 0.8s forwards;
+}
+
+@keyframes sm-loading-show {
+  to {
+    opacity: 1;
+  }
+}
+
 @media (prefers-color-scheme: light) {
   html,
   body {

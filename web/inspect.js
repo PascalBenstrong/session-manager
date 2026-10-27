@@ -8,6 +8,8 @@
   const api = globalThis.browser ?? globalThis.chrome;
   if (!api || globalThis.__smInspector) return;
   globalThis.__smInspector = true;
+  // This document (the network log keeps the requests of each page apart).
+  const DOC = crypto.randomUUID();
 
   // Our own elements in the page (highlight overlay, dock), hidden from the inspector.
   const OURS = new Set(['sm-inspector-overlay', 'sm-inspector-dock']);
@@ -453,10 +455,57 @@
     shot = null;
   };
 
+  // ------------------------------------------------------------------ network
+
+  // Records from the page-world recorder (web/net-recorder.js), passed on to inspectors in
+  // batches. `net.channel` is the event name the recorder answers on.
+  const net = { channel: null, batch: [], timer: 0, ready: false };
+  const onNet = (e) => {
+    let rec;
+    try {
+      rec = JSON.parse(String(e.detail));
+    } catch {
+      return;
+    }
+    if (rec.ready) {
+      net.ready = true;
+      return;
+    }
+    if (net.batch.length < 5000) net.batch.push(rec);
+    if (!net.timer) {
+      net.timer = setTimeout(() => {
+        net.timer = 0;
+        if (ports.size) post({ net: net.batch.splice(0) });
+      }, 250);
+    }
+  };
+  // Greets the recorder with a new channel; true if one is in the page.
+  const netHello = ({ token }) => {
+    if (net.channel) document.removeEventListener(net.channel, onNet);
+    net.channel = token;
+    net.ready = false;
+    document.addEventListener(token, onNet);
+    document.dispatchEvent(new CustomEvent('sm-net-hello', { detail: token }));
+    return net.ready;
+  };
+  // Marks this tab as recording (the recorder registered for the site checks it), or not.
+  const netFlag = ({ on }) => {
+    try {
+      if (on) sessionStorage.setItem('smNetRecording', '1');
+      else sessionStorage.removeItem('smNetRecording');
+    } catch {
+      // No storage (sandboxed page): only this page is recorded.
+    }
+  };
+  const netCmd = ({ cmd }) => {
+    if (!net.channel) throw new Error('not recording');
+    document.dispatchEvent(new CustomEvent(`${net.channel}:cmd`, { detail: JSON.stringify(cmd) }));
+  };
+
   // ------------------------------------------------------------------ requests
 
   const handlers = {
-    root: () => ({ title: document.title, url: location.href, node: summary(document.documentElement) }),
+    root: () => ({ title: document.title, url: location.href, node: summary(document.documentElement), doc: DOC }),
     children: ({ id }) => {
       listed.add(id);
       return kids(node(id)).map(summary);
@@ -496,6 +545,9 @@
     shotStart,
     shotScroll,
     shotEnd: () => shotEnd(),
+    netHello,
+    netCmd,
+    netFlag,
   };
 
   api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

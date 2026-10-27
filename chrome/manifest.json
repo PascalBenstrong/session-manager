@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Session Manager",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Track tabs in sessions, search and organize them, and clean cookies & site data.",
   "minimum_chrome_version": "120",
   "icons": {
@@ -23,7 +23,8 @@
     "scripting",
     "declarativeNetRequest",
     "contextMenus",
-    "clipboardWrite"
+    "clipboardWrite",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>"

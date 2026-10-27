@@ -144,6 +144,47 @@ async function captureBySlices(api, tab, m, scroll) {
   return canvas.convertToBlob({ type: 'image/png' });
 }
 
+/** `*` wildcards over a whole URL (case-insensitive). */
+export function globToRegExp(glob) {
+  return new RegExp(`^${glob.split('*').map((p) => p.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 'i');
+}
+
+/** The host of a URL ('' if none). */
+export function hostOf(u) {
+  try {
+    return new URL(u).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The enabled throttle rule (see src/netlog.rs) for a request to `url` made by a page of
+ * `pageUrl` in tab `tabId`, or null. Rules belong to a site (and its subdomains), and
+ * either to one tab or to every tab.
+ */
+export function throttleRuleFor(rules, pageUrl, url, method, tabId) {
+  const host = hostOf(pageUrl);
+  if (!host) return null;
+  return (
+    rules.find(
+      (r) =>
+        r.enabled &&
+        (r.tab == null || r.tab === tabId) &&
+        (host === r.site || host.endsWith(`.${r.site}`)) &&
+        (!r.method || r.method.toUpperCase() === String(method || 'GET').toUpperCase()) &&
+        globToRegExp(r.pattern || '*').test(url),
+    ) || null
+  );
+}
+
+/** Throttle rules: those of every tab (kept) and those of one tab (this browser session). */
+export async function readThrottleRules(api) {
+  const kept = (await api.storage.local.get('smThrottle')).smThrottle || [];
+  const tabs = api.storage.session ? (await api.storage.session.get('smThrottleTabs')).smThrottleTabs || [] : [];
+  return [...kept.map((r) => ({ ...r, tab: null })), ...tabs];
+}
+
 /** Saves a blob as a downloaded file (UI pages). */
 function saveBlob(filename, blob) {
   const url = URL.createObjectURL(blob);
@@ -180,6 +221,14 @@ export function cookieOut(c) {
   };
 }
 
+/** What pages without the tabs API (see installPlatform) ask the background to do. */
+const PROXIED = [
+  'getTab', 'queryTabs', 'reloadTab', 'openUrl', 'hasPermission', 'focusTab', 'activateTab', 'openManager', 'currentWindowId',
+  'openInspector', 'dockInspector', 'undockInspector', 'moveInspector', 'verifyDock', 'inspectorInject', 'inspect',
+  'collectResources', 'collectAdSignals', 'tabInfo', 'captureTabImage',
+  'netStart', 'netStop', 'netCommand', 'netReloadAndRecord', 'getThrottle', 'setThrottle', 'sessionGet', 'sessionSet',
+];
+
 export function installPlatform(api, overrides = {}) {
   // Events that arrive before the wasm module is ready are queued, so a background
   // service worker woken up by an event doesn't lose it.
@@ -209,20 +258,50 @@ export function installPlatform(api, overrides = {}) {
     );
   }
 
-  // Tabs with a docked inspector (docked again when their page navigates).
-  const dockedTabs = async () => (api.storage.session ? (await api.storage.session.get('smDocked')).smDocked || [] : []);
+  // Per-tab state for the browser session (storage.session): tabs with a docked inspector
+  // (docked again as soon as their page starts loading), and tabs recording their requests
+  // (tab -> URL patterns of the site, where the recorder runs from the start of each page).
+  const session = async (key, fallback) => (api.storage.session ? (await api.storage.session.get(key))[key] ?? fallback : fallback);
+  const dockedTabs = () => session('smDocked', []);
   async function setDocked(tabId, on) {
     if (!api.storage.session) return;
     const list = (await dockedTabs()).filter((id) => id !== tabId);
     if (on) list.push(tabId);
     await api.storage.session.set({ smDocked: list });
+    await syncPageScripts();
   }
+  async function setRecording(tabId, matches) {
+    if (!api.storage.session) return;
+    const all = await session('smRecording', {});
+    if (matches) all[tabId] = matches;
+    else delete all[tabId];
+    await api.storage.session.set({ smRecording: all });
+    await syncPageScripts();
+  }
+  // Registers the recorder (page world, document start) for the sites of recording tabs,
+  // and the boot script (which re-docks inspectors early) while a tab is docked.
+  async function syncPageScripts() {
+    if (!api.scripting || !api.scripting.registerContentScripts) return;
+    const recording = [...new Set(Object.values(await session('smRecording', {})).flat())];
+    const docked = (await dockedTabs()).length > 0;
+    const existing = (await api.scripting.getRegisteredContentScripts()).map((r) => r.id).filter((id) => id === 'sm-net-record' || id === 'sm-boot');
+    if (existing.length) await api.scripting.unregisterContentScripts({ ids: existing });
+    const regs = [];
+    if (recording.length) {
+      regs.push({ id: 'sm-net-record', js: ['net-recorder.js'], matches: recording, runAt: 'document_start', world: 'MAIN', allFrames: false, persistAcrossSessions: false });
+    }
+    if (docked) {
+      regs.push({ id: 'sm-boot', js: ['boot.js'], matches: ['<all_urls>'], runAt: 'document_start', allFrames: false, persistAcrossSessions: false });
+    }
+    if (regs.length) await api.scripting.registerContentScripts(regs);
+  }
+  const throttleRules = () => readThrottleRules(api);
 
   const platform = {
     info() {
       return {
         browser: 'unknown',
-        tabGroups: !!(api.tabs.group && api.tabGroups),
+        tabGroups: !!(api.tabs?.group && api.tabGroups),
         perHostCache: false,
         sidebar: !!(api.sidePanel || api.sidebarAction),
         extensionId: api.runtime.id || '',
@@ -392,7 +471,7 @@ export function installPlatform(api, overrides = {}) {
         await platform.dockInspector(tabId);
         const tab = await api.tabs.update(tabId, { active: true });
         await api.windows.update(tab.windowId, { focused: true });
-        window.close();
+        if (globalThis.location && location.pathname.endsWith('/inspector.html')) window.close();
       } else {
         await api.windows.create({ url: api.runtime.getURL(`inspector.html?tab=${tabId}`), type: 'popup', width: 1100, height: 780 });
         await platform.undockInspector(tabId); // removes this (docked) page
@@ -415,6 +494,70 @@ export function installPlatform(api, overrides = {}) {
       port.onDisconnect.addListener(() => cb(JSON.stringify({ disconnected: true })));
     },
 
+    // ---- network recording and throttling (inspector) ----
+
+    /**
+     * Starts recording a tab's requests: now (injecting the page-world recorder if needed),
+     * and from the start of every page the tab loads on this site until netStop.
+     */
+    async netStart(tabId) {
+      const tab = await api.tabs.get(tabId);
+      const u = new URL(tab.url);
+      const matches = u.protocol === 'file:' ? ['file:///*'] : [`${u.protocol}//${u.hostname}/*`];
+      await platform.inspect(tabId, { op: 'netFlag', on: true });
+      await setRecording(tabId, matches);
+      const token = `sm-net-${crypto.randomUUID()}`;
+      let ready = await platform.inspect(tabId, { op: 'netHello', token });
+      if (!ready) {
+        await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ['net-recorder.js'], world: 'MAIN' });
+        ready = await platform.inspect(tabId, { op: 'netHello', token });
+      }
+      if (!ready) throw new Error("this page's requests can't be recorded");
+      await platform.inspect(tabId, { op: 'netCmd', cmd: { cmd: 'start' } });
+    },
+
+    /** A command for the recorder: { cmd: 'stop' | 'start' | 'clear' } or { cmd: 'replay', ids, gap }. */
+    async netCommand(tabId, cmd) {
+      await platform.inspect(tabId, { op: 'netCmd', cmd });
+    },
+
+    async netStop(tabId) {
+      await setRecording(tabId, null);
+      await platform.inspect(tabId, { op: 'netFlag', on: false }).catch(() => {});
+      await platform.inspect(tabId, { op: 'netCmd', cmd: { cmd: 'stop' } }).catch(() => {});
+    },
+
+    /** Records a tab from the very start of its page: starts recording, then reloads it. */
+    async netReloadAndRecord(tabId) {
+      await platform.netStart(tabId);
+      await api.tabs.reload(tabId);
+    },
+
+    /**
+     * Throttle rules (see src/netlog.rs ThrottleRule), applied by the background. Rules
+     * of one tab (`tab` set) last for the browser session; rules of every tab are kept.
+     */
+    async getThrottle() {
+      return throttleRules();
+    },
+
+    async setThrottle(rules) {
+      await api.storage.local.set({ smThrottle: rules.filter((r) => r.tab == null) });
+      if (api.storage.session) await api.storage.session.set({ smThrottleTabs: rules.filter((r) => r.tab != null) });
+    },
+
+    /** Text kept for the browser session (the inspector's state of a tab). */
+    async sessionGet(key) {
+      return session(key, null);
+    },
+
+    async sessionSet(key, value) {
+      if (api.storage.session) await api.storage.session.set({ [key]: value });
+    },
+
+    /** Background: applies throttle rules. Browser specific (Firefox: webRequest; Chrome: debugger). */
+    installThrottle() {},
+
     /** Scripts, frames, requests and ad slots of every frame of a tab (see src/ads.rs). */
     async collectAdSignals(tabId, slotSelectors) {
       const results = await api.scripting.executeScript({ target: { tabId, allFrames: true }, func: collectAdSignals, args: [slotSelectors] });
@@ -426,7 +569,7 @@ export function installPlatform(api, overrides = {}) {
      * 'download' saves a PNG, 'copy' puts it on the clipboard. Resolves to its size.
      */
     async captureElement(tabId, id, action) {
-      const tab = await api.tabs.get(tabId);
+      const tab = await platform.tabInfo(tabId);
       let blob;
       try {
         const m = await platform.inspect(tabId, { op: 'shotStart', id });
@@ -450,6 +593,12 @@ export function installPlatform(api, overrides = {}) {
       return size;
     },
 
+    /** Id, window and URL of a tab. */
+    async tabInfo(tabId) {
+      const t = await api.tabs.get(tabId);
+      return { id: t.id, windowId: t.windowId, url: t.url || '' };
+    },
+
     /** A PNG of the element where `m` says it is. Chromium: from screenshots of the tab. */
     async captureRegion(tab, m, scroll) {
       return captureBySlices(api, tab, m, scroll);
@@ -457,7 +606,7 @@ export function installPlatform(api, overrides = {}) {
 
     /** Injects the inspector content script into the tab's top frame. */
     async inspectorInject(tabId) {
-      await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ['inspect.js'] });
+      await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ['inspect.js'], injectImmediately: true });
     },
 
     /** A request to the inspector content script ({ op, ...args }); resolves to its result. */
@@ -739,6 +888,7 @@ export function installPlatform(api, overrides = {}) {
         if (!info.removed) fire({ type: 'cookieSet', cookie: cookieOut(info.cookie) });
       });
       api.alarms.onAlarm.addListener((alarm) => fire({ type: 'alarm', name: alarm.name }));
+      platform.installThrottle();
       // A docked inspector comes back when its page navigates or reloads.
       api.tabs.onUpdated.addListener((tabId, change) => {
         if (change.status !== 'complete') return;
@@ -746,8 +896,26 @@ export function installPlatform(api, overrides = {}) {
           if (list.includes(tabId)) platform.dockInspector(tabId).catch((e) => console.warn('[session-manager] dock', e));
         });
       });
-      api.tabs.onRemoved.addListener((tabId) => {
-        dockedTabs().then((list) => list.includes(tabId) && setDocked(tabId, false));
+      // A closed tab's inspector state, recording and throttle rules go with it.
+      api.tabs.onRemoved.addListener(async (tabId) => {
+        try {
+          if ((await dockedTabs()).includes(tabId)) await setDocked(tabId, false);
+          if ((await session('smRecording', {}))[tabId]) await setRecording(tabId, null);
+          const rules = await session('smThrottleTabs', []);
+          if (rules.some((r) => r.tab === tabId)) await api.storage.session.set({ smThrottleTabs: rules.filter((r) => r.tab !== tabId) });
+          await api.storage.session?.remove(`smInspector:${tabId}`);
+        } catch (e) {
+          console.warn('[session-manager] tab cleanup', e);
+        }
+      });
+      // A docked inspector's (Firefox) connection to its page, relayed.
+      api.runtime.onConnect?.addListener((port) => {
+        const m = /^sm-relay:(\d+)$/.exec(port.name || '');
+        if (!m || (port.sender && port.sender.id !== api.runtime.id)) return;
+        const page = api.tabs.connect(Number(m[1]), { name: 'sm-inspector', frameId: 0 });
+        page.onMessage.addListener((msg) => port.postMessage(msg));
+        page.onDisconnect.addListener(() => port.disconnect());
+        port.onDisconnect.addListener(() => page.disconnect());
       });
       // Right-click on any frame of a page: open it in a new tab.
       const menus = api.menus ?? api.contextMenus;
@@ -776,6 +944,24 @@ export function installPlatform(api, overrides = {}) {
           }));
           return false;
         }
+        // A docked inspector (Firefox) asks the background to do what it can't.
+        if (msg && msg.smProxy && sender && sender.id === api.runtime.id && PROXIED.includes(msg.smProxy.name)) {
+          const { name, args } = msg.smProxy;
+          Promise.resolve()
+            .then(() => platform[name](...(args || [])))
+            .then(
+              (result) => sendResponse({ result: result ?? null }),
+              (e) => sendResponse({ error: String(e && e.message ? e.message : e) }),
+            );
+          return true;
+        }
+        // A page starts loading in a tab (web/boot.js): dock its inspector right away.
+        if (msg && msg.smBoot && sender && sender.tab && !sender.frameId) {
+          dockedTabs().then((list) => {
+            if (list.includes(sender.tab.id)) platform.dockInspector(sender.tab.id).catch(() => {});
+          });
+          return false;
+        }
         if (!msg || typeof msg.smPayload !== 'string') return false;
         emit({ type: 'message', payload: msg.smPayload }).then(
           (r) => sendResponse({ smResponse: r }),
@@ -787,6 +973,24 @@ export function installPlatform(api, overrides = {}) {
   };
 
   Object.assign(platform, overrides);
+  // Firefox gives an extension page framed in a web page (the docked inspector) only
+  // content-script APIs: what needs more is done by the background, and the page
+  // connection goes through it.
+  if (!api.tabs) {
+    for (const name of PROXIED) {
+      platform[name] = async (...args) => {
+        const r = await api.runtime.sendMessage({ smProxy: { name, args } });
+        if (!r) throw new Error('the extension did not answer');
+        if (r.error) throw new Error(r.error);
+        return r.result;
+      };
+    }
+    platform.inspectorConnect = (tabId, cb) => {
+      const port = api.runtime.connect({ name: `sm-relay:${tabId}` });
+      port.onMessage.addListener((msg) => cb(JSON.stringify(msg)));
+      port.onDisconnect.addListener(() => cb(JSON.stringify({ disconnected: true })));
+    };
+  }
   globalThis.smPlatform = platform;
   if (globalThis.document && globalThis.addEventListener) {
     addEventListener(
