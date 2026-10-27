@@ -74,8 +74,18 @@ extern "C" {
     fn js_inspect(tab_id: f64, request: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = collectResources)]
     fn js_collect_resources(tab_id: f64) -> std::result::Result<Promise, JsValue>;
-    #[wasm_bindgen(js_namespace = smPlatform, js_name = onInspectorPick)]
-    pub fn on_inspector_pick(cb: &Function);
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = inspectorConnect)]
+    fn js_inspector_connect(tab_id: f64, cb: &Function) -> std::result::Result<(), JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = moveInspector)]
+    fn js_move_inspector(tab_id: f64, place: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = undockInspector)]
+    fn js_undock_inspector(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = verifyDock)]
+    fn js_verify_dock(tab_id: f64, token: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = collectAdSignals)]
+    fn js_collect_ad_signals(tab_id: f64, selectors: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = captureElement)]
+    fn js_capture_element(tab_id: f64, node: f64, action: &str) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(js_namespace = smPlatform, js_name = locationParam)]
     pub fn location_param(name: &str) -> String;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getAllCookies)]
@@ -331,6 +341,53 @@ pub struct PageResource {
     /// The frame it was found in.
     pub frame: String,
     pub top: bool,
+}
+
+/// Connects to the inspector content script of a tab; `cb` gets its events as JSON (see
+/// `inspectorConnect` in platform-common.js).
+pub fn inspector_connect(tab_id: TabId, cb: &Function) -> Result<()> {
+    js_inspector_connect(tab_id as f64, cb).map_err(js_error)
+}
+
+/// Moves the inspector of a tab to `"bottom"` (docked in the page) or `"window"`, and
+/// remembers it. The calling inspector page goes away.
+pub async fn move_inspector(tab_id: TabId, place: &str) -> Result<()> {
+    call(js_move_inspector(tab_id as f64, place)).await.map(drop)
+}
+
+pub async fn undock_inspector(tab_id: TabId) -> Result<()> {
+    call(js_undock_inspector(tab_id as f64)).await.map(drop)
+}
+
+/// A docked inspector page: is it the one the tab's page docked (and not one a website framed)?
+pub async fn verify_dock(tab_id: TabId, token: &str) -> Result<bool> {
+    Ok(call(js_verify_dock(tab_id as f64, token)).await?.as_bool().unwrap_or(false))
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct AdSignalOut {
+    pub kind: String,
+    pub url: String,
+    pub detail: String,
+    pub frame: String,
+}
+
+/// Scripts, frames, requests and ad slots (`selectors`) of every frame of a tab.
+pub async fn collect_ad_signals(tab_id: TabId, selectors: &[&str]) -> Result<Vec<AdSignalOut>> {
+    call_as(js_collect_ad_signals(tab_id as f64, to_js(selectors))).await
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default)]
+#[serde(default)]
+pub struct ShotSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A screenshot of an inspected element: `action` "download" (PNG file) or "copy".
+pub async fn capture_element(tab_id: TabId, node: u64, action: &str) -> Result<ShotSize> {
+    call_as(js_capture_element(tab_id as f64, node as f64, action)).await
 }
 
 pub async fn collect_resources(tab_id: TabId) -> Result<Vec<PageResource>> {

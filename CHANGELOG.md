@@ -2,6 +2,18 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.6.0] - 2026-10-27
+
+### New
+- Stop ads that hijack the play button (Page guards): clicks on a video player, or on an invisible layer over the page, can't open windows or tabs. A layer laid over the player to catch your click is switched off, so the click starts the video instead.
+- Open frame in new tab: right-click any iframe or frame in a page.
+- Inspector, Ads: the ad networks a page runs (pop-up networks, display, native, video, exchanges, verification), found in the scripts, frames, requests and ad slots of all its frames and in the tabs it opened, with one-click rules to block a network on the site or everywhere.
+- Inspector docked at the bottom of the page: ⬓ docks it, 🗗 takes it back to a window; the choice is remembered, and a docked inspector comes back when the page reloads or navigates. Drag its top edge to resize it.
+- The inspector is live: the element tree and the selected element's details follow changes to the page, and it reconnects by itself after a reload.
+- Selected elements stay highlighted on the page, with their name and size, and the highlight follows them as the page scrolls.
+- Right-click menus in the inspector: copy an element's HTML, inner HTML, text, the text selected on the page or in the inspector, its CSS selector, JS path or XPath, its attributes or computed styles; open or copy a frame's URL; scroll to, select, photograph or delete it. Attribute, style, HTML and source lines have their own copy menus.
+- Element screenshots: save a PNG of an element, or copy it, even when it's taller than the window.
+
 ## [0.5.0] - 2026-10-27
 
 ### New

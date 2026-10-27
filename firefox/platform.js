@@ -59,6 +59,14 @@ installPlatform(api, {
     }
   },
 
+  // Firefox renders any part of the page (not only what's on screen): no scrolling needed.
+  async captureRegion(tab, m) {
+    const p = m.page;
+    const rect = { x: p.x, y: p.y, width: p.width, height: Math.min(p.height, 12000) };
+    const shot = await api.tabs.captureTab(tab.id, { rect, scale: m.dpr, format: 'png' });
+    return (await fetch(shot)).blob();
+  },
+
   async setTitlePreface(windowId, text) {
     await api.windows.update(windowId, { titlePreface: text });
   },

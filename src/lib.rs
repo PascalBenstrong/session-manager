@@ -5,6 +5,7 @@
 //! talk to the browser through `globalThis.smPlatform`, a small JS shim that each
 //! browser folder (`firefox/`, `chrome/`) provides.
 
+pub mod ads;
 pub mod cleanup;
 pub mod dedupe;
 pub mod guards;

@@ -128,13 +128,16 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
   - *Close tabs opened to* `adserver.com`: such tabs are closed at once and you're back on the page.
   - *Block all pop-ups on* `example.com`.
 
-  *Tabs opened by pages* lists recent ones with one-click rules, and the inspector's Media & frames has ⛔ Block on each script.
+  *Tabs opened by pages* lists recent ones with one-click rules, the inspector's Media & frames has ⛔ Block on each script, and its Ads view blocks whole ad networks.
+- **Play-button hijacks:** *Stop ads that hijack the play button* stops clicks on a video player (or on an invisible layer over the page) from opening windows or tabs, and switches off a layer laid over the player so the click reaches it.
 - **Right-click & copying:** pages can't block the context menu (and, optionally, selecting and copying).
 - **Developer tools:** *Remove debugger traps* (runtime-built `debugger` statements; in Firefox also those in script files), *Hide the developer tools from pages* (window size, shortcuts), and *Silence the page's console* (console-based detection).
+- **Open frame in new tab:** right-click any iframe or frame in a page.
 - **Exceptions:** sites where no guard runs, e.g. web apps with their own context menus.
 
-**Inspector** (Alt+Shift+I, 🔬 in the popup or on a tab row, or Page guards → Inspector): a separate window that inspects a page without the browser's developer tools, so pages can't detect it.
-- **Elements:** 🎯 pick an element in the page, browse the DOM tree, find by CSS selector, and see the path, selector, size, attributes, computed style, text and HTML. Scroll it into view or delete it.
+**Inspector** (Alt+Shift+I, 🔬 in the popup or on a tab row, or Page guards → Inspector): inspects a page without the browser's developer tools, so pages can't detect it. It opens in its own window or docked at the bottom of the page (⬓ / 🗗 switch, and the choice sticks; drag the dock's top edge to resize it).
+- **Elements:** 🎯 pick an element in the page, browse the DOM tree, find by CSS selector, and see the path, selector, size, attributes, computed style, text and HTML. The tree is live (it follows changes to the page) and the selected element stays highlighted on the page. Right-click an element for copy options (HTML, text, page selection, selector, JS path, XPath, attributes, styles), to open a frame in a new tab, take a screenshot (save or copy), scroll to it or delete it.
+- **Ads:** the ad networks the page runs, from the scripts, frames, requests and ad slots of all its frames and the tabs it opened, with rules to block a network on the site or everywhere.
 - **Media & frames:** video, audio, source, subtitle, poster, iframe, frame, embed, object and script URLs of the page and all its frames, plus media requests (the real stream URLs behind `blob:` videos). Grouped by type and searchable; copy, open, or ⛔ block a script.
 - **Source:** the page as it is now, with line numbers and search.
 

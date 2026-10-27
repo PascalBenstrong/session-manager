@@ -16,6 +16,9 @@ pub struct GuardSettings {
     /// Block pop-ups and new tabs that pages open without a click, or from handlers that
     /// catch clicks anywhere on the page (how pop-under ad scripts work).
     pub popups: bool,
+    /// Block pop-ups from clicks on video players and on invisible layers over the page
+    /// ("press play, get an ad"), and switch off the layer so the click reaches the player.
+    pub click_hijack: bool,
     /// Pages can't block the context menu (right-click).
     pub context_menu: bool,
     /// Pages can't block selecting and copying text either.
@@ -34,7 +37,7 @@ pub struct GuardSettings {
 
 impl GuardSettings {
     pub fn any_page_guard(&self) -> bool {
-        self.popups || self.context_menu || self.anti_debugger || self.devtools_stealth
+        self.popups || self.click_hijack || self.context_menu || self.anti_debugger || self.devtools_stealth
     }
 }
 
@@ -253,6 +256,9 @@ pub fn registrations(g: &GuardSettings, rules: &[BlockRule]) -> Vec<ScriptRegist
     if g.popups {
         out.push(reg("sm-guard-popups", vec!["guards/popups.js"], all()));
     }
+    if g.click_hijack {
+        out.push(reg("sm-guard-click-hijack", vec!["guards/click-hijack.js"], all()));
+    }
     let strict: Vec<String> = rules
         .iter()
         .filter(|r| r.enabled && r.kind == BlockRuleKind::AllPopupsOn)
@@ -328,12 +334,13 @@ mod tests {
         g.context_menu = true;
         g.text_selection = true;
         g.devtools_stealth = true;
+        g.click_hijack = true;
         let regs = registrations(&g, &[rule(1, BlockRuleKind::AllPopupsOn, "", &["www.bad.com"])]);
         let ids: Vec<_> = regs.iter().map(|r| r.id).collect();
-        assert_eq!(ids, vec!["sm-guard-popups-strict", "sm-guard-context-menu", "sm-guard-stealth"]);
-        assert_eq!(regs[0].matches, vec!["*://bad.com/*", "*://*.bad.com/*"]);
-        assert_eq!(regs[1].js, vec!["guards/context-menu.js", "guards/text-selection.js"]);
-        assert_eq!(regs[1].exclude_matches, vec!["*://docs.google.com/*", "*://*.docs.google.com/*"]);
+        assert_eq!(ids, vec!["sm-guard-click-hijack", "sm-guard-popups-strict", "sm-guard-context-menu", "sm-guard-stealth"]);
+        assert_eq!(regs[1].matches, vec!["*://bad.com/*", "*://*.bad.com/*"]);
+        assert_eq!(regs[2].js, vec!["guards/context-menu.js", "guards/text-selection.js"]);
+        assert_eq!(regs[2].exclude_matches, vec!["*://docs.google.com/*", "*://*.docs.google.com/*"]);
         assert!(regs.iter().all(|r| r.world == "MAIN" && r.run_at == "document_start" && r.id.starts_with(REGISTRATION_PREFIX)));
     }
 

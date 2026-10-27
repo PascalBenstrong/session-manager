@@ -103,8 +103,10 @@ async function chromium() {
   await page.click('#space');
   await page.click('#space', 'right');
   await page.key('Escape');
+  await page.click('#hijack');
   await sleep(1500);
   let report = await page.report();
+  check('control: pressing play opens an ad', report.playPopups.includes('opened'));
   const devtoolsDetected = report.detections.length > 0;
   check('control: the page detects the open developer tools', devtoolsDetected, report.detections.join(', '));
   check('control: the pop-under opens', report.popups.includes('opened'));
@@ -114,7 +116,7 @@ async function chromium() {
   await page.close();
 
   // ---- guarded run
-  await setGuards({ popups: true, context_menu: true, text_selection: true, anti_debugger: true, devtools_stealth: true, silence_console: true });
+  await setGuards({ popups: true, click_hijack: true, context_menu: true, text_selection: true, anti_debugger: true, devtools_stealth: true, silence_console: true });
   await command({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'Script', pattern: 'tools/real/ad-script.js', sites: [] } });
   await command({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'PopupTo', pattern: 'localhost', sites: [] } });
   await sleep(500);
@@ -133,6 +135,12 @@ async function chromium() {
   check('text can be selected', (await page.eval(`getComputedStyle(document.body).userSelect`)) === 'text');
   check('the guard style sits in <head>', await page.eval(`!document.querySelector('html > style')`));
   check('no ad tab is left open', !(await pageTargets()).some((t) => t.url.includes('ad.html?popunder')));
+  await page.click('#hijack');
+  await sleep(1500);
+  report = await page.report();
+  check('pressing play does not open an ad', report.playPopups.length > 0 && !report.playPopups.includes('opened'), report.playPopups.join(', '));
+  check('and the layer over the player is switched off', (await page.eval(`getComputedStyle(document.getElementById('hijack')).pointerEvents`)) === 'none');
+  check('no ad tab opened from the player', !(await pageTargets()).some((t) => t.url.includes('ad.html?play')));
 
   // A real click on a link to the ad site: the tab opens, and the rule closes it.
   await page.click('#adlink');
@@ -150,14 +158,78 @@ async function chromium() {
   const doc = JSON.parse(await insp.eval(`smPlatform.inspect(${tabId}, { op: 'root' }).then(JSON.stringify)`));
   check('the inspector reads the page', doc.title === 'Hostile test page' && doc.node.tag === 'html');
   const found = JSON.parse(await insp.eval(`smPlatform.inspect(${tabId}, { op: 'query', selector: 'video, iframe' }).then(JSON.stringify)`));
-  check('the inspector finds elements by selector', found.map((n) => n.tag).join() === 'video,iframe');
+  check('the inspector finds elements by selector', found.map((n) => n.tag).join() === 'video,iframe,video');
   const res = JSON.parse(await insp.eval(`smPlatform.collectResources(${tabId}).then(JSON.stringify)`));
   const kinds = new Set(res.map((r) => r.kind));
   check('media & frames lists the video, iframe and scripts', kinds.has('video') && kinds.has('iframe') && kinds.has('script'), [...kinds].join(', '));
   check('including those of other frames', res.some((r) => !r.top));
   check('the page cannot see the inspector', (await page.eval(`typeof window.__smInspector`)) === 'undefined');
-  await insp.screenshot(join(shots, `${which}-inspector.png`));
+  await inspectorExtras(insp.eval, page.eval, tabId, () => pageTargets().then((t) => t.map((x) => x.url)), () => cdp.send('Target.getTargets').then((r) => r.targetInfos.map((x) => x.url)), () => page.screenshot(join(shots, `${which}-docked.png`)));
   await page.screenshot(join(shots, `${which}-page.png`));
+
+  // The inspector window itself: the tree, a node's context menu, the Ads pane.
+  const winTarget = (await pageTargets()).find((t) => t.url.includes('inspector.html?tab=') && !t.url.includes('dock='));
+  const win = await attach(cdp, winTarget.targetId);
+  await win.eval('location.reload(), true');
+  await sleep(4000);
+  const dpr = await win.eval('devicePixelRatio');
+  await win.screenshot(join(shots, `${which}-inspector.png`));
+  const at = (x, y) => ({ x: x / dpr, y: y / dpr }); // screenshot pixels -> CSS pixels
+  await win.mouse(at(+process.env.SM_NODE_X || 160, +process.env.SM_NODE_Y || 300), 'right');
+  await sleep(600);
+  await win.screenshot(join(shots, `${which}-inspector-menu.png`));
+  await win.key('Escape');
+  await win.mouse(at(+process.env.SM_ADS_X || 348, +process.env.SM_ADS_Y || 98));
+  await sleep(3000);
+  await win.screenshot(join(shots, `${which}-inspector-ads.png`));
+}
+
+/** Live changes, copying, frames, ads, screenshots and docking, from an extension page. */
+async function inspectorExtras(evalExt, evalPage, tabId, urls, frameUrls = urls, shoot = null) {
+  const json = async (expr) => JSON.parse(await evalExt(`Promise.resolve(${expr}).then(JSON.stringify)`));
+  const T = tabId;
+  await evalPage(`setTimeout(() => document.body.append(Object.assign(document.createElement('p'), { textContent: 'added later' })), 1000), true`);
+  const live = await json(`(async () => {
+    const root = await smPlatform.inspect(${T}, { op: 'root' });
+    const body = (await smPlatform.inspect(${T}, { op: 'children', id: root.node.id })).find((k) => k.tag === 'body');
+    await smPlatform.inspect(${T}, { op: 'children', id: body.id });
+    return await new Promise((ok) => {
+      smPlatform.inspectorConnect(${T}, (j) => { const m = JSON.parse(j); if (m.changed) ok(m.changed.includes(body.id)); });
+      setTimeout(() => ok('timed out'), 5000);
+    });
+  })()`);
+  check('the inspector hears about changes to the page (live tree)', live === true, String(live));
+  const [vid] = await json(`smPlatform.inspect(${T}, { op: 'query', selector: '#vid' })`);
+  check('copy: CSS selector', (await json(`smPlatform.inspect(${T}, { op: 'copy', id: ${vid.id}, what: 'selector' })`)) === '#vid');
+  check('copy: XPath', (await json(`smPlatform.inspect(${T}, { op: 'copy', id: ${vid.id}, what: 'xpath' })`)) === '//*[@id="vid"]');
+  const [frame] = await json(`smPlatform.inspect(${T}, { op: 'query', selector: 'iframe' })`);
+  check('frames in the tree carry their URL (open in a new tab)', frame.src.includes('ad.html?frame'), frame.src);
+  const signals = await json(`smPlatform.collectAdSignals(${T}, ['ins.adsbygoogle'])`);
+  check('the ads view finds the ad slot and the scripts', signals.some((s) => s.kind === 'slot') && signals.some((s) => s.kind === 'script'));
+  const [player] = await json(`smPlatform.inspect(${T}, { op: 'query', selector: '#player' })`);
+  const shot = await json(`(async () => {
+    const tab = await (globalThis.browser ?? chrome).tabs.get(${T});
+    try {
+      const m = await smPlatform.inspect(${T}, { op: 'shotStart', id: ${player.id} });
+      const blob = await smPlatform.captureRegion(tab, m, (dy) => smPlatform.inspect(${T}, { op: 'shotScroll', dy }));
+      const img = await createImageBitmap(blob);
+      return { width: img.width, height: img.height, dpr: m.dpr };
+    } finally {
+      await smPlatform.inspect(${T}, { op: 'shotEnd' });
+    }
+  })()`).catch((e) => ({ error: e.message }));
+  check('a screenshot of an element has its size', !shot.error && Math.abs(shot.width - 320 * shot.dpr) <= 2 && Math.abs(shot.height - 180 * shot.dpr) <= 2, shot.error || `${shot.width}x${shot.height} @${shot.dpr}`);
+  await evalExt(`smPlatform.dockInspector(${T}).then(() => true)`);
+  await sleep(3000);
+  check('the inspector docks at the bottom of the page', await evalPage(`!!document.querySelector('sm-inspector-dock')`));
+  if (shoot) await shoot();
+  check('the docked inspector loads', (await frameUrls()).some((u) => u.includes('inspector.html?tab=') && u.includes('dock=')));
+  await evalPage(`setTimeout(() => location.reload(), 50), true`);
+  await sleep(5000);
+  check('the docked inspector comes back after the page reloads', await evalPage(`!!document.querySelector('sm-inspector-dock')`));
+  await evalExt(`smPlatform.undockInspector(${T}).then(() => true)`);
+  await sleep(500);
+  check('and undocks', await evalPage(`!document.querySelector('sm-inspector-dock')`));
 }
 
 /** Minimal DevTools Protocol client (flat sessions). */
@@ -207,9 +279,16 @@ async function attach(cdp, targetId) {
     /** A real (trusted) mouse click in the middle of an element. */
     async click(selector, button = 'left') {
       await cdp.send('Target.activateTarget', { targetId });
-      const r = await p.eval(`(() => { const r = document.querySelector('${selector}').getBoundingClientRect(); return { x: r.x + Math.min(r.width / 2, 40), y: r.y + r.height / 2 }; })()`);
+      const r = await p.eval(`(() => { const el = document.querySelector('${selector}'); el.scrollIntoView({ block: 'center' }); const r = el.getBoundingClientRect(); return { x: r.x + Math.min(r.width / 2, 40), y: r.y + r.height / 2 }; })()`);
       for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
         await send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button, buttons: type === 'mousePressed' ? (button === 'left' ? 1 : 2) : 0, clickCount: 1 });
+      }
+    },
+    /** A real click at a point (CSS pixels). */
+    async mouse({ x, y }, button = 'left') {
+      await cdp.send('Target.activateTarget', { targetId });
+      for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+        await send('Input.dispatchMouseEvent', { type, x, y, button, buttons: type === 'mousePressed' ? (button === 'left' ? 1 : 2) : 0, clickCount: 1 });
       }
     },
     async key(key) {
@@ -266,7 +345,7 @@ async function firefox() {
     navigate: (url) => bidi.send('browsingContext.navigate', { context, url, wait: 'complete' }),
     async click(selector, button = 0) {
       await bidi.send('browsingContext.activate', { context });
-      const r = await this.json(`(() => { const r = document.querySelector('${selector}').getBoundingClientRect(); return { x: Math.round(r.x + Math.min(r.width / 2, 40)), y: Math.round(r.y + r.height / 2) }; })()`);
+      const r = await this.json(`(() => { const el = document.querySelector('${selector}'); el.scrollIntoView({ block: 'center' }); const r = el.getBoundingClientRect(); return { x: Math.round(r.x + Math.min(r.width / 2, 40)), y: Math.round(r.y + r.height / 2) }; })()`);
       await bidi.send('input.performActions', {
         context,
         actions: [{ type: 'pointer', id: 'mouse', actions: [
@@ -324,8 +403,10 @@ async function firefox() {
   await page.click('#space');
   await page.click('#space', 2);
   await page.key('\uE00C'); // Escape
+  await page.click('#hijack');
   await sleep(1500);
   let report = await page.report();
+  check('control: pressing play opens an ad', report.playPopups.includes('opened'));
   check('control: the page detects the open developer tools', report.detections.length > 0, report.detections.join(', '));
   check('control: the pop-under opens', report.popups.includes('opened'));
   check('control: the page blocks right-click', report.contextMenus > 0);
@@ -334,7 +415,7 @@ async function firefox() {
 
   // ---- guarded run, with the script filter for debugger statements in script files
   await setGuards({
-    popups: true, context_menu: true, text_selection: true, anti_debugger: true, strip_debugger_scripts: true,
+    popups: true, click_hijack: true, context_menu: true, text_selection: true, anti_debugger: true, strip_debugger_scripts: true,
     devtools_stealth: true, silence_console: true,
   });
   await command({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'Script', pattern: 'tools/real/ad-script.js', sites: [] } });
@@ -357,6 +438,12 @@ async function firefox() {
   check('text can be selected', (await page.eval('getComputedStyle(document.body).MozUserSelect || getComputedStyle(document.body).userSelect')) === 'text');
   check('the guard style sits in <head>', await page.eval(`!document.querySelector('html > style')`));
   check('no ad tab is left open', !(await tabsOpen()).some((u) => u.includes('ad.html?popunder')));
+  await page.click('#hijack');
+  await sleep(1500);
+  report = await page.report();
+  check('pressing play does not open an ad', report.playPopups.length > 0 && !report.playPopups.includes('opened'), report.playPopups.join(', '));
+  check('and the layer over the player is switched off', (await page.eval(`getComputedStyle(document.getElementById('hijack')).pointerEvents`)) === 'none');
+  check('no ad tab opened from the player', !(await tabsOpen()).some((u) => u.includes('ad.html?play')));
 
   await page.click('#adlink');
   await sleep(2500);
@@ -371,12 +458,18 @@ async function firefox() {
   const doc = await ext.json(`smPlatform.inspectorInject(${tabId}).then(() => smPlatform.inspect(${tabId}, { op: 'root' }))`);
   check('the inspector reads the page', doc.title === 'Hostile test page' && doc.node.tag === 'html');
   const found = await ext.json(`smPlatform.inspect(${tabId}, { op: 'query', selector: 'video, iframe' })`);
-  check('the inspector finds elements by selector', found.map((n) => n.tag).join() === 'video,iframe');
+  check('the inspector finds elements by selector', found.map((n) => n.tag).join() === 'video,iframe,video');
   const res = await ext.json(`smPlatform.collectResources(${tabId})`);
   const kinds = new Set(res.map((r) => r.kind));
   check('media & frames lists the video, iframe and scripts', kinds.has('video') && kinds.has('iframe') && kinds.has('script'), [...kinds].join(', '));
   check('including those of other frames', res.some((r) => !r.top));
   check('the page cannot see the inspector', (await page.eval('typeof window.__smInspector')) === 'undefined');
+  await inspectorExtras((e) => ext.eval(e), (e) => page.eval(e), tabId, async () => {
+    const all = [];
+    const walk = (cs) => cs.forEach((c) => (all.push(c.url), walk(c.children || [])));
+    walk((await bidi.send('browsingContext.getTree', {})).contexts);
+    return all;
+  }, undefined, () => page.screenshot(join(shots, 'firefox-docked.png')));
   const inspectorCtx = (await bidi.send('browsingContext.getTree', {})).contexts.find((c) => c.url.includes('inspector.html?tab='));
   await ctx(inspectorCtx.context).screenshot(join(shots, 'firefox-inspector.png'));
   await page.screenshot(join(shots, 'firefox-page.png'));

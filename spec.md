@@ -48,6 +48,7 @@ Version: 0.5.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 ## Page guards
 - Guards run inside pages (the page's own world, at document start, in every frame) before the pages' own scripts. Each can be turned on or off, and a list of sites (with subdomains) is left alone.
 - Pop-ups: block windows and new tabs a page opens without a click, or from handlers that catch clicks anywhere on the page (pop-under ad scripts), including programmatic clicks on links and form submits to new tabs. Links the user clicks keep working.
+- Play-button hijacks: during a click on a video player (video, iframe, embed, object, or an element over one) or on an invisible positioned layer over most of the page, scripts can't open windows or new tabs, and a link stretched over the player (or invisible) doesn't open. When such a click tries, the layer it landed on is switched off (pointer-events / visibility) and a paused video under it starts.
 - Custom rules: block scripts by URL (declarativeNetRequest; a bare host blocks every script from it; optionally only on given sites), close tabs that pages open to a matching site (and refocus the page), or block every script-opened pop-up on given sites. A log of recent tabs opened by pages offers one-click rules.
 - Right-click: pages can't block or replace the context menu. Optionally they can't block selecting and copying text either.
 - Debugger traps: `debugger` statements in code built at runtime (`Function`, constructors of functions, string timers) are removed. Firefox: optionally `debugger` statements in script files are blanked out as they load.
@@ -55,7 +56,12 @@ Version: 0.5.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Replaced functions look native to the page (`Function.prototype.toString`).
 
 ## Inspector
-- A separate window inspects a tab without the browser's developer tools, through a content script in the extension's isolated world that the page can't see.
+- Inspects a tab without the browser's developer tools, through a content script in the extension's isolated world that the page can't see. It runs in a separate window or docked at the bottom of the page (an iframe of the extension page in a closed shadow root, resizable; the page gets as much room below its content). The placement is remembered; a docked inspector is docked again after the page navigates. A docked inspector only runs if the page's dock loaded it (a random token).
+- Live: the inspector keeps a port to the content script, which reports DOM mutations of listed nodes and of the selected element; it reconnects after navigations.
+- Context menus on elements: copy outer / inner HTML, text, the page's selected text within the element, the inspector's own selected text, CSS selector, JS path, XPath, attributes (all or one), computed styles; frames: open in a new tab, copy URL; select, scroll into view, screenshot (save / copy), delete.
+- Element screenshots: Firefox renders the element's area of the page (tabs.captureTab with a rect); Chromium stitches screenshots of the visible tab while scrolling (at most two a second). The highlight and the dock are hidden meanwhile, and the scroll position is restored.
+- Ads: scripts, frames, requests and ad slots of every frame, and the tabs the page opened, matched against a catalogue of ad networks (src/ads.rs); unknown third-party hosts named like ad servers are listed as possible ad hosts. Script and close-tab rules in one click.
+- Open frame in new tab: a browser context menu item on frames.
 - Elements: an element picker (hover highlights, click selects), a lazily loaded DOM tree (including open shadow roots), CSS selector search, and for the selected element its path, a unique selector, size and position, attributes, computed style (filterable), text and HTML; scroll into view and delete.
 - Media & frames: the URLs of videos, audio, sources, subtitle tracks, posters, iframes, frames, embeds, objects and scripts in every frame, and media requests from the network log (the streams behind blob: videos), grouped by element type and searchable; copy, open, and block a script.
 - Source: the current page source with line numbers and search.

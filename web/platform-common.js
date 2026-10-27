@@ -76,6 +76,87 @@ function collectPageResources() {
   return { frameUrl: location.href, top: window === window.top, items };
 }
 
+/**
+ * Runs in every frame of an inspected page (scripting.executeScript): what can give away
+ * the ads it runs — script and frame URLs, every request, and elements matching
+ * `slotSelectors` (ad slots, reported as "selector × count").
+ */
+function collectAdSignals(slotSelectors) {
+  const items = [];
+  const seen = new Set();
+  const add = (kind, url, detail = '') => {
+    if (url && seen.has(url)) return;
+    if (url) seen.add(url);
+    items.push({ kind, url: String(url || ''), detail: String(detail || '') });
+  };
+  for (const s of document.querySelectorAll('script[src]')) add('script', s.src);
+  for (const f of document.querySelectorAll('iframe, frame')) if (/^https?:/.test(f.src)) add('iframe', f.src, f.title || f.name);
+  for (const r of performance.getEntriesByType('resource')) add('request', r.name, r.initiatorType);
+  for (const sel of slotSelectors) {
+    let n = 0;
+    try {
+      n = document.querySelectorAll(sel).length;
+    } catch {
+      // Not a selector this browser knows.
+    }
+    if (n) add('slot', '', `${sel} × ${n}`);
+  }
+  return { frameUrl: location.href, items };
+}
+
+/**
+ * Chromium: an element's picture from screenshots of the visible tab, scrolling through
+ * elements taller than the window (captureVisibleTab allows two captures a second).
+ * `m` is where the element is (see shotStart in inspect.js); `scroll(dy)` scrolls the page
+ * and resolves to where it is then.
+ */
+async function captureBySlices(api, tab, m, scroll) {
+  const MAX_CSS_HEIGHT = 12000;
+  const height = Math.min(m.rect.height, MAX_CSS_HEIGHT);
+  let canvas = null;
+  let ctx = null;
+  let done = 0; // CSS pixels of the element drawn so far
+  for (let slice = 0; slice < 40; slice++) {
+    const shot = await api.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    const img = await createImageBitmap(await (await fetch(shot)).blob());
+    const scale = img.width / m.viewport.width;
+    const left = Math.max(m.rect.x, 0);
+    const right = Math.min(m.rect.x + m.rect.width, m.viewport.width);
+    if (!canvas) {
+      if (right <= left) throw new Error('the element is outside the page');
+      canvas = new OffscreenCanvas(Math.round((right - left) * scale), Math.round(height * scale));
+      ctx = canvas.getContext('2d');
+    }
+    const from = Math.max(m.rect.y + done, 0);
+    const to = Math.min(m.rect.y + height, m.viewport.height);
+    if (to > from) {
+      const w = (right - left) * scale;
+      ctx.drawImage(img, left * scale, from * scale, w, (to - from) * scale, 0, (from - m.rect.y) * scale, w, (to - from) * scale);
+      done = to - m.rect.y;
+    }
+    img.close();
+    if (done >= height - 0.5) break;
+    await new Promise((r) => setTimeout(r, 550));
+    const before = m.rect.y;
+    m = await scroll(Math.max(100, m.viewport.height - 80));
+    if (Math.abs(m.rect.y - before) < 1) break; // the page can't scroll further
+  }
+  return canvas.convertToBlob({ type: 'image/png' });
+}
+
+/** Saves a blob as a downloaded file (UI pages). */
+function saveBlob(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 /** Like tabOut, with the title of the native tab group the tab is in. */
 export async function tabOutWithGroup(api, t, titles = new Map()) {
   const out = tabOut(t);
@@ -126,6 +207,15 @@ export function installPlatform(api, overrides = {}) {
       (ev) => ev && fire(ev),
       (e) => console.error('[session-manager] could not read tab event', e),
     );
+  }
+
+  // Tabs with a docked inspector (docked again when their page navigates).
+  const dockedTabs = async () => (api.storage.session ? (await api.storage.session.get('smDocked')).smDocked || [] : []);
+  async function setDocked(tabId, on) {
+    if (!api.storage.session) return;
+    const list = (await dockedTabs()).filter((id) => id !== tabId);
+    if (on) list.push(tabId);
+    await api.storage.session.set({ smDocked: list });
   }
 
   const platform = {
@@ -271,9 +361,98 @@ export function installPlatform(api, overrides = {}) {
 
     // ---- inspector ----
 
+    /** Opens the inspector for a tab where the user last had it: in a window, or docked. */
     async openInspector(tabId) {
+      const { smInspectorDock } = await api.storage.local.get('smInspectorDock');
+      if (smInspectorDock) return platform.dockInspector(tabId);
       const url = api.runtime.getURL(`inspector.html?tab=${tabId}`);
       await api.windows.create({ url, type: 'popup', width: 1100, height: 780 });
+    },
+
+    /** Docks the inspector at the bottom of the tab's page (again after it navigates). */
+    async dockInspector(tabId) {
+      await platform.inspectorInject(tabId);
+      await platform.inspect(tabId, { op: 'dock', url: api.runtime.getURL(`inspector.html?tab=${tabId}`) });
+      await setDocked(tabId, true);
+    },
+
+    async undockInspector(tabId) {
+      await setDocked(tabId, false);
+      await platform.inspect(tabId, { op: 'undock' }).catch(() => {});
+    },
+
+    /**
+     * Moves this inspector ('bottom': docked in the page, 'window': its own window) and
+     * remembers the choice. The inspector page that asked goes away.
+     */
+    async moveInspector(tabId, where) {
+      const bottom = where === 'bottom';
+      await api.storage.local.set({ smInspectorDock: bottom });
+      if (bottom) {
+        await platform.dockInspector(tabId);
+        const tab = await api.tabs.update(tabId, { active: true });
+        await api.windows.update(tab.windowId, { focused: true });
+        window.close();
+      } else {
+        await api.windows.create({ url: api.runtime.getURL(`inspector.html?tab=${tabId}`), type: 'popup', width: 1100, height: 780 });
+        await platform.undockInspector(tabId); // removes this (docked) page
+      }
+    },
+
+    /** Docked inspectors: true if the page's dock is the one that loaded this page. */
+    async verifyDock(tabId, token) {
+      return (await platform.inspect(tabId, { op: 'dockToken' })) === token;
+    },
+
+    /**
+     * Connects to the inspector content script of a tab: `cb(json)` gets its events
+     * ({ picked }, { pickCancelled }, { changed, details, title }) and, when the page goes
+     * away (navigation, reload, closed tab), { disconnected: true }.
+     */
+    inspectorConnect(tabId, cb) {
+      const port = api.tabs.connect(tabId, { name: 'sm-inspector', frameId: 0 });
+      port.onMessage.addListener((msg) => cb(JSON.stringify(msg)));
+      port.onDisconnect.addListener(() => cb(JSON.stringify({ disconnected: true })));
+    },
+
+    /** Scripts, frames, requests and ad slots of every frame of a tab (see src/ads.rs). */
+    async collectAdSignals(tabId, slotSelectors) {
+      const results = await api.scripting.executeScript({ target: { tabId, allFrames: true }, func: collectAdSignals, args: [slotSelectors] });
+      return results.filter((r) => r && r.result).flatMap((r) => r.result.items.map((i) => ({ ...i, frame: r.result.frameUrl })));
+    },
+
+    /**
+     * A screenshot of an element of a tab (node id from the inspector). `action`:
+     * 'download' saves a PNG, 'copy' puts it on the clipboard. Resolves to its size.
+     */
+    async captureElement(tabId, id, action) {
+      const tab = await api.tabs.get(tabId);
+      let blob;
+      try {
+        const m = await platform.inspect(tabId, { op: 'shotStart', id });
+        blob = await platform.captureRegion(tab, m, (dy) => platform.inspect(tabId, { op: 'shotScroll', dy }));
+      } finally {
+        await platform.inspect(tabId, { op: 'shotEnd' }).catch(() => {});
+      }
+      const img = await createImageBitmap(blob);
+      const size = { width: img.width, height: img.height };
+      img.close();
+      if (action === 'copy') {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      } else {
+        let host = 'page';
+        try {
+          host = new URL(tab.url).hostname || host;
+        } catch {}
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        saveBlob(`element-${host}-${stamp}.png`, blob);
+      }
+      return size;
+    },
+
+    /** A PNG of the element where `m` says it is. Chromium: from screenshots of the tab. */
+    async captureRegion(tab, m, scroll) {
+      return captureBySlices(api, tab, m, scroll);
     },
 
     /** Injects the inspector content script into the tab's top frame. */
@@ -295,14 +474,6 @@ export function installPlatform(api, overrides = {}) {
       return results
         .filter((r) => r && r.result)
         .flatMap((r) => r.result.items.map((i) => ({ ...i, frame: r.result.frameUrl, top: !!r.result.top })));
-    },
-
-    /** UI pages: `cb(json)` when the inspector content script reports a picked element. */
-    onInspectorPick(cb) {
-      api.runtime.onMessage.addListener((msg) => {
-        if (msg && msg.smInspectPicked) cb(JSON.stringify(msg.smInspectPicked));
-        return undefined;
-      });
     },
 
     /** A query parameter of this page's URL ('' if missing). */
@@ -495,16 +666,7 @@ export function installPlatform(api, overrides = {}) {
 
     /** Saves text as a downloaded file. */
     downloadText(filename, text, mime) {
-      const blob = new Blob([text], { type: mime || 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.style.display = 'none';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      saveBlob(filename, new Blob([text], { type: mime || 'text/plain' }));
     },
 
     /** Removes the toolbar badge (after the release notes were seen). */
@@ -577,6 +739,29 @@ export function installPlatform(api, overrides = {}) {
         if (!info.removed) fire({ type: 'cookieSet', cookie: cookieOut(info.cookie) });
       });
       api.alarms.onAlarm.addListener((alarm) => fire({ type: 'alarm', name: alarm.name }));
+      // A docked inspector comes back when its page navigates or reloads.
+      api.tabs.onUpdated.addListener((tabId, change) => {
+        if (change.status !== 'complete') return;
+        dockedTabs().then((list) => {
+          if (list.includes(tabId)) platform.dockInspector(tabId).catch((e) => console.warn('[session-manager] dock', e));
+        });
+      });
+      api.tabs.onRemoved.addListener((tabId) => {
+        dockedTabs().then((list) => list.includes(tabId) && setDocked(tabId, false));
+      });
+      // Right-click on any frame of a page: open it in a new tab.
+      const menus = api.menus ?? api.contextMenus;
+      if (menus) {
+        menus.removeAll(() => {
+          menus.create({ id: 'sm-open-frame', title: 'Open frame in new tab', contexts: ['frame'] }, () => void api.runtime.lastError);
+        });
+        menus.onClicked.addListener((info, tab) => {
+          if (info.menuItemId !== 'sm-open-frame' || !info.frameUrl) return;
+          const props = { url: info.frameUrl, active: true };
+          if (tab && tab.index >= 0) Object.assign(props, { index: tab.index + 1, windowId: tab.windowId });
+          api.tabs.create(props).catch((e) => console.warn('[session-manager] open frame', e));
+        });
+      }
       api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Playback reported by the media content script (web/media.js).
         if (msg && msg.smMedia && sender && sender.tab) {

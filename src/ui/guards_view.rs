@@ -40,6 +40,12 @@ impl GuardsView {
                     "Windows and tabs a page opens without a click, or from code that catches clicks anywhere on the page \
                      (how pop-under ad scripts open ad tabs). Links and buttons you click keep working.",
                 );
+                changed |= setting(
+                    ui,
+                    &mut s.guards.click_hijack,
+                    "Stop ads that hijack the play button",
+                    "Clicks on a video player, or on an invisible layer over the page, can't open windows or tabs. A layer                      laid over the player to catch your click is switched off, so the click starts the video instead.",
+                );
                 ui.separator();
                 self.rules(ui, cx, acts);
                 ui.separator();

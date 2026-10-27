@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Session Manager",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Track tabs in sessions, search and organize them, and clean cookies & site data.",
   "minimum_chrome_version": "120",
   "icons": {
@@ -21,7 +21,9 @@
     "clipboardRead",
     "sidePanel",
     "scripting",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "contextMenus",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -70,10 +72,20 @@
       "suggested_key": {
         "default": "Alt+Shift+I"
       },
-      "description": "Inspect the current page in a separate window"
+      "description": "Inspect the current page (in a window, or docked at the bottom of the page)"
     }
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "inspector.html"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
 }

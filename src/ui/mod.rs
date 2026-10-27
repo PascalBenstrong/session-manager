@@ -863,7 +863,7 @@ impl App {
         self.drain_inbox();
         if let Some(mut inspector) = self.inspector.take() {
             let mut acts = Actions::default();
-            inspector.ui(ui, &mut acts);
+            inspector.ui(ui, &mut acts, self.state.as_ref());
             self.inspector = Some(inspector);
             self.apply(acts);
             let dark = ui.visuals().dark_mode;

@@ -1,11 +1,14 @@
-//! Inspector window (`inspector.html?tab=ID`): inspects a tab's page without the browser's
+//! Inspector (`inspector.html?tab=ID`): inspects a tab's page without the browser's
 //! developer tools, through a content script in the extension's isolated world
-//! (`web/inspect.js`). Panes: Elements (DOM tree, picker, details), Media & frames (video,
-//! frame, script... URLs of every frame, grouped and searchable) and Source.
+//! (`web/inspect.js`). It runs in its own window, or docked at the bottom of the page (an
+//! iframe the content script adds, `&dock=TOKEN`). Panes: Elements (live DOM tree, picker,
+//! details, context menus, screenshots), Media & frames (video, frame, script... URLs of
+//! every frame), Ads (the ad networks the page runs) and Source.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Align, CursorIcon, Layout, Margin, RichText, Sense, Stroke};
 use serde::Deserialize;
@@ -16,8 +19,9 @@ use wasm_bindgen_futures::spawn_local;
 use super::theme;
 use super::widgets::{badge, empty_state, icon_button, primary_button, segmented, text_input};
 use super::Actions;
+use crate::ads::{self, AdCategory, AdSignal, ProviderHit};
 use crate::guards::{BlockRule, BlockRuleKind, normalize_site};
-use crate::model::TabId;
+use crate::model::{AppState, TabId};
 use crate::platform::{self as pf, PageResource};
 use crate::protocol::Command;
 
@@ -36,6 +40,9 @@ const KINDS: [(&str, &str); 11] = [
     ("script", "📜 Scripts"),
 ];
 
+/// Reconnection attempts after the page went away (navigation, reload), one a second.
+const RECONNECT_TRIES: u32 = 20;
+
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 struct NodeSummary {
@@ -45,6 +52,14 @@ struct NodeSummary {
     label: String,
     children: usize,
     text: String,
+    /// Iframes and frames: where they are.
+    src: String,
+}
+
+impl NodeSummary {
+    fn is_frame(&self) -> bool {
+        self.kind == "element" && matches!(self.tag.as_str(), "iframe" | "frame")
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -77,7 +92,19 @@ struct Root {
     node: NodeSummary,
 }
 
+/// What the content script tells a connected inspector.
 #[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct PageEvent {
+    picked: Option<Picked>,
+    pick_cancelled: bool,
+    changed: Option<Vec<u64>>,
+    details: bool,
+    title: Option<String>,
+    disconnected: bool,
+}
+
+#[derive(Deserialize, Default, Clone)]
 #[serde(default)]
 struct Picked {
     id: u64,
@@ -88,29 +115,69 @@ enum Reply {
     Ready(Result<Root, String>),
     Children(u64, Result<Vec<NodeSummary>, String>),
     Details(Result<Details, String>),
+    /// Details read again after the page changed (a removed element just goes away).
+    Refreshed(Result<Details, String>),
     Query(Result<Vec<NodeSummary>, String>),
+    /// The ids from the root down to a node, to open the tree to it.
+    Reveal(u64, Result<Vec<u64>, String>),
     Source(Result<String, String>),
     Resources(Result<Vec<PageResource>, String>),
+    Ads(Result<Vec<AdSignal>, String>),
+    /// Text to put on the clipboard, and what it is ("CSS selector").
+    Copy(&'static str, Result<String, String>),
+    Shot(&'static str, Result<pf::ShotSize, String>),
     Done(Result<(), String>),
+    /// Errors not worth showing (highlighting an element that just went away).
+    Quiet,
 }
 
 #[derive(Default)]
 struct Inbox {
     replies: Vec<Reply>,
-    picked: Option<Picked>,
+    /// Page events, with the connection they came from.
+    events: Vec<(u32, PageEvent)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Elements,
     Media,
+    Ads,
     Source,
+}
+
+/// Remembers the text last selected in the inspector's labels (egui only reports it as an
+/// output command), for "Copy selected text".
+struct SelectionWatcher(Arc<Mutex<String>>);
+
+impl egui::Plugin for SelectionWatcher {
+    fn debug_name(&self) -> &'static str {
+        "InspectorSelectionWatcher"
+    }
+
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+        for cmd in &output.platform_output.commands {
+            if let egui::OutputCommand::TextSelectionSettled(text) = cmd
+                && let Ok(mut last) = self.0.lock()
+            {
+                last.clone_from(text);
+            }
+        }
+    }
 }
 
 pub struct InspectorView {
     tab: Option<TabId>,
+    /// Docked in the page: the token the page's dock gave this page.
+    dock: Option<String>,
     ctx: egui::Context,
     inbox: Rc<RefCell<Inbox>>,
+    /// Current connection to the page (events of older ones are ignored).
+    connection: u32,
+    connected: bool,
+    /// Reconnecting after the page went away: (tries left, when to try next).
+    reconnect: Option<(u32, f64)>,
+    selection: Arc<Mutex<String>>,
     pane: Pane,
     error: Option<String>,
     title: String,
@@ -125,10 +192,13 @@ pub struct InspectorView {
     hovered: Option<u64>,
     query: String,
     query_results: Option<Vec<NodeSummary>>,
+    /// Select the first match of the running query (ad slots' "Show").
+    select_first_match: bool,
     style_filter: String,
     confirm_delete: bool,
     resources: Option<Vec<PageResource>>,
     res_query: String,
+    ads: Option<Vec<AdSignal>>,
     source: Option<Vec<String>>,
     source_query: String,
 }
@@ -140,23 +210,18 @@ fn parse<T: for<'de> Deserialize<'de>>(r: Result<Value, String>) -> Result<T, St
 impl InspectorView {
     pub fn new(ctx: &egui::Context) -> Self {
         let tab = pf::location_param("tab").parse::<TabId>().ok();
-        let inbox = Rc::new(RefCell::new(Inbox::default()));
-        {
-            let inbox = inbox.clone();
-            let ctx = ctx.clone();
-            let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
-                if let Some(p) = v.as_string().and_then(|s| serde_json::from_str::<Picked>(&s).ok()) {
-                    inbox.borrow_mut().picked = Some(p);
-                    ctx.request_repaint();
-                }
-            });
-            pf::on_inspector_pick(cb.as_ref().unchecked_ref());
-            cb.forget();
-        }
+        let dock = Some(pf::location_param("dock")).filter(|d| !d.is_empty());
+        let selection = Arc::new(Mutex::new(String::new()));
+        ctx.add_plugin(SelectionWatcher(selection.clone()));
         let mut v = Self {
             tab,
+            dock,
             ctx: ctx.clone(),
-            inbox,
+            inbox: Rc::new(RefCell::new(Inbox::default())),
+            connection: 0,
+            connected: false,
+            reconnect: None,
+            selection,
             pane: Pane::Elements,
             error: tab.is_none().then(|| "No tab to inspect.".to_string()),
             title: String::new(),
@@ -171,10 +236,12 @@ impl InspectorView {
             hovered: None,
             query: String::new(),
             query_results: None,
+            select_first_match: false,
             style_filter: String::new(),
             confirm_delete: false,
             resources: None,
             res_query: String::new(),
+            ads: None,
             source: None,
             source_query: String::new(),
         };
@@ -182,7 +249,8 @@ impl InspectorView {
         v
     }
 
-    /// Injects the content script and loads the document root.
+    /// Injects the content script, connects to it (live changes, picks) and loads the
+    /// document root.
     fn connect(&mut self) {
         let Some(tab) = self.tab else { return };
         self.root = None;
@@ -191,10 +259,32 @@ impl InspectorView {
         self.details = None;
         self.selected = None;
         self.error = None;
-        self.run(async move {
-            pf::inspector_inject(tab).await?;
-            pf::inspect(tab, &json!({ "op": "root" })).await
-        }, |r| Reply::Ready(parse(r)));
+        self.picking = false;
+        self.connection += 1;
+        let connection = self.connection;
+        let inbox = self.inbox.clone();
+        let ctx = self.ctx.clone();
+        let dock = self.dock.clone();
+        self.run(
+            async move {
+                pf::inspector_inject(tab).await?;
+                if let Some(token) = dock
+                    && !pf::verify_dock(tab, &token).await?
+                {
+                    return Err("This inspector wasn't opened by Session Manager.".into());
+                }
+                let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
+                    if let Some(e) = v.as_string().and_then(|s| serde_json::from_str::<PageEvent>(&s).ok()) {
+                        inbox.borrow_mut().events.push((connection, e));
+                        ctx.request_repaint();
+                    }
+                });
+                pf::inspector_connect(tab, cb.as_ref().unchecked_ref())?;
+                cb.forget();
+                pf::inspect(tab, &json!({ "op": "root" })).await
+            },
+            |r| Reply::Ready(parse(r)),
+        );
     }
 
     fn run<F>(&self, fut: F, reply: impl FnOnce(Result<Value, String>) -> Reply + 'static)
@@ -215,6 +305,11 @@ impl InspectorView {
         self.run(async move { pf::inspect(tab, &request).await }, reply);
     }
 
+    /// A request whose failure isn't worth an error message.
+    fn tell(&self, request: Value) {
+        self.ask(request, |_| Reply::Quiet);
+    }
+
     fn load_children(&self, id: u64) {
         self.ask(json!({ "op": "children", "id": id }), move |r| Reply::Children(id, parse(r)));
     }
@@ -223,7 +318,37 @@ impl InspectorView {
         self.selected = Some(id);
         self.confirm_delete = false;
         self.ask(json!({ "op": "details", "id": id }), |r| Reply::Details(parse(r)));
-        self.ask(json!({ "op": "scrollTo", "id": id }), |r| Reply::Done(r.map(drop)));
+        self.tell(json!({ "op": "scrollTo", "id": id }));
+    }
+
+    /// Opens the tree down to a node, selects it and scrolls the tree to it.
+    fn reveal(&mut self, id: u64, path: &[u64]) {
+        self.pane = Pane::Elements;
+        for a in path.iter().filter(|a| **a != id) {
+            self.expanded.insert(*a);
+            if !self.children.contains_key(a) {
+                self.load_children(*a);
+            }
+        }
+        self.select(id);
+        self.scroll_to_selected = true;
+    }
+
+    fn copy(&self, id: u64, what: &'static str, label: &'static str) {
+        self.ask(json!({ "op": "copy", "id": id, "what": what }), move |r| Reply::Copy(label, parse(r)));
+    }
+
+    fn screenshot(&self, id: u64, action: &'static str) {
+        let Some(tab) = self.tab else { return };
+        self.run(
+            async move { pf::capture_element(tab, id, action).await.map(|s| json!([s.width, s.height])) },
+            move |r| {
+                Reply::Shot(
+                    action,
+                    r.map(|v| pf::ShotSize { width: v[0].as_u64().unwrap_or(0) as u32, height: v[1].as_u64().unwrap_or(0) as u32 }),
+                )
+            },
+        );
     }
 
     fn load_resources(&mut self) {
@@ -255,19 +380,67 @@ impl InspectorView {
         );
     }
 
-    fn drain(&mut self) {
-        let (replies, picked) = {
+    fn load_ads(&mut self) {
+        let Some(tab) = self.tab else { return };
+        self.run(
+            async move {
+                let selectors: Vec<&str> = ads::SLOT_SELECTORS.iter().map(|(s, _)| *s).collect();
+                let list = pf::collect_ad_signals(tab, &selectors).await?;
+                Ok(Value::Array(list.into_iter().map(|s| json!([s.kind, s.url, s.detail, s.frame])).collect()))
+            },
+            |r| {
+                Reply::Ads(r.map(|v| {
+                    v.as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|x| AdSignal {
+                                    kind: x[0].as_str().unwrap_or("").to_string(),
+                                    url: x[1].as_str().unwrap_or("").to_string(),
+                                    detail: x[2].as_str().unwrap_or("").to_string(),
+                                    frame: x[3].as_str().unwrap_or("").to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }))
+            },
+        );
+    }
+
+    fn refresh_pane(&mut self) {
+        match self.pane {
+            Pane::Elements => self.connect(),
+            Pane::Media => self.load_resources(),
+            Pane::Ads => self.load_ads(),
+            Pane::Source => self.ask(json!({ "op": "source" }), |r| Reply::Source(parse(r))),
+        }
+    }
+
+    fn drain(&mut self, acts: &mut Actions) {
+        let (replies, events) = {
             let mut inbox = self.inbox.borrow_mut();
-            (std::mem::take(&mut inbox.replies), inbox.picked.take())
+            (std::mem::take(&mut inbox.replies), std::mem::take(&mut inbox.events))
         };
         for r in replies {
             match r {
                 Reply::Ready(Ok(root)) => {
+                    self.connected = true;
+                    self.reconnect = None;
                     self.title = root.title;
                     self.url = root.url;
                     self.expanded.insert(root.node.id);
                     self.load_children(root.node.id);
                     self.root = Some(root.node);
+                }
+                Reply::Ready(Err(e)) => {
+                    // Still loading after a navigation: try again shortly.
+                    match self.reconnect {
+                        Some((tries, _)) if tries > 0 => self.reconnect = Some((tries - 1, pf::now() + 1000.0)),
+                        _ => {
+                            self.reconnect = None;
+                            self.error = Some(e);
+                        }
+                    }
                 }
                 Reply::Children(id, Ok(list)) => {
                     // Open <body> by default.
@@ -278,41 +451,112 @@ impl InspectorView {
                     }
                     self.children.insert(id, list);
                 }
-                Reply::Details(Ok(d)) => self.details = Some(d),
-                Reply::Query(Ok(list)) => self.query_results = Some(list),
+                Reply::Children(id, Err(_)) => {
+                    // The node went away with a change of the page.
+                    self.children.remove(&id);
+                    self.expanded.remove(&id);
+                }
+                Reply::Details(Ok(d)) | Reply::Refreshed(Ok(d)) => {
+                    if self.selected == Some(d.node.id) {
+                        self.details = Some(d);
+                    }
+                }
+                Reply::Refreshed(Err(_)) => {
+                    self.details = None;
+                    self.selected = None;
+                }
+                Reply::Query(Ok(list)) => {
+                    if std::mem::take(&mut self.select_first_match)
+                        && let Some(first) = list.first()
+                    {
+                        let id = first.id;
+                        self.ask(json!({ "op": "reveal", "id": id }), move |r| Reply::Reveal(id, parse(r)));
+                    }
+                    self.query_results = Some(list);
+                }
+                Reply::Reveal(id, Ok(path)) => self.reveal(id, &path),
                 Reply::Source(Ok(s)) => self.source = Some(s.lines().map(String::from).collect()),
                 Reply::Resources(Ok(list)) => self.resources = Some(list),
-                Reply::Done(Ok(())) => {}
-                Reply::Ready(Err(e))
-                | Reply::Children(_, Err(e))
-                | Reply::Details(Err(e))
+                Reply::Ads(Ok(list)) => self.ads = Some(list),
+                Reply::Copy(label, Ok(text)) => {
+                    if text.is_empty() {
+                        acts.notice(format!("Nothing to copy ({label} is empty)"));
+                    } else {
+                        self.ctx.copy_text(text);
+                        acts.notice(format!("Copied the {label}"));
+                    }
+                }
+                Reply::Shot(action, Ok(size)) => {
+                    let what = if action == "copy" { "copied" } else { "saved" };
+                    acts.notice(format!("Screenshot {what} ({} × {} px)", size.width, size.height));
+                }
+                Reply::Shot(_, Err(e)) => self.error = Some(format!("Screenshot failed: {e}")),
+                Reply::Done(Ok(())) | Reply::Quiet => {}
+                Reply::Details(Err(e))
                 | Reply::Query(Err(e))
+                | Reply::Reveal(_, Err(e))
                 | Reply::Source(Err(e))
                 | Reply::Resources(Err(e))
+                | Reply::Ads(Err(e))
+                | Reply::Copy(_, Err(e))
                 | Reply::Done(Err(e)) => self.error = Some(e),
             }
         }
-        if let Some(p) = picked {
-            self.picking = false;
-            self.pane = Pane::Elements;
-            // Open every ancestor, loading what isn't loaded yet.
-            for id in p.path.iter().filter(|id| **id != p.id) {
-                self.expanded.insert(*id);
-                if !self.children.contains_key(id) {
-                    self.load_children(*id);
+        for (connection, e) in events {
+            if connection != self.connection {
+                continue;
+            }
+            if e.disconnected {
+                // The page navigated, reloaded or closed: read the new one when it's there.
+                self.connected = false;
+                self.picking = false;
+                self.reconnect = Some((RECONNECT_TRIES, pf::now() + 800.0));
+                continue;
+            }
+            if let Some(p) = e.picked {
+                self.picking = false;
+                self.reveal(p.id, &p.path);
+            }
+            if e.pick_cancelled {
+                self.picking = false;
+            }
+            if let Some(t) = e.title {
+                self.title = t;
+            }
+            for id in e.changed.unwrap_or_default() {
+                if self.children.contains_key(&id) {
+                    self.load_children(id);
                 }
             }
-            self.select(p.id);
-            self.scroll_to_selected = true;
+            if e.details
+                && let Some(id) = self.selected
+            {
+                self.ask(json!({ "op": "details", "id": id }), |r| Reply::Refreshed(parse(r)));
+            }
+        }
+        if let Some((tries, at)) = self.reconnect {
+            let now = pf::now();
+            if now >= at {
+                self.reconnect = Some((tries, f64::INFINITY));
+                self.connect();
+                self.resources = None;
+                self.ads = None;
+                self.source = None;
+                if self.pane != Pane::Elements {
+                    self.refresh_pane();
+                }
+            } else if at.is_finite() {
+                self.ctx.request_repaint_after(std::time::Duration::from_millis((at - now) as u64));
+            }
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
-        self.drain();
+    pub fn ui(&mut self, ui: &mut egui::Ui, acts: &mut Actions, state: Option<&AppState>) {
+        self.drain(acts);
         let p = theme::palette(ui);
         egui::Panel::top("inspector-header")
-            .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 8)))
-            .show(ui, |ui| self.header(ui));
+            .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, if self.dock.is_some() { 4 } else { 8 })))
+            .show(ui, |ui| self.header(ui, acts));
         if let Some(e) = self.error.clone() {
             egui::Panel::bottom("inspector-error")
                 .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
@@ -328,80 +572,114 @@ impl InspectorView {
                     });
                 });
         }
+        let pad = egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12));
         match self.pane {
-            Pane::Elements => self.elements(ui),
+            Pane::Elements => self.elements(ui, acts),
             Pane::Media => {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12)))
-                    .show(ui, |ui| self.media(ui, acts));
+                egui::CentralPanel::default().frame(pad).show(ui, |ui| self.media(ui, acts));
+            }
+            Pane::Ads => {
+                egui::CentralPanel::default().frame(pad).show(ui, |ui| self.ads(ui, acts, state));
             }
             Pane::Source => {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12)))
-                    .show(ui, |ui| self.source(ui, acts));
+                egui::CentralPanel::default().frame(pad).show(ui, |ui| self.source(ui, acts));
             }
         }
     }
 
-    fn header(&mut self, ui: &mut egui::Ui) {
+    fn header(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
         let p = theme::palette(ui);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("🔬").size(18.0).color(p.accent));
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let title = if self.title.is_empty() { "Inspector" } else { &self.title };
-                ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
-                ui.add(egui::Label::new(RichText::new(&self.url).small().color(p.muted)).truncate());
+        if self.dock.is_none() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🔬").size(18.0).color(p.accent));
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let title = if self.title.is_empty() { "Inspector" } else { &self.title };
+                    ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
+                    ui.add(egui::Label::new(RichText::new(&self.url).small().color(p.muted)).truncate());
+                });
             });
-        });
-        ui.add_space(4.0);
+            ui.add_space(4.0);
+        }
         ui.horizontal(|ui| {
             let before = self.pane;
-            segmented(ui, &mut self.pane, &[(Pane::Elements, "Elements"), (Pane::Media, "Media & frames"), (Pane::Source, "Source")]);
+            segmented(
+                ui,
+                &mut self.pane,
+                &[(Pane::Elements, "Elements"), (Pane::Media, "Media & frames"), (Pane::Ads, "Ads"), (Pane::Source, "Source")],
+            );
             if self.pane != before {
                 match self.pane {
                     Pane::Media if self.resources.is_none() => self.load_resources(),
-                    Pane::Source if self.source.is_none() => self.ask(json!({ "op": "source" }), |r| Reply::Source(parse(r))),
+                    Pane::Ads if self.ads.is_none() => self.load_ads(),
+                    Pane::Source if self.source.is_none() => self.refresh_pane(),
                     _ => {}
                 }
             }
+            if self.connected {
+                ui.label(RichText::new("● Live").small().color(p.success)).on_hover_text("The tree follows changes to the page");
+            } else if self.reconnect.is_some() {
+                ui.label(RichText::new("◌ Page loading…").small().color(p.muted));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.placement_buttons(ui, acts);
                 if ui.button("⟳ Refresh").on_hover_text("Read the page again").clicked() {
-                    match self.pane {
-                        Pane::Elements => self.connect(),
-                        Pane::Media => self.load_resources(),
-                        Pane::Source => self.ask(json!({ "op": "source" }), |r| Reply::Source(parse(r))),
-                    }
+                    self.refresh_pane();
                 }
                 if self.pane == Pane::Elements {
                     let label = if self.picking { "Picking… (Esc cancels)" } else { "🎯 Pick an element" };
-                    if ui
-                        .add(primary_button(ui, label))
-                        .on_hover_text("Then click an element in the page")
-                        .clicked()
-                    {
+                    if ui.add(primary_button(ui, label)).on_hover_text("Then click an element in the page").clicked() {
                         if self.picking {
                             self.picking = false;
-                            self.ask(json!({ "op": "cancelPick" }), |r| Reply::Done(r.map(drop)));
+                            self.tell(json!({ "op": "cancelPick" }));
                         } else {
                             self.picking = true;
                             self.ask(json!({ "op": "pick" }), |r| Reply::Done(r.map(drop)));
                         }
                     }
                 }
+                if self.dock.is_some() {
+                    let title = if self.title.is_empty() { "Inspector" } else { &self.title };
+                    ui.add(egui::Label::new(RichText::new(format!("🔬 {title}")).small().color(p.muted)).truncate());
+                }
             });
         });
     }
 
+    /// Dock / undock / close.
+    fn placement_buttons(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
+        let Some(tab) = self.tab else { return };
+        let mv = |place: &'static str| {
+            spawn_local(async move {
+                if let Err(e) = pf::move_inspector(tab, place).await {
+                    web_sys::console::warn_1(&format!("could not move the inspector: {e}").into());
+                }
+            });
+        };
+        if self.dock.is_some() {
+            if icon_button(ui, "🗙", "Close the inspector").clicked() {
+                spawn_local(async move {
+                    let _ = pf::undock_inspector(tab).await;
+                });
+            }
+            if icon_button(ui, "🗗", "Open the inspector in its own window (and from now on)").clicked() {
+                mv("window");
+            }
+        } else if icon_button(ui, "⬓", "Dock the inspector at the bottom of the page (and from now on)").clicked() {
+            mv("bottom");
+            acts.notice("Docking…");
+        }
+    }
+
     // ------------------------------------------------------------ elements
 
-    fn elements(&mut self, ui: &mut egui::Ui) {
+    fn elements(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
         let p = theme::palette(ui);
         egui::Panel::right("details")
             .resizable(true)
-            .default_size(440.0)
+            .default_size(if self.dock.is_some() { 520.0 } else { 440.0 })
             .frame(egui::Frame::new().fill(p.surface).inner_margin(Margin::same(12)))
-            .show(ui, |ui| self.details_panel(ui));
+            .show(ui, |ui| self.details_panel(ui, acts));
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(10)))
             .show(ui, |ui| {
@@ -422,9 +700,12 @@ impl InspectorView {
                     });
                     egui::ScrollArea::vertical().id_salt("query-results").max_height(160.0).show(ui, |ui| {
                         for n in &results {
-                            if self.node_label(ui, n, false).clicked() {
-                                self.select(n.id);
+                            let r = self.node_label(ui, n, false);
+                            if r.clicked() {
+                                let id = n.id;
+                                self.ask(json!({ "op": "reveal", "id": id }), move |r| Reply::Reveal(id, parse(r)));
                             }
+                            r.context_menu(|ui| self.node_menu(ui, n, acts));
                         }
                     });
                     ui.separator();
@@ -433,7 +714,7 @@ impl InspectorView {
                 egui::ScrollArea::both().id_salt("tree").auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     match self.root.clone() {
-                        Some(root) => self.tree(ui, &root, 0, &mut hovered),
+                        Some(root) => self.tree(ui, &root, 0, &mut hovered, acts),
                         None if self.error.is_none() => {
                             ui.spinner();
                         }
@@ -443,12 +724,12 @@ impl InspectorView {
                 if hovered != self.hovered {
                     self.hovered = hovered;
                     let id = hovered.or(self.selected);
-                    self.ask(json!({ "op": "highlight", "id": id }), |r| Reply::Done(r.map(drop)));
+                    self.tell(json!({ "op": "highlight", "id": id }));
                 }
             });
     }
 
-    fn tree(&mut self, ui: &mut egui::Ui, n: &NodeSummary, depth: usize, hovered: &mut Option<u64>) {
+    fn tree(&mut self, ui: &mut egui::Ui, n: &NodeSummary, depth: usize, hovered: &mut Option<u64>, acts: &mut Actions) {
         let open = self.expanded.contains(&n.id);
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 14.0);
@@ -472,18 +753,19 @@ impl InspectorView {
                 r.scroll_to_me(Some(Align::Center));
                 self.scroll_to_selected = false;
             }
-            if r.hovered() {
+            if r.hovered() || r.context_menu_opened() {
                 *hovered = Some(n.id);
             }
             if r.clicked() {
                 self.select(n.id);
             }
+            r.context_menu(|ui| self.node_menu(ui, n, acts));
         });
         if open {
             match self.children.get(&n.id).cloned() {
                 Some(kids) => {
                     for k in &kids {
-                        self.tree(ui, k, depth + 1, hovered);
+                        self.tree(ui, k, depth + 1, hovered, acts);
                     }
                 }
                 None => {
@@ -522,10 +804,136 @@ impl InspectorView {
         r
     }
 
-    fn details_panel(&mut self, ui: &mut egui::Ui) {
+    /// Text selected in the inspector's own labels (HTML, text, attributes...), if any.
+    fn inspector_selection(&self, ui: &egui::Ui) -> Option<String> {
+        let active = ui.ctx().plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection();
+        let text = self.selection.lock().ok()?.clone();
+        (active && !text.is_empty()).then_some(text)
+    }
+
+    /// The context menu of an element in the tree (or in the search results).
+    fn node_menu(&mut self, ui: &mut egui::Ui, n: &NodeSummary, acts: &mut Actions) {
+        let element = n.kind == "element";
+        let id = n.id;
+        ui.set_min_width(220.0);
+        if let Some(text) = self.inspector_selection(ui)
+            && ui.button("Copy selected text").clicked()
+        {
+            ui.ctx().copy_text(text);
+            acts.notice("Copied the selected text");
+        }
+        if element {
+            if ui.button("Copy element (outer HTML)").clicked() {
+                self.copy(id, "outerHtml", "element's HTML");
+            }
+            if ui.button("Copy inner HTML").clicked() {
+                self.copy(id, "innerHtml", "inner HTML");
+            }
+        }
+        if ui.button("Copy text").clicked() {
+            self.copy(id, "text", "text");
+        }
+        if ui.button("Copy text selected on the page").on_hover_text("What you selected in the page, within this element").clicked() {
+            self.copy(id, "selection", "selected text");
+        }
+        ui.menu_button("Copy path", |ui| {
+            if ui.button("CSS selector").clicked() {
+                self.copy(id, "selector", "CSS selector");
+            }
+            if ui.button("JS path").clicked() {
+                self.copy(id, "jsPath", "JS path");
+            }
+            if ui.button("XPath").clicked() {
+                self.copy(id, "xpath", "XPath");
+            }
+        });
+        if element {
+            ui.menu_button("Copy attributes", |ui| {
+                if ui.button("All attributes").clicked() {
+                    self.copy(id, "attributes", "attributes");
+                }
+                if let Some(d) = self.details.as_ref().filter(|d| d.node.id == id) {
+                    ui.separator();
+                    for (k, v) in &d.attributes {
+                        if ui.button(k.as_str()).on_hover_text(v).clicked() {
+                            ui.ctx().copy_text(v.clone());
+                            acts.notice(format!("Copied the value of {k}"));
+                        }
+                    }
+                } else {
+                    ui.label(RichText::new("Select the element to copy single attributes").small().weak());
+                }
+            });
+            if ui.button("Copy computed styles").clicked() {
+                self.copy(id, "styles", "computed styles");
+            }
+        }
+        if n.is_frame() {
+            ui.separator();
+            let src = n.src.clone();
+            let web = src.starts_with("http");
+            if ui.add_enabled(web, egui::Button::new("↗ Open frame in new tab")).on_hover_text(&src).clicked() {
+                acts.open_page(src.clone());
+            }
+            if ui.add_enabled(!src.is_empty(), egui::Button::new("Copy frame URL")).clicked() {
+                ui.ctx().copy_text(src);
+                acts.notice("Copied the frame's URL");
+            }
+        }
+        ui.separator();
+        if ui.button("Select").clicked() {
+            let id = n.id;
+            self.ask(json!({ "op": "reveal", "id": id }), move |r| Reply::Reveal(id, parse(r)));
+        }
+        if ui.button("Scroll into view").clicked() {
+            self.tell(json!({ "op": "scrollTo", "id": id }));
+        }
+        if element {
+            if ui.button("📷 Save a screenshot").clicked() {
+                self.screenshot(id, "download");
+            }
+            if ui.button("📷 Copy a screenshot").clicked() {
+                self.screenshot(id, "copy");
+            }
+            ui.separator();
+            if ui.button(RichText::new("🗑 Delete element").color(theme::palette(ui).danger)).clicked() {
+                self.delete(id);
+            }
+        }
+    }
+
+    fn delete(&mut self, id: u64) {
+        self.ask(json!({ "op": "remove", "id": id }), |r| Reply::Done(r.map(drop)));
+        if self.selected == Some(id) {
+            self.details = None;
+            self.selected = None;
+        }
+        self.children.retain(|_, list| !list.iter().any(|n| n.id == id));
+        self.confirm_delete = false;
+    }
+
+    /// Context menu of a text in the details panel: the selection, or the whole value.
+    fn value_menu(&self, r: &egui::Response, items: &[(&str, String)], acts: &mut Actions) {
+        r.context_menu(|ui| {
+            if let Some(text) = self.inspector_selection(ui)
+                && ui.button("Copy selected text").clicked()
+            {
+                ui.ctx().copy_text(text);
+                acts.notice("Copied the selected text");
+            }
+            for (label, value) in items {
+                if ui.button(*label).clicked() {
+                    ui.ctx().copy_text(value.clone());
+                    acts.notice("Copied");
+                }
+            }
+        });
+    }
+
+    fn details_panel(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
         let p = theme::palette(ui);
         let Some(d) = self.details.clone() else {
-            empty_state(ui, "🎯", "Pick or click an element", "Its attributes, size, styles and HTML show here.");
+            empty_state(ui, "🎯", "Pick or click an element", "Its attributes, size, styles and HTML show here. Right-click for more.");
             return;
         };
         egui::ScrollArea::vertical().id_salt("details").auto_shrink([false, false]).show(ui, |ui| {
@@ -537,15 +945,18 @@ impl InspectorView {
                         ui.label(RichText::new("›").color(p.muted));
                     }
                     let name = if n.kind == "element" { n.tag.clone() } else { n.kind.clone() };
-                    if ui.link(RichText::new(name).small()).clicked() {
+                    let r = ui.link(RichText::new(name).small());
+                    if r.clicked() {
                         self.select(n.id);
                     }
+                    r.context_menu(|ui| self.node_menu(ui, n, acts));
                 }
             });
             ui.add_space(6.0);
             if !d.selector.is_empty() {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(RichText::new(&d.selector).monospace().small()).truncate().selectable(true));
+                    let r = ui.add(egui::Label::new(RichText::new(&d.selector).monospace().small()).truncate().selectable(true));
+                    self.value_menu(&r, &[("Copy CSS selector", d.selector.clone())], acts);
                     if icon_button(ui, "⧉", "Copy the CSS selector").clicked() {
                         ui.ctx().copy_text(d.selector.clone());
                     }
@@ -556,22 +967,35 @@ impl InspectorView {
                     RichText::new(format!("{:.0} × {:.0} px at ({:.0}, {:.0})", r.width, r.height, r.x, r.y)).color(p.muted),
                 );
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Scroll into view").clicked() {
-                    self.ask(json!({ "op": "scrollTo", "id": d.node.id }), |r| Reply::Done(r.map(drop)));
+                    self.tell(json!({ "op": "scrollTo", "id": d.node.id }));
                 }
                 if ui.button("Copy HTML").clicked() {
                     ui.ctx().copy_text(d.outer_html.clone());
+                    acts.notice("Copied the element's HTML");
+                }
+                if d.node.kind == "element" {
+                    let shot = ui.button("📷 Screenshot").on_hover_text("Save a picture of the element (right-click: copy it)");
+                    if shot.clicked() {
+                        self.screenshot(d.node.id, "download");
+                    }
+                    shot.context_menu(|ui| {
+                        if ui.button("Save as PNG").clicked() {
+                            self.screenshot(d.node.id, "download");
+                        }
+                        if ui.button("Copy the picture").clicked() {
+                            self.screenshot(d.node.id, "copy");
+                        }
+                    });
+                }
+                if d.node.is_frame() && d.node.src.starts_with("http") && ui.button("↗ Open frame").on_hover_text(&d.node.src).clicked() {
+                    acts.open_page(d.node.src.clone());
                 }
                 let label = if self.confirm_delete { "Click again to delete" } else { "🗑 Delete element" };
                 if ui.button(RichText::new(label).color(p.danger)).on_hover_text("Remove it from the page (until reload)").clicked() {
                     if self.confirm_delete {
-                        let id = d.node.id;
-                        self.ask(json!({ "op": "remove", "id": id }), |r| Reply::Done(r.map(drop)));
-                        self.details = None;
-                        self.selected = None;
-                        self.children.retain(|_, list| !list.iter().any(|n| n.id == id));
-                        self.confirm_delete = false;
+                        self.delete(d.node.id);
                     } else {
                         self.confirm_delete = true;
                     }
@@ -584,8 +1008,15 @@ impl InspectorView {
                     .show(ui, |ui| {
                         egui::Grid::new("attrs").num_columns(2).striped(true).show(ui, |ui| {
                             for (k, v) in &d.attributes {
-                                ui.label(RichText::new(k).monospace().color(p.warn));
-                                ui.add(egui::Label::new(RichText::new(v).monospace()).wrap().selectable(true));
+                                let items = [
+                                    ("Copy value", v.clone()),
+                                    ("Copy name", k.clone()),
+                                    ("Copy as name=\"value\"", format!("{k}=\"{v}\"")),
+                                ];
+                                let r = ui.add(egui::Label::new(RichText::new(k).monospace().color(p.warn)).sense(Sense::click()));
+                                self.value_menu(&r, &items, acts);
+                                let r = ui.add(egui::Label::new(RichText::new(v).monospace()).wrap().selectable(true));
+                                self.value_menu(&r, &items, acts);
                                 ui.end_row();
                             }
                         });
@@ -598,8 +1029,11 @@ impl InspectorView {
                     egui::ScrollArea::vertical().id_salt("style").max_height(260.0).show(ui, |ui| {
                         egui::Grid::new("style").num_columns(2).show(ui, |ui| {
                             for (k, v) in d.style.iter().filter(|(k, v)| f.is_empty() || k.contains(&f) || v.to_lowercase().contains(&f)) {
-                                ui.label(RichText::new(k).monospace().small().color(p.accent_hover));
-                                ui.add(egui::Label::new(RichText::new(v).monospace().small()).selectable(true));
+                                let items = [("Copy value", v.clone()), ("Copy property", k.clone()), ("Copy declaration", format!("{k}: {v};"))];
+                                let r = ui.add(egui::Label::new(RichText::new(k).monospace().small().color(p.accent_hover)).sense(Sense::click()));
+                                self.value_menu(&r, &items, acts);
+                                let r = ui.add(egui::Label::new(RichText::new(v).monospace().small()).selectable(true));
+                                self.value_menu(&r, &items, acts);
                                 ui.end_row();
                             }
                         });
@@ -608,13 +1042,15 @@ impl InspectorView {
             }
             if !d.text.trim().is_empty() {
                 egui::CollapsingHeader::new(RichText::new("Text").strong()).show(ui, |ui| {
-                    ui.add(egui::Label::new(&d.text).wrap().selectable(true));
+                    let r = ui.add(egui::Label::new(&d.text).wrap().selectable(true));
+                    self.value_menu(&r, &[("Copy all text", d.text.clone())], acts);
                 });
             }
             egui::CollapsingHeader::new(RichText::new("HTML").strong()).default_open(true).show(ui, |ui| {
                 egui::Frame::new().fill(p.input).corner_radius(6).inner_margin(Margin::same(8)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.add(egui::Label::new(RichText::new(&d.outer_html).monospace().small()).wrap().selectable(true));
+                    let r = ui.add(egui::Label::new(RichText::new(&d.outer_html).monospace().small()).wrap().selectable(true));
+                    self.value_menu(&r, &[("Copy all HTML", d.outer_html.clone())], acts);
                 });
             });
         });
@@ -707,8 +1143,10 @@ impl InspectorView {
                             acts.notice("URL copied");
                         }
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.add(egui::Label::new(RichText::new(&r.url).monospace().small()).truncate().selectable(true))
+                            let l = ui
+                                .add(egui::Label::new(RichText::new(&r.url).monospace().small()).truncate().selectable(true))
                                 .on_hover_text(&r.url);
+                            self.url_menu(&l, &r.url, acts);
                         });
                     });
                 });
@@ -725,6 +1163,151 @@ impl InspectorView {
                         ui.label(RichText::new(meta.join(" · ")).small().color(p.muted));
                     });
                 }
+            });
+    }
+
+    fn url_menu(&self, r: &egui::Response, url: &str, acts: &mut Actions) {
+        r.context_menu(|ui| {
+            if let Some(text) = self.inspector_selection(ui)
+                && ui.button("Copy selected text").clicked()
+            {
+                ui.ctx().copy_text(text);
+                acts.notice("Copied the selected text");
+            }
+            if ui.button("Copy URL").clicked() {
+                ui.ctx().copy_text(url.to_string());
+                acts.notice("URL copied");
+            }
+            if url.starts_with("http") && ui.button("↗ Open in a new tab").clicked() {
+                acts.open_page(url.to_string());
+            }
+        });
+    }
+
+    // ------------------------------------------------------------ ads
+
+    fn ads(&mut self, ui: &mut egui::Ui, acts: &mut Actions, state: Option<&AppState>) {
+        let p = theme::palette(ui);
+        let Some(mut signals) = self.ads.clone() else {
+            ui.spinner();
+            return;
+        };
+        // Tabs this site opened (from the log of tabs opened by pages).
+        let site = crate::url::registrable_domain(&crate::url::host(&self.url));
+        if let Some(s) = state {
+            for e in &s.popup_log {
+                if !site.is_empty() && crate::url::registrable_domain(&crate::url::host(&e.opener)) == site {
+                    let detail = if e.closed_by.is_some() { "closed by a rule" } else { "" };
+                    signals.push(AdSignal { kind: "popup".into(), url: e.url.clone(), detail: detail.into(), frame: e.opener.clone() });
+                }
+            }
+        }
+        let hits = ads::providers(&self.url, &signals);
+        ui.label(
+            RichText::new(
+                "Ad networks this page uses, from the scripts, frames and requests of all its frames, its ad slots, and \
+                 the tabs it opened. Block a network on this site, or everywhere.",
+            )
+            .small()
+            .color(p.muted),
+        );
+        ui.add_space(6.0);
+        let rules = state.map(|s| s.block_rules.as_slice()).unwrap_or_default();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if hits.is_empty() {
+                empty_state(ui, "✨", "No ads found", "No known ad network shows up in this page's scripts, frames or requests.");
+            }
+            let mut category = None;
+            for h in &hits {
+                let cat = if h.signals.iter().any(|s| s.kind == "popup") { AdCategory::Popunder } else { h.category };
+                if category != Some(cat) {
+                    category = Some(cat);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(cat.label()).strong().color(p.muted));
+                }
+                self.provider_card(ui, h, &site, rules, acts);
+            }
+        });
+    }
+
+    fn provider_card(&mut self, ui: &mut egui::Ui, h: &ProviderHit, site: &str, rules: &[BlockRule], acts: &mut Actions) {
+        let p = theme::palette(ui);
+        let has_rule = |kind: BlockRuleKind, pattern: &str, sites: &[String]| {
+            rules.iter().any(|r| r.enabled && r.kind == kind && r.pattern == pattern && (r.sites.is_empty() || r.sites == sites))
+        };
+        egui::Frame::new()
+            .fill(p.surface)
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(10, 8))
+            .outer_margin(Margin { left: 0, right: 0, top: 0, bottom: 6 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&h.name).strong());
+                    if h.category == AdCategory::Suspected {
+                        badge(ui, "by its name", false);
+                    } else if !h.known {
+                        badge(ui, "unknown network", false);
+                    }
+                    ui.label(RichText::new(h.summary()).small().color(p.muted));
+                });
+                if !h.domains.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        let domains: Vec<String> = h.domains.iter().cloned().collect();
+                        ui.label(RichText::new(domains.join(", ")).monospace().small());
+                        let here = vec![site.to_string()];
+                        let blocked_here = domains.iter().all(|d| has_rule(BlockRuleKind::Script, d, &here));
+                        if blocked_here {
+                            ui.label(RichText::new("✔ scripts blocked").small().color(p.success));
+                        } else {
+                            if !site.is_empty()
+                                && ui
+                                    .button(RichText::new("⛔ Block on this site").color(p.danger))
+                                    .on_hover_text(format!("Rules blocking scripts from {} on {site}", domains.join(", ")))
+                                    .clicked()
+                            {
+                                for d in &domains {
+                                    let rule = BlockRule { enabled: true, kind: BlockRuleKind::Script, pattern: d.clone(), sites: here.clone(), ..Default::default() };
+                                    acts.send(Command::SaveBlockRule { rule });
+                                }
+                            }
+                            if ui.button("Block everywhere").on_hover_text(format!("Rules blocking scripts from {} on every site", domains.join(", "))).clicked() {
+                                for d in &domains {
+                                    let rule = BlockRule { enabled: true, kind: BlockRuleKind::Script, pattern: d.clone(), ..Default::default() };
+                                    acts.send(Command::SaveBlockRule { rule });
+                                }
+                            }
+                        }
+                        let opens_tabs = h.category == AdCategory::Popunder || h.signals.iter().any(|s| s.kind == "popup");
+                        if opens_tabs && !domains.iter().all(|d| has_rule(BlockRuleKind::PopupTo, d, &[])) && ui.button("Close tabs it opens").clicked() {
+                            for d in &domains {
+                                let rule = BlockRule { enabled: true, kind: BlockRuleKind::PopupTo, pattern: d.clone(), ..Default::default() };
+                                acts.send(Command::SaveBlockRule { rule });
+                            }
+                        }
+                    });
+                }
+                egui::CollapsingHeader::new(RichText::new("What gave it away").small()).id_salt(("ad", &h.name)).show(ui, |ui| {
+                    for s in &h.signals {
+                        ui.horizontal(|ui| {
+                            badge(ui, if s.kind == "popup" { "tab" } else { &s.kind }, s.kind == "popup");
+                            if s.kind == "slot" {
+                                let selector = s.detail.split(" × ").next().unwrap_or("").to_string();
+                                ui.label(RichText::new(&s.detail).monospace().small());
+                                if s.frame == self.url && ui.small_button("🎯 Show").on_hover_text("Select it in the elements").clicked() {
+                                    self.query = selector.clone();
+                                    self.select_first_match = true;
+                                    self.ask(json!({ "op": "query", "selector": selector }), |r| Reply::Query(parse(r)));
+                                }
+                            } else {
+                                let l = ui
+                                    .add(egui::Label::new(RichText::new(&s.url).monospace().small()).truncate().selectable(true))
+                                    .on_hover_text(format!("{}\n{}", s.url, s.detail));
+                                self.url_menu(&l, &s.url, acts);
+                            }
+                        });
+                    }
+                });
             });
     }
 
@@ -759,7 +1342,8 @@ impl InspectorView {
                 for &i in &shown[range] {
                     ui.horizontal(|ui| {
                         ui.add_sized([48.0, row_height], egui::Label::new(RichText::new(format!("{}", i + 1)).monospace().color(p.muted)));
-                        ui.add(egui::Label::new(RichText::new(&lines[i]).monospace()).extend().selectable(true));
+                        let r = ui.add(egui::Label::new(RichText::new(&lines[i]).monospace()).extend().selectable(true));
+                        self.value_menu(&r, &[("Copy line", lines[i].clone())], acts);
                     });
                 }
             });
