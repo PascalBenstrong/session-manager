@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cleanup::{CleanupReport, CleanupRule};
 use crate::dedupe::DedupeOptions;
+use crate::guards::{BlockRule, GuardSettings, PopupEvent};
 use crate::media::{MediaSettings, MediaState};
 use crate::organize::OrganizeKey;
 use crate::pattern::SitePattern;
@@ -178,6 +179,8 @@ pub struct Settings {
     pub tab_list: TabListSettings,
     /// How workspaces show up in the browser itself.
     pub browser_ui: BrowserUiSettings,
+    /// Protections against pages (pop-ups, right-click blocking, developer tools traps).
+    pub guards: GuardSettings,
 }
 
 /// Workspaces in the browser's own interface (tab strip, window title).
@@ -267,6 +270,7 @@ impl Default for Settings {
             media: MediaSettings::default(),
             tab_list: TabListSettings::default(),
             browser_ui: BrowserUiSettings::default(),
+            guards: GuardSettings::default(),
         }
     }
 }
@@ -294,6 +298,10 @@ pub struct AppState {
     /// Tabs opened for a workspace whose entry doesn't exist yet (a new tab page becomes an
     /// entry once it shows a page).
     pub pending_workspace: BTreeMap<TabId, Id>,
+    /// Rules blocking ad scripts and ad tabs.
+    pub block_rules: Vec<BlockRule>,
+    /// Tabs recently opened by pages (newest first, bounded).
+    pub popup_log: Vec<PopupEvent>,
 }
 
 impl Default for AppState {
@@ -312,6 +320,8 @@ impl Default for AppState {
             media: MediaState::default(),
             active_workspace: None,
             pending_workspace: BTreeMap::new(),
+            block_rules: Vec::new(),
+            popup_log: Vec::new(),
         };
         let id = s.alloc_id();
         s.sessions.push(Session { id, name: "Default".into(), ..Default::default() });
@@ -379,4 +389,6 @@ pub struct BrowserTab {
     pub group_id: Option<i64>,
     /// Hidden from the tab strip (Firefox).
     pub hidden: bool,
+    /// The tab that opened this one (a link or a script).
+    pub opener_tab_id: Option<TabId>,
 }

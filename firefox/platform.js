@@ -1,8 +1,38 @@
 // Firefox implementation of `smPlatform` (overrides on top of platform-common.js).
-import { installPlatform, tabOut } from './platform-common.js';
+import { installPlatform, stripDebuggerBytes, tabOut } from './platform-common.js';
 
 const api = globalThis.browser;
 const LAZY_SCHEMES = /^(https?|ftp):/i;
+
+// Script filter that blanks out `debugger` statements (developer tools traps) in script
+// files as they load. Only Firefox lets extensions rewrite responses.
+let rewriteExceptions = null; // null: off; else sites to leave alone
+const hostOf = (u) => {
+  try {
+    return new URL(u).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+};
+function filterScript(details) {
+  if (!rewriteExceptions) return;
+  const site = hostOf(details.documentUrl || details.originUrl || details.url);
+  if (rewriteExceptions.some((d) => site === d || site.endsWith(`.${d}`))) return;
+  const filter = api.webRequest.filterResponseData(details.requestId);
+  const chunks = [];
+  filter.ondata = (e) => chunks.push(new Uint8Array(e.data));
+  filter.onstop = () => {
+    const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of chunks) {
+      all.set(c, at);
+      at += c.length;
+    }
+    filter.write(stripDebuggerBytes(all));
+    filter.close();
+  };
+  filter.onerror = () => {};
+}
 
 installPlatform(api, {
   info() {
@@ -17,6 +47,16 @@ installPlatform(api, {
       titlePreface: true,
       extensionId: api.runtime.id || '',
     };
+  },
+
+  async setScriptRewrite(enabled, exceptions) {
+    const listening = rewriteExceptions !== null;
+    rewriteExceptions = enabled ? exceptions.map((d) => d.toLowerCase()) : null;
+    if (enabled && !listening) {
+      api.webRequest.onBeforeRequest.addListener(filterScript, { urls: ['<all_urls>'], types: ['script'] }, ['blocking']);
+    } else if (!enabled && listening) {
+      api.webRequest.onBeforeRequest.removeListener(filterScript);
+    }
   },
 
   async setTitlePreface(windowId, text) {

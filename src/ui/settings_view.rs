@@ -218,7 +218,7 @@ pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
     }
 }
 
-fn setting(ui: &mut egui::Ui, value: &mut bool, title: &str, description: &str) -> bool {
+pub(crate) fn setting(ui: &mut egui::Ui, value: &mut bool, title: &str, description: &str) -> bool {
     let p = theme::palette(ui);
     let mut changed = false;
     ui.horizontal(|ui| {

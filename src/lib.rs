@@ -7,6 +7,7 @@
 
 pub mod cleanup;
 pub mod dedupe;
+pub mod guards;
 pub mod hibernate;
 pub mod media;
 pub mod model;

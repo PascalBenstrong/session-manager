@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Page guards test</title>
+    <!-- The guards run first, as the extension registers them (page world, document_start).
+         ?control runs the page without them: most checks must then fail. -->
+    <script>
+      if (!location.search.includes('control')) {
+        for (const f of ['popups', 'context-menu', 'text-selection', 'anti-debugger', 'devtools-stealth', 'silence-console']) {
+          document.write(`<script src="../web/guards/${f}.js"><\/script>`);
+        }
+      }
+    </script>
+    <style>
+      .noselect { user-select: none; }
+    </style>
+  </head>
+  <!-- Page guards in a real browser engine: node tools/serve.mjs, then open
+       http://127.0.0.1:8123/tools/guards-test.html (or headless: --dump-dom). -->
+  <body>
+    <p class="noselect" id="ns">Unselectable text</p>
+    <a id="ad" href="https://example.com/ad" target="_blank">ad</a>
+    <pre id="out">running…</pre>
+    <script>
+      // Hostile page code, the way real pages do it.
+      const results = [];
+      const check = (name, ok) => results.push(`${ok ? 'PASS' : 'FAIL'} ${name}`);
+      const native = (f) => /\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(f));
+
+      check('patched functions still look native',
+        native(window.open) && native(Function.prototype.toString) && native(EventTarget.prototype.addEventListener) &&
+        native(Function) && native(console.log) && native(setInterval) &&
+        window.open.name === 'open' && EventTarget.prototype.addEventListener.length === 2);
+
+      // Pop-ups
+      check('window.open without a click is blocked', window.open('https://example.com/popup') === null);
+      let self = null;
+      const onClick = function () { self = this; };
+      document.addEventListener('click', onClick);
+      document.body.click();
+      check('page click listeners still run, with the right this', self === document);
+      self = null;
+      document.removeEventListener('click', onClick);
+      document.body.click();
+      check('removeEventListener still works', self === null);
+      let handlerRan = false;
+      document.onmousedown = () => { handlerRan = true; };
+      document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      check('document.onmousedown still runs', handlerRan && typeof document.onmousedown === 'function');
+
+      // Right-click and selection
+      let blockedMenu = false;
+      document.addEventListener('contextmenu', (e) => { blockedMenu = true; e.preventDefault(); });
+      document.oncontextmenu = () => false;
+      const notCancelled = document.body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+      check('the page cannot block the context menu', !blockedMenu && notCancelled);
+      let rightDown = false;
+      document.addEventListener('mousedown', (e) => { if (e.button === 2) rightDown = true; });
+      document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 2 }));
+      check('the page cannot see right-button presses', !rightDown);
+      check('user-select: none is undone', getComputedStyle(document.getElementById('ns')).userSelect === 'text');
+      let copyBlocked = false;
+      document.addEventListener('copy', (e) => { copyBlocked = true; e.preventDefault(); });
+      document.body.dispatchEvent(new ClipboardEvent('copy', { bubbles: true, cancelable: true }));
+      check('the page cannot cancel copying', !copyBlocked);
+
+      // debugger traps
+      check('Function() drops debugger', !String(Function('debugger; return 1')).includes('debugger') && Function('debugger; return 1')() === 1);
+      check('.constructor() drops debugger', !String((function () {}).constructor('debugger')).includes('debugger'));
+      check('async / generator constructors drop debugger',
+        !String((async function () {}).constructor('debugger')).includes('debugger') &&
+        !String(function* () {}.constructor('debugger')).includes('debugger'));
+      check('Function still behaves', new Function('a', 'return a * 2')(21) === 42 && (() => {}) instanceof Function &&
+        Function.prototype.constructor === Function && typeof Function === 'function');
+      const start = performance.now();
+      Function('debugger')();
+      check('a debugger trap takes no time', performance.now() - start < 50);
+
+      // developer tools detection
+      check('window size looks normal', window.outerWidth - window.innerWidth <= 16 && window.outerHeight - window.innerHeight <= 150);
+      let f12 = false;
+      window.addEventListener('keydown', (e) => { if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && e.key === 'I')) f12 = true; });
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'F12' }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'I', ctrlKey: true, shiftKey: true }));
+      check('the page cannot catch the developer tools shortcuts', !f12);
+      let probed = false;
+      const bait = new Image();
+      Object.defineProperty(bait, 'id', { get() { probed = true; return ''; } });
+      console.log(bait);
+      console.dir(bait);
+      check('console probes never run', !probed && console.log('x') === undefined);
+      let typed = false;
+      window.addEventListener('keydown', (e) => { if (e.key === 'a') typed = true; });
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' }));
+      check('other keys still reach the page', typed);
+
+      setTimeout(() => {
+        const failed = results.filter((r) => r.startsWith('FAIL')).length;
+        document.getElementById('out').textContent = `${results.join('\n')}\n\n${failed ? `${failed} FAILED` : 'ALL PASSED'}`;
+      }, 50);
+    </script>
+  </body>
+</html>

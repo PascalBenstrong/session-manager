@@ -11,6 +11,7 @@ use wasm_bindgen_futures::{future_to_promise, spawn_local};
 
 use crate::cleanup::{self, ALARM_PREFIX, CleanupReport, CleanupSpec, CleanupTarget, Cookie, SpecMatcher};
 use crate::dedupe::Scope;
+use crate::guards::{self, BlockRule, GuardSettings, PopupEvent};
 use crate::hibernate::{self, HibernateTarget};
 use crate::media::MediaReport;
 use crate::model::{AppState, BrowserTab, EntryRef, Id, TabId};
@@ -44,7 +45,14 @@ thread_local! {
     static STRIP_AGAIN: Cell<bool> = const { Cell::new(false) };
     /// Window title prefaces we set, by window.
     static TITLES: RefCell<std::collections::HashMap<TabId, String>> = RefCell::new(Default::default());
+    /// Tabs opened by a page, until their first page loads: tab -> (opener, opened at).
+    static OPENED: RefCell<std::collections::HashMap<TabId, (TabId, f64)>> = RefCell::new(Default::default());
+    /// Page guards as last given to the browser.
+    static GUARDS_SYNCED: RefCell<Option<(GuardSettings, Vec<BlockRule>)>> = const { RefCell::new(None) };
 }
+
+/// How long after opening a tab a rule can still close it (it may load its page late).
+const OPENED_TAB_WINDOW_MS: f64 = 15_000.0;
 
 /// Marks that the extension itself is opening tabs (for the lifetime of the guard).
 struct OpeningGuard;
@@ -105,7 +113,62 @@ pub async fn start() -> Result<(), JsValue> {
     pf::set_event_handler(handler.as_ref().unchecked_ref());
     handler.forget();
     schedule_strip_sync();
+    sync_guards().await;
     Ok(())
+}
+
+/// Registers the page guard scripts and script blocking rules for the current settings
+/// (only when they changed since the last time).
+async fn sync_guards() {
+    let wanted = with_state(|s| (s.settings.guards.clone(), s.block_rules.clone()));
+    if GUARDS_SYNCED.with(|g| g.borrow().as_ref() == Some(&wanted)) {
+        return;
+    }
+    let (g, rules) = &wanted;
+    if let Err(e) = pf::sync_content_scripts(&guards::registrations(g, rules)).await {
+        log(&format!("could not register page guards: {e}"));
+    }
+    if let Err(e) = pf::set_block_rules(&guards::dnr_rules(rules)).await {
+        log(&format!("could not set script blocking rules: {e}"));
+    }
+    let exceptions: Vec<String> = g.exceptions.iter().map(|s| guards::normalize_site(s)).collect();
+    if let Err(e) = pf::set_script_rewrite(g.anti_debugger && g.strip_debugger_scripts, &exceptions).await {
+        log(&format!("could not set the script filter: {e}"));
+    }
+    GUARDS_SYNCED.with(|s| *s.borrow_mut() = Some(wanted));
+}
+
+/// A tab a page opened: once it shows a web page, log it, and close it if a rule says
+/// so (then the page that opened it gets the focus back). Returns true if closed.
+async fn check_opened_tab(tab: &BrowserTab, now: f64) -> bool {
+    let Some((opener, at)) = OPENED.with(|o| o.borrow().get(&tab.id).copied()) else { return false };
+    if now - at > OPENED_TAB_WINDOW_MS {
+        OPENED.with(|o| o.borrow_mut().remove(&tab.id));
+        return false;
+    }
+    if !matches!(crate::url::scheme(&tab.url).as_str(), "http" | "https") {
+        return false; // about:blank first; wait for the real page
+    }
+    OPENED.with(|o| o.borrow_mut().remove(&tab.id));
+    let opener_url = pf::get_tab(Some(opener)).await.map(|t| t.url).unwrap_or_default();
+    if !matches!(crate::url::scheme(&opener_url).as_str(), "http" | "https") {
+        return false;
+    }
+    let rule = with_state(|s| {
+        let rule = guards::popup_rule_for(&s.block_rules, &tab.url);
+        s.push_popup(PopupEvent { at: now, opener: opener_url, url: tab.url.clone(), closed_by: rule });
+        rule
+    });
+    persist().await;
+    if rule.is_none() {
+        return false;
+    }
+    if let Err(e) = pf::remove_tabs(&[tab.id]).await {
+        log(&format!("could not close ad tab: {e}"));
+        return false;
+    }
+    let _ = pf::focus_tab(opener).await;
+    true
 }
 
 /// Whether the optional tabHide permission was granted.
@@ -147,6 +210,9 @@ enum Event {
     MediaState { tab_id: TabId, frame_id: i64, playing: bool, video: bool, pip: bool },
     /// An optional permission was granted or revoked.
     PermissionsChanged,
+    /// A keyboard shortcut handled here (`open-inspector`).
+    #[serde(rename_all = "camelCase")]
+    Command { name: String, tab_id: Option<TabId> },
     CookieSet { cookie: Cookie },
     Alarm { name: String },
     Message { payload: String },
@@ -165,6 +231,14 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             }
         }
         Event::TabCreated { tab } => {
+            if let Some(opener) = tab.opener_tab_id
+                && OPENING.with(|o| o.get()) == 0
+            {
+                OPENED.with(|o| o.borrow_mut().insert(tab.id, (opener, now)));
+                if check_opened_tab(&tab, now).await {
+                    return Ok(JsValue::UNDEFINED);
+                }
+            }
             if STARTUP_DEDUPE.with(|d| d.get()).is_some() {
                 // A tab the browser restores: give it back its saved entry rather than
                 // adding a copy, and wait for the restore to finish before de-duplicating.
@@ -184,6 +258,9 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             }
         }
         Event::TabUpdated { tab, url_changed } => {
+            if url_changed && check_opened_tab(&tab, now).await {
+                return Ok(JsValue::UNDEFINED);
+            }
             if url_changed && prevent_duplicate(&tab, now).await {
                 return Ok(JsValue::UNDEFINED);
             }
@@ -210,6 +287,13 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         Event::PermissionsChanged => {
             refresh_permissions().await;
             schedule_strip_sync();
+        }
+        Event::Command { name, tab_id } => {
+            if name == "open-inspector"
+                && let Err(e) = run_command(Command::OpenInspector { tab: tab_id }).await
+            {
+                log(&format!("could not open the inspector: {e}"));
+            }
         }
         Event::MediaState { tab_id, frame_id, playing, video, pip } => {
             let report = MediaReport { playing, video, pip };
@@ -500,6 +584,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             sync_alarms().await;
             schedule_auto_organize();
             enforce_media().await;
+            sync_guards().await;
             ok("Settings saved")
         }
         Command::SaveWorkspace { workspace } => {
@@ -563,6 +648,33 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
                 log(&format!("could not switch to tab {tab}: {e}"));
             }
             ok(format!("Switched to {name}"))
+        }
+        Command::SaveBlockRule { rule } => {
+            let new = rule.id == 0;
+            let id = with_state(|s| s.save_block_rule(rule))?;
+            persist().await;
+            sync_guards().await;
+            let text = with_state(|s| s.block_rules.iter().find(|r| r.id == id).map(|r| r.describe()).unwrap_or_default());
+            ok(format!("{} rule: {text}", if new { "Added" } else { "Saved" }))
+        }
+        Command::DeleteBlockRule { id } => {
+            with_state(|s| s.block_rules.retain(|r| r.id != id));
+            persist().await;
+            sync_guards().await;
+            ok("Rule deleted")
+        }
+        Command::ClearPopupLog => {
+            with_state(|s| s.popup_log.clear());
+            persist().await;
+            ok("")
+        }
+        Command::OpenInspector { tab } => {
+            let tab = pf::get_tab(tab).await?;
+            if !matches!(crate::url::scheme(&tab.url).as_str(), "http" | "https" | "file") {
+                return Err("only web pages can be inspected (not browser or extension pages)".into());
+            }
+            pf::open_inspector(tab.id).await?;
+            ok("")
         }
         Command::NewTabInWorkspace { workspace } => {
             let ws = workspace.or(with_state(|s| s.active_workspace));

@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.4.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.5.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -44,6 +44,21 @@ Version: 0.4.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Optionally allow media to play only in the active tab (of each window), or in at most N background tabs besides the active ones. When there are more, the least recently used background tabs are paused.
 - Media paused this way resumes when its tab becomes active (configurable).
 - Only video counts by default; audio can be included. Picture-in-picture video can keep playing.
+
+## Page guards
+- Guards run inside pages (the page's own world, at document start, in every frame) before the pages' own scripts. Each can be turned on or off, and a list of sites (with subdomains) is left alone.
+- Pop-ups: block windows and new tabs a page opens without a click, or from handlers that catch clicks anywhere on the page (pop-under ad scripts), including programmatic clicks on links and form submits to new tabs. Links the user clicks keep working.
+- Custom rules: block scripts by URL (declarativeNetRequest; a bare host blocks every script from it; optionally only on given sites), close tabs that pages open to a matching site (and refocus the page), or block every script-opened pop-up on given sites. A log of recent tabs opened by pages offers one-click rules.
+- Right-click: pages can't block or replace the context menu. Optionally they can't block selecting and copying text either.
+- Debugger traps: `debugger` statements in code built at runtime (`Function`, constructors of functions, string timers) are removed. Firefox: optionally `debugger` statements in script files are blanked out as they load.
+- Developer tools detection: pages see a normal window size while the developer tools are docked, can't take away the developer tools shortcuts, and (optionally) their console calls do nothing, which defeats getter / toString probes.
+- Replaced functions look native to the page (`Function.prototype.toString`).
+
+## Inspector
+- A separate window inspects a tab without the browser's developer tools, through a content script in the extension's isolated world that the page can't see.
+- Elements: an element picker (hover highlights, click selects), a lazily loaded DOM tree (including open shadow roots), CSS selector search, and for the selected element its path, a unique selector, size and position, attributes, computed style (filterable), text and HTML; scroll into view and delete.
+- Media & frames: the URLs of videos, audio, sources, subtitle tracks, posters, iframes, frames, embeds, objects and scripts in every frame, and media requests from the network log (the streams behind blob: videos), grouped by element type and searchable; copy, open, and block a script.
+- Source: the current page source with line numbers and search.
 
 ## Search
 - Search tabs by keyword, title, URL, host, domain, custom tags, groups and workspace.
@@ -111,5 +126,8 @@ Version: 0.4.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Extensions can't restyle or replace the browser's tab bar; workspaces appear there as native tab groups (or, in Firefox, by hiding tabs). Hiding Firefox's own tab bar takes a `userChrome.css` that the user installs.
 - Firefox doesn't let extensions open `about:config` or `about:support`, or change preferences and files in the profile.
 - Chrome cannot hide tabs. Tab groups need Chrome / Edge, or Firefox 139+.
+- Chrome doesn't let extensions change scripts: `debugger` statements written in script files can only be removed in Firefox.
+- Page guards and the inspector don't work on browser-internal pages and extension stores. Guards apply to pages loaded after they are turned on.
+- The inspector reads the top frame's DOM; other frames contribute to Media & frames.
 - The media limit relies on a content script, which only runs in pages loaded after the extension was installed or updated, and not in browser-internal pages.
 - Browsers refuse to hibernate the active tab. Chromium may give a hibernated tab a new id; the extension follows the change.

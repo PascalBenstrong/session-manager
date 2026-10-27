@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hostile test page</title>
+    <!-- A page that does what the page guards defend against, for tools/real-browser-test.mjs.
+         ?notrap: skip the debugger trap (it would freeze an unguarded page with the developer tools open).
+         ?static: also load trap.js, a script file with a literal debugger statement (Firefox filter). -->
+    <script src="ad-script.js"></script>
+    <script>
+      window.report = { adScript: !!window.__adScript, popups: [], contextMenus: 0, detections: [], ticks: 0 };
+      const params = new URLSearchParams(location.search);
+      if (params.has('static')) document.write('<script src="trap.js"><\/script>');
+
+      // Pop-under: any click anywhere opens an ad.
+      document.addEventListener('click', () => {
+        const w = window.open('http://localhost:8123/tools/real/ad.html?popunder', '_blank');
+        report.popups.push(w ? 'opened' : 'blocked');
+      });
+      // No right-click.
+      document.addEventListener('contextmenu', (e) => {
+        report.contextMenus++;
+        e.preventDefault();
+      });
+
+      // Developer tools detection, three classic ways.
+      const detect = (how) => report.detections.includes(how) || report.detections.push(how);
+      setInterval(() => {
+        report.ticks++;
+        if (window.outerWidth - window.innerWidth > 160 || window.outerHeight - window.innerHeight > 200) detect('window size');
+        const bait = new Image();
+        Object.defineProperty(bait, 'id', { get: () => detect('console getter') });
+        console.log(bait);
+        console.clear();
+        if (!params.has('notrap')) {
+          const t = performance.now();
+          Function('debugger')();
+          if (performance.now() - t > 100) detect('debugger timing');
+        }
+      }, 300);
+    </script>
+    <style>
+      body { font: 16px system-ui; margin: 40px; user-select: none; }
+      #space { height: 300px; background: #eef; }
+    </style>
+  </head>
+  <body>
+    <h1>Hostile test page</h1>
+    <p><a id="adlink" href="http://localhost:8123/tools/real/ad.html?link" target="_blank">A link to an ad site</a></p>
+    <div id="space">Click anywhere here.</div>
+    <video src="https://example.com/clip.mp4" muted></video>
+    <iframe src="ad.html?frame" title="ad frame" width="200" height="60"></iframe>
+  </body>
+</html>

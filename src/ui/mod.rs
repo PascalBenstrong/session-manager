@@ -8,6 +8,8 @@
 
 mod backup_view;
 mod cleanup_view;
+mod guards_view;
+mod inspector_view;
 mod mini_view;
 mod organize_view;
 mod settings_view;
@@ -36,10 +38,12 @@ const WIDE_LAYOUT: f32 = 860.0;
 /// This page is the toolbar popup (which closes itself after some actions).
 static IS_POPUP: AtomicBool = AtomicBool::new(false);
 
-/// `mode`: "popup", "sidebar" (browser sidebar / side panel) or "manager".
+/// `mode`: "popup", "sidebar" (browser sidebar / side panel), "inspector" (inspector
+/// window) or "manager".
 pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
     let popup = mode == "popup";
     let sidebar = mode == "sidebar";
+    let inspector = mode == "inspector";
     IS_POPUP.store(popup, Ordering::Relaxed);
     let document = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let canvas = document
@@ -48,7 +52,7 @@ pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
         .dyn_into::<web_sys::HtmlCanvasElement>()?;
     let runner = Box::leak(Box::new(eframe::WebRunner::new()));
     runner
-        .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, popup, sidebar)))))
+        .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, popup, sidebar, inspector)))))
         .await
 }
 
@@ -70,16 +74,19 @@ enum View {
     Cleanup,
     Backup,
     Settings,
+    /// Page guards and the inspector.
+    Guards,
     /// Release notes (reached from the sidebar, the popup footer or Settings).
     WhatsNew,
 }
 
 impl View {
-    const ALL: [(View, &'static str, &'static str); 5] = [
+    const ALL: [(View, &'static str, &'static str); 6] = [
         (View::Tabs, "☰", "Tabs"),
         (View::Organize, "⊞", "Organize"),
         (View::Backup, "💾", "Snapshots & import"),
         (View::Cleanup, "🧹", "Cookies & data"),
+        (View::Guards, "🛡", "Page guards"),
         (View::Settings, "⚙", "Settings"),
     ];
 
@@ -91,6 +98,7 @@ impl View {
             "backup" => View::Backup,
             "cleanup" => View::Cleanup,
             "settings" => View::Settings,
+            "guards" => View::Guards,
             "whatsnew" => View::WhatsNew,
             _ => return None,
         })
@@ -182,6 +190,9 @@ pub struct App {
     /// Gesture action armed in this frame.
     gesture: Option<&'static str>,
     side: sidebar_view::SidebarView,
+    guards: guards_view::GuardsView,
+    /// The inspector window.
+    inspector: Option<inspector_view::InspectorView>,
     ctx: egui::Context,
     inbox: Rc<RefCell<Inbox>>,
     pending: u32,
@@ -209,7 +220,7 @@ pub struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, popup: bool, sidebar: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, popup: bool, sidebar: bool, inspector: bool) -> Self {
         let theme = theme::load_preference();
         theme::install(&cc.egui_ctx, theme);
 
@@ -244,6 +255,8 @@ impl App {
             window_id: None,
             gesture: None,
             side: Default::default(),
+            guards: Default::default(),
+            inspector: inspector.then(|| inspector_view::InspectorView::new(&cc.egui_ctx)),
             ctx: cc.egui_ctx.clone(),
             inbox,
             pending: 0,
@@ -702,6 +715,10 @@ impl App {
                 if self.popup && icon_button(ui, "⛶", "Open the full manager in a tab").clicked() {
                     open_manager("");
                 }
+                if self.popup && icon_button(ui, "🔬", "Inspect this page in a separate window (Alt+Shift+I)").clicked() {
+                    self.send(Command::OpenInspector { tab: None });
+                    self.close_when_done = true;
+                }
                 if self.popup && self.caps.sidebar {
                     let r = icon_button(ui, "◨", "Open the workspace sidebar");
                     if r.contains_pointer() {
@@ -844,6 +861,15 @@ impl App {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         self.drain_inbox();
+        if let Some(mut inspector) = self.inspector.take() {
+            let mut acts = Actions::default();
+            inspector.ui(ui, &mut acts);
+            self.inspector = Some(inspector);
+            self.apply(acts);
+            let dark = ui.visuals().dark_mode;
+            self.toast(&ui.ctx().clone(), dark);
+            return;
+        }
         if !self.popup {
             let hash = pf::location_hash();
             if hash != self.last_hash {
@@ -901,6 +927,7 @@ impl App {
                     View::Cleanup => self.cleanup.show(ui, &cx, &mut acts),
                     View::Backup => self.backup.show(ui, &cx, &mut acts),
                     View::Settings => settings_view::show(ui, &cx, &mut acts),
+                    View::Guards => self.guards.show(ui, &cx, &mut acts),
                     View::WhatsNew => whats_new_view::show(ui),
                 }
             });

@@ -11,8 +11,10 @@ import { createMockBrowser } from './mock-browser.js';
 const browserName = process.argv[2] || 'firefox';
 const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', browserName);
 
-const { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, titlePrefaces, ev, clone } =
-  createMockBrowser();
+const {
+  api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, titlePrefaces, contentScripts, dnr,
+  createdWindows, requestListeners, filters, ev, clone,
+} = createMockBrowser();
 globalThis.browser = api;
 globalThis.chrome = api;
 
@@ -589,6 +591,107 @@ if (browserName === 'firefox') {
     await settle();
     assert.ok([...tabs.values()].every((t) => !t.hidden), 'every tab shows again');
     assert.equal(titlePrefaces[1], '');
+  });
+}
+
+const guards = async (changes) => {
+  const st = stored();
+  await send({ cmd: 'UpdateSettings', settings: { ...st.settings, guards: { ...st.settings.guards, ...changes } } });
+};
+
+await step('page guards are registered in the page world, with exceptions', async () => {
+  await guards({ popups: true, context_menu: true, text_selection: true, anti_debugger: true, devtools_stealth: true,
+    silence_console: true, exceptions: ['docs.example.com'] });
+  const ids = contentScripts.map((s) => s.id).sort();
+  assert.deepEqual(ids, ['sm-guard-context-menu', 'sm-guard-debugger', 'sm-guard-popups', 'sm-guard-stealth']);
+  for (const s of contentScripts) {
+    assert.equal(s.world, 'MAIN');
+    assert.equal(s.runAt, 'document_start');
+    assert.ok(s.allFrames);
+    assert.deepEqual(s.excludeMatches, ['*://docs.example.com/*', '*://*.docs.example.com/*']);
+    for (const f of s.js) assert.ok(readFileSync(join(dist, f)).length > 0, `${f} is packaged`);
+  }
+  assert.deepEqual(contentScripts.find((s) => s.id === 'sm-guard-stealth').js, ['guards/devtools-stealth.js', 'guards/silence-console.js']);
+  await guards({ popups: false, context_menu: false, anti_debugger: false, devtools_stealth: false });
+  assert.deepEqual(contentScripts, [], 'turned off: unregistered');
+});
+
+await step('custom rules: block scripts (declarativeNetRequest), all pop-ups on a site', async () => {
+  let r = await send({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'Script', pattern: 'ads.example.net', sites: ['https://www.news.example/'] } });
+  const rule = r.state.block_rules[r.state.block_rules.length - 1];
+  assert.deepEqual(dnr(), [{ id: rule.id, priority: 1, action: { type: 'block' },
+    condition: { resourceTypes: ['script'], urlFilter: '||ads.example.net^', initiatorDomains: ['news.example'] } }]);
+  r = await send({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'AllPopupsOn', pattern: '', sites: ['bad.example'] } });
+  assert.deepEqual(contentScripts.map((s) => [s.id, s.matches]), [['sm-guard-popups-strict', ['*://bad.example/*', '*://*.bad.example/*']]]);
+  await send({ cmd: 'SaveBlockRule', rule: { ...rule, enabled: false } });
+  assert.deepEqual(dnr(), [], 'disabled rules are removed');
+  for (const x of stored().block_rules) await send({ cmd: 'DeleteBlockRule', id: x.id });
+  assert.deepEqual(contentScripts, []);
+  const bad = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'Script', pattern: '/(/', sites: [] } })));
+  assert.ok(!bad.ok && /regex/.test(bad.error));
+});
+
+await step('ad tabs: tabs opened by a page to a blocked site are closed and logged', async () => {
+  await send({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'PopupTo', pattern: 'adserver.example', sites: [] } });
+  const page = await api.tabs.create({ url: 'https://video.example/watch', active: true });
+  await tick();
+  // The ad tab opens blank, then navigates.
+  const ad = await api.tabs.create({ url: 'about:blank', openerTabId: page.id });
+  tabs.get(ad.id).url = 'https://x.adserver.example/click?z=1';
+  ev.updated.fire(ad.id, { url: tabs.get(ad.id).url }, clone(tabs.get(ad.id)));
+  await tick();
+  assert.ok(!tabs.has(ad.id), 'the ad tab was closed');
+  assert.ok(tabs.get(page.id).active, 'back on the page');
+  const log = stored().popup_log;
+  assert.equal(log[0].url, 'https://x.adserver.example/click?z=1');
+  assert.equal(log[0].opener, 'https://video.example/watch');
+  assert.ok(log[0].closed_by);
+  // Other tabs a page opens stay, and are logged.
+  const ok = await api.tabs.create({ url: 'https://docs.example.org/', openerTabId: page.id });
+  await tick();
+  assert.ok(tabs.has(ok.id));
+  assert.equal(stored().popup_log[0].closed_by, null);
+  await send({ cmd: 'ClearPopupLog' });
+  assert.deepEqual(stored().popup_log, []);
+});
+
+await step('inspector: opens a window for a web page, not for browser pages', async () => {
+  const page = await api.tabs.create({ url: 'https://inspect.example/', active: true });
+  await send({ cmd: 'OpenInspector', tab: page.id });
+  const w = createdWindows[createdWindows.length - 1];
+  assert.equal(w.url, `moz-extension://test/inspector.html?tab=${page.id}`);
+  assert.equal(w.type, 'popup');
+  const internal = await api.tabs.create({ url: 'about:preferences' });
+  const r = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'OpenInspector', tab: internal.id })));
+  assert.ok(!r.ok && /web pages/.test(r.error));
+});
+
+await step('debugger statements are blanked out of script bytes', async () => {
+  const { stripDebuggerBytes } = await import(pathToFileURL(join(dist, 'platform-common.js')).href);
+  const run = (s) => new TextDecoder().decode(stripDebuggerBytes(new TextEncoder().encode(s)));
+  assert.equal(run('setInterval(function(){debugger},50)'), 'setInterval(function(){        },50)');
+  assert.equal(run('a.debugger = {debugger: 1}; mydebugger()'), 'a.debugger = {debugger: 1}; mydebugger()');
+  assert.equal(run('ünï debugger;'), 'ünï         ;');
+});
+
+if (browserName === 'firefox') {
+  await step('Firefox: the script filter rewrites scripts, except on exception sites', async () => {
+    await guards({ anti_debugger: true, strip_debugger_scripts: true, exceptions: ['trusted.example'] });
+    assert.equal(requestListeners.length, 1);
+    assert.deepEqual(requestListeners[0].filter.types, ['script']);
+    assert.deepEqual(requestListeners[0].extra, ['blocking']);
+    const load = (requestId, documentUrl, text) => {
+      requestListeners[0].f({ requestId, documentUrl, url: 'https://cdn.example/app.js' });
+      const f = filters.get(requestId);
+      if (!f) return null;
+      f.ondata({ data: new TextEncoder().encode(text).buffer });
+      f.onstop();
+      return new TextDecoder().decode(f.written[0]);
+    };
+    assert.equal(load('r1', 'https://site.example/', 'x();debugger;y()'), 'x();        ;y()');
+    assert.equal(load('r2', 'https://www.trusted.example/', 'debugger'), null, 'exception sites are not filtered');
+    await guards({ anti_debugger: false, strip_debugger_scripts: false, exceptions: [] });
+    assert.equal(requestListeners.length, 0);
   });
 }
 

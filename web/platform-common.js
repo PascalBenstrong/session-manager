@@ -19,7 +19,61 @@ export function tabOut(t) {
     groupTitle: null,
     groupId: t.groupId != null && t.groupId >= 0 ? t.groupId : null,
     hidden: !!t.hidden,
+    openerTabId: t.openerTabId ?? null,
   };
+}
+
+/**
+ * Blanks out `debugger` statements in script source bytes (UTF-8 or any ASCII compatible
+ * encoding), keeping the length. `a.debugger` and `{ debugger: 1 }` are left alone.
+ * Returns the same array when there is nothing to change.
+ */
+export function stripDebuggerBytes(bytes) {
+  const WORD = [100, 101, 98, 117, 103, 103, 101, 114]; // "debugger"
+  const ident = (b) => (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95 || b === 36 || b >= 128;
+  const space = (b) => b === 32 || b === 9 || b === 10 || b === 13;
+  let out = null;
+  for (let i = bytes.indexOf(100); i !== -1 && i + 8 <= bytes.length; i = bytes.indexOf(100, i + 1)) {
+    let k = 0;
+    while (k < 8 && bytes[i + k] === WORD[k]) k++;
+    if (k < 8 || (i > 0 && ident(bytes[i - 1])) || (i + 8 < bytes.length && ident(bytes[i + 8]))) continue;
+    let p = i - 1;
+    while (p >= 0 && space(bytes[p])) p--;
+    let n = i + 8;
+    while (n < bytes.length && space(bytes[n])) n++;
+    if ((p >= 0 && bytes[p] === 46) || (n < bytes.length && bytes[n] === 58)) continue; // "." or ":"
+    out ??= bytes.slice();
+    out.fill(32, i, i + 8);
+    i += 7;
+  }
+  return out ?? bytes;
+}
+
+/**
+ * Runs in every frame of an inspected page (scripting.executeScript): the URLs of its
+ * videos, audio, frames, embeds and scripts, and of media requests in its network log.
+ */
+function collectPageResources() {
+  const items = [];
+  const add = (kind, url, detail = '') => {
+    if (url) items.push({ kind, url: String(url), detail: String(detail || '') });
+  };
+  for (const m of document.querySelectorAll('video, audio')) {
+    add(m.localName, m.currentSrc || m.src, [m.duration > 0 ? `${Math.round(m.duration)} s` : '', m.paused ? 'paused' : 'playing'].filter(Boolean).join(' · '));
+    for (const s of m.querySelectorAll('source')) add('source', s.src, s.type);
+    for (const t of m.querySelectorAll('track')) add('track', t.src, [t.kind, t.srclang].filter(Boolean).join(' '));
+    if (m.poster) add('poster', m.poster);
+  }
+  for (const f of document.querySelectorAll('iframe, frame')) add(f.localName, f.src || 'about:blank', f.title || f.name);
+  for (const e of document.querySelectorAll('embed')) add('embed', e.src, e.type);
+  for (const o of document.querySelectorAll('object')) add('object', o.data, o.type);
+  for (const s of document.querySelectorAll('script[src]')) add('script', s.src, [s.async && 'async', s.defer && 'defer'].filter(Boolean).join(' '));
+  // Streams behind blob: videos show up as requests (HLS / DASH manifests and segments).
+  const MEDIA = /\.(m3u8|mpd|mp4|m4v|m4s|m4a|webm|mkv|mov|ts|mp3|aac|ogg|oga|ogv|flac|wav|flv)(\?|#|$)/i;
+  for (const r of performance.getEntriesByType('resource')) {
+    if (MEDIA.test(r.name) || r.initiatorType === 'video' || r.initiatorType === 'audio') add('network', r.name, r.initiatorType);
+  }
+  return { frameUrl: location.href, top: window === window.top, items };
 }
 
 /** Like tabOut, with the title of the native tab group the tab is in. */
@@ -187,6 +241,74 @@ export function installPlatform(api, overrides = {}) {
 
     /** Text before the window title (Firefox only). */
     async setTitlePreface(_windowId, _text) {},
+
+    // ---- page guards ----
+
+    /** Replaces our page scripts (ids starting with "sm-guard-") with `regs`. */
+    async syncContentScripts(regs) {
+      if (!api.scripting || !api.scripting.registerContentScripts) throw new Error('this browser cannot register page scripts');
+      const existing = await api.scripting.getRegisteredContentScripts();
+      const ours = existing.map((s) => s.id).filter((id) => id.startsWith('sm-guard-'));
+      if (ours.length) await api.scripting.unregisterContentScripts({ ids: ours });
+      const clean = regs.map((r) => {
+        const out = { ...r };
+        if (!out.excludeMatches.length) delete out.excludeMatches;
+        return out;
+      });
+      if (clean.length) await api.scripting.registerContentScripts(clean);
+    },
+
+    /** Replaces our declarativeNetRequest dynamic rules (script blocking). */
+    async setBlockRules(rules) {
+      const dnr = api.declarativeNetRequest;
+      if (!dnr) throw new Error('this browser cannot block requests');
+      const old = await dnr.getDynamicRules();
+      await dnr.updateDynamicRules({ removeRuleIds: old.map((r) => r.id), addRules: rules });
+    },
+
+    /** Firefox: blank out `debugger` in script files as they load. Elsewhere: unsupported. */
+    async setScriptRewrite(_enabled, _exceptions) {},
+
+    // ---- inspector ----
+
+    async openInspector(tabId) {
+      const url = api.runtime.getURL(`inspector.html?tab=${tabId}`);
+      await api.windows.create({ url, type: 'popup', width: 1100, height: 780 });
+    },
+
+    /** Injects the inspector content script into the tab's top frame. */
+    async inspectorInject(tabId) {
+      await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ['inspect.js'] });
+    },
+
+    /** A request to the inspector content script ({ op, ...args }); resolves to its result. */
+    async inspect(tabId, request) {
+      const r = await api.tabs.sendMessage(tabId, { smInspect: request }, { frameId: 0 });
+      if (!r) throw new Error('the page did not answer (reload it and try again)');
+      if (!r.ok) throw new Error(r.error);
+      return r.result;
+    },
+
+    /** Videos, frames, scripts... of every frame of a tab. */
+    async collectResources(tabId) {
+      const results = await api.scripting.executeScript({ target: { tabId, allFrames: true }, func: collectPageResources });
+      return results
+        .filter((r) => r && r.result)
+        .flatMap((r) => r.result.items.map((i) => ({ ...i, frame: r.result.frameUrl, top: !!r.result.top })));
+    },
+
+    /** UI pages: `cb(json)` when the inspector content script reports a picked element. */
+    onInspectorPick(cb) {
+      api.runtime.onMessage.addListener((msg) => {
+        if (msg && msg.smInspectPicked) cb(JSON.stringify(msg.smInspectPicked));
+        return undefined;
+      });
+    },
+
+    /** A query parameter of this page's URL ('' if missing). */
+    locationParam(name) {
+      return (globalThis.location && new URLSearchParams(location.search).get(name)) || '';
+    },
 
     async hasPermission(name) {
       try {
@@ -435,6 +557,8 @@ export function installPlatform(api, overrides = {}) {
       api.commands?.onCommand?.addListener((command, tab) => {
         if (command === 'open-sidebar' && api.sidePanel && tab) {
           api.sidePanel.open({ windowId: tab.windowId }).catch((e) => console.warn('[session-manager] side panel', e));
+        } else if (command === 'open-inspector') {
+          fire({ type: 'command', name: command, tabId: tab ? tab.id : null });
         }
       });
       if (api.tabs.onReplaced) {

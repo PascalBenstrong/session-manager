@@ -1085,6 +1085,11 @@ impl TabsView {
                     if icon_button(ui, "🗙", "Close tab (also removes it from the session)").clicked() {
                         acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: true });
                     }
+                    if matches!(crate::url::scheme(&e.url).as_str(), "http" | "https" | "file")
+                        && icon_button(ui, "🔬", "Inspect this page in a separate window").clicked()
+                    {
+                        acts.send(Command::OpenInspector { tab: e.tab_id });
+                    }
                     if !e.discarded && icon_button(ui, "💤", "Hibernate: unload the tab, keeping it open").clicked() {
                         acts.send(Command::Hibernate { target: HibernateTarget::Entries(vec![r]), force: true });
                     }

@@ -17,6 +17,12 @@ export function createMockBrowser() {
   let nextGroupId = 100;
   const granted = new Set();
   const titlePrefaces = {};
+  const contentScripts = [];
+  const createdWindows = [];
+  // webRequest (Firefox script filter): blocking listeners and response filters.
+  const requestListeners = [];
+  const filters = new Map();
+  let dnrRules = [];
   const ev = {
     created: listeners(), updated: listeners(), removed: listeners(), activated: listeners(),
     cookie: listeners(), alarm: listeners(), message: listeners(), storage: listeners(), installed: listeners(),
@@ -50,7 +56,8 @@ export function createMockBrowser() {
       async reload(id) { reloaded.push(id); },
       async create(p) {
         const t = { id: nextTabId++, windowId: p.windowId ?? 1, index: tabs.size, url: p.url, title: p.title || '',
-          pinned: !!p.pinned, active: !!p.active, discarded: !!p.discarded, groupId: -1, hidden: false };
+          pinned: !!p.pinned, active: !!p.active, discarded: !!p.discarded, groupId: -1, hidden: false,
+          openerTabId: p.openerTabId };
         if (t.active) for (const o of tabs.values()) if (o.windowId === t.windowId) o.active = false;
         tabs.set(t.id, t);
         ev.created.fire(clone(t));
@@ -89,12 +96,22 @@ export function createMockBrowser() {
         rest.forEach((t, i) => (t.index = i));
       },
       async discard(id) { tabs.get(id).discarded = true; return clone(tabs.get(id)); },
-      // Messages to content scripts.
-      async sendMessage(tabId, msg) { tabMessages.push({ tabId, msg }); },
+      // Messages to content scripts. In the preview the inspector content script runs in
+      // the preview page itself and listens on runtime.onMessage.
+      async sendMessage(tabId, msg) {
+        if (msg && msg.smInspect) {
+          return new Promise((resolve) => {
+            let answered = false;
+            ev.message.fire(msg, { tab: { id: tabId } }, (r) => { answered = true; resolve(r); });
+            if (!answered) resolve(undefined);
+          });
+        }
+        tabMessages.push({ tabId, msg });
+      },
       onCreated: ev.created, onUpdated: ev.updated, onRemoved: ev.removed, onActivated: ev.activated,
     },
     windows: {
-      async create() { return { id: 2, tabs: [] }; },
+      async create(p) { createdWindows.push(clone(p || {})); return { id: 2, tabs: [] }; },
       async update(id, p) { if (p && 'titlePreface' in p) titlePrefaces[id] = p.titlePreface; },
       async getCurrent() { return { id: 1 }; },
     },
@@ -103,6 +120,35 @@ export function createMockBrowser() {
       async get(id) { return clone(groups.get(id)); },
       async update(id, p) { Object.assign(groups.get(id), p); ev.groupUpdated.fire(clone(groups.get(id))); return clone(groups.get(id)); },
       onUpdated: ev.groupUpdated,
+    },
+    scripting: {
+      async getRegisteredContentScripts() { return clone(contentScripts); },
+      async registerContentScripts(list) { contentScripts.push(...clone(list)); },
+      async unregisterContentScripts({ ids }) {
+        for (const id of ids) contentScripts.splice(contentScripts.findIndex((s) => s.id === id), 1);
+      },
+      async executeScript({ files, func }) {
+        // Preview: run in this page (as the inspected tab's top frame).
+        if (files) for (const f of files) await import(new URL(`../web/${f}`, import.meta.url).href);
+        return func ? [{ frameId: 0, result: func() }] : [{ frameId: 0, result: undefined }];
+      },
+    },
+    webRequest: {
+      onBeforeRequest: {
+        addListener: (f, filter, extra) => requestListeners.push({ f, filter, extra }),
+        removeListener: (f) => requestListeners.splice(requestListeners.findIndex((l) => l.f === f), 1),
+      },
+      filterResponseData(requestId) {
+        const filter = { written: [], closed: false, write(d) { this.written.push(d); }, close() { this.closed = true; } };
+        filters.set(requestId, filter);
+        return filter;
+      },
+    },
+    declarativeNetRequest: {
+      async getDynamicRules() { return clone(dnrRules); },
+      async updateDynamicRules({ removeRuleIds, addRules }) {
+        dnrRules = dnrRules.filter((r) => !removeRuleIds.includes(r.id)).concat(clone(addRules));
+      },
     },
     permissions: {
       async contains({ permissions }) { return permissions.every((p) => granted.has(p)); },
@@ -162,5 +208,8 @@ export function createMockBrowser() {
       async setBadgeBackgroundColor() {},
     },
   };
-  return { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, granted, titlePrefaces, ev, clone };
+  return {
+    api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, granted, titlePrefaces, contentScripts,
+    dnr: () => dnrRules, createdWindows, requestListeners, filters, ev, clone,
+  };
 }

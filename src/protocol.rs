@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cleanup::{CleanupReport, CleanupRule, CleanupSpec, DataTypes};
 use crate::dedupe::Scope;
+use crate::guards::BlockRule;
 use crate::hibernate::HibernateTarget;
 use crate::model::{AppState, AutoRule, EntryRef, Id, Session, Settings, TabId};
 use crate::workspace::Workspace;
@@ -77,6 +78,12 @@ pub enum Command {
     SetActiveWorkspace { id: Option<Id> },
     /// Open a new tab that joins a workspace (`None`: the current one).
     NewTabInWorkspace { workspace: Option<Id> },
+    /// Create (`id == 0`) or update a rule blocking ad scripts / ad tabs.
+    SaveBlockRule { rule: BlockRule },
+    DeleteBlockRule { id: Id },
+    ClearPopupLog,
+    /// Open the inspector window for a tab (`None`: the active tab of the focused window).
+    OpenInspector { tab: Option<TabId> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

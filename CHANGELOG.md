@@ -2,6 +2,18 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.5.0] - 2026-10-27
+
+### New
+- Page guards (a new view): protections that run inside pages before the pages' own scripts, with a list of sites to leave alone.
+- Pop-ups and ad tabs: block windows and tabs a page opens without a click, or from code that catches clicks anywhere on the page (pop-under ad scripts).
+- Custom rules: block a script by its URL (only on chosen sites if you like), close tabs that pages open to an ad site, or block every pop-up on a site. A list of tabs opened by pages turns an ad tab into a rule in one click.
+- Always allow right-click, and optionally selecting and copying text, on pages that block them.
+- Remove debugger traps: `debugger` statements that pages build at runtime no longer freeze the page when the developer tools are open. In Firefox, also those in script files.
+- Hide the developer tools from pages that look for them (window size, console tricks, blocked shortcuts).
+- Inspector: inspect any page in a separate window, without the browser's developer tools. Pick elements, browse the DOM, and see attributes, size, computed styles and HTML. Search with CSS selectors, delete elements, and read the page source. Open it with Alt+Shift+I, 🔬 in the popup, or from a tab.
+- Media & frames: every video, audio, source, subtitle, iframe, frame, embed and script URL of the page and its frames, plus the streams behind blob: videos. Grouped by element type and searchable, with copy, open and "block this script".
+
 ## [0.4.0] - 2026-10-27
 
 ### New

@@ -60,6 +60,24 @@ extern "C" {
     fn js_open_url(url: &str) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(js_namespace = smPlatform, js_name = setGestureAction)]
     pub fn set_gesture_action(name: &str);
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = syncContentScripts)]
+    fn js_sync_content_scripts(regs: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = setBlockRules)]
+    fn js_set_block_rules(rules: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = setScriptRewrite)]
+    fn js_set_script_rewrite(enabled: bool, exceptions: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = openInspector)]
+    fn js_open_inspector(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = inspectorInject)]
+    fn js_inspector_inject(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = inspect)]
+    fn js_inspect(tab_id: f64, request: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = collectResources)]
+    fn js_collect_resources(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(js_namespace = smPlatform, js_name = onInspectorPick)]
+    pub fn on_inspector_pick(cb: &Function);
+    #[wasm_bindgen(js_namespace = smPlatform, js_name = locationParam)]
+    pub fn location_param(name: &str) -> String;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getAllCookies)]
     fn js_get_all_cookies() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = removeCookie)]
@@ -263,6 +281,60 @@ pub async fn current_window_id() -> Result<TabId> {
 
 pub async fn open_url(url: &str) -> Result<()> {
     call(js_open_url(url)).await.map(drop)
+}
+
+// ---- page guards ----
+
+/// Replaces our registered page scripts.
+pub async fn sync_content_scripts(regs: &[crate::guards::ScriptRegistration]) -> Result<()> {
+    call(js_sync_content_scripts(to_js(regs))).await.map(drop)
+}
+
+/// Replaces our declarativeNetRequest dynamic rules.
+pub async fn set_block_rules(rules: &[serde_json::Value]) -> Result<()> {
+    call(js_set_block_rules(to_js(rules))).await.map(drop)
+}
+
+/// Firefox: blank out `debugger` statements in script files, except on `exceptions`.
+pub async fn set_script_rewrite(enabled: bool, exceptions: &[String]) -> Result<()> {
+    call(js_set_script_rewrite(enabled, to_js(exceptions))).await.map(drop)
+}
+
+// ---- inspector ----
+
+pub async fn open_inspector(tab_id: TabId) -> Result<()> {
+    call(js_open_inspector(tab_id as f64)).await.map(drop)
+}
+
+pub async fn inspector_inject(tab_id: TabId) -> Result<()> {
+    call(js_inspector_inject(tab_id as f64)).await.map(drop)
+}
+
+/// A request (`{"op": ..., ...}`) to the inspector content script in a tab.
+pub async fn inspect(tab_id: TabId, request: &serde_json::Value) -> Result<serde_json::Value> {
+    let v = call(js_inspect(tab_id as f64, to_js(request))).await?;
+    if v.is_null() || v.is_undefined() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_wasm_bindgen::from_value(v).map_err(|e| e.to_string())
+}
+
+/// A URL found on a page (see `collectPageResources` in platform-common.js).
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct PageResource {
+    /// Element type: video, audio, source, track, poster, iframe, frame, embed, object,
+    /// script, or "network" (a media request).
+    pub kind: String,
+    pub url: String,
+    pub detail: String,
+    /// The frame it was found in.
+    pub frame: String,
+    pub top: bool,
+}
+
+pub async fn collect_resources(tab_id: TabId) -> Result<Vec<PageResource>> {
+    call_as(js_collect_resources(tab_id as f64)).await
 }
 
 /// Sends `"pause"` / `"resume"` to the media content script of every frame of a tab.

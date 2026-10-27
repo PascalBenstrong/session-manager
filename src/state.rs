@@ -53,6 +53,7 @@ impl AppState {
             .chain(self.auto_rules.iter().map(|r| r.id))
             .chain(self.cleanup_rules.iter().map(|r| r.id))
             .chain(self.workspaces.iter().map(|w| w.id))
+            .chain(self.block_rules.iter().map(|r| r.id))
             .max()
             .unwrap_or(0);
         self.next_id = self.next_id.max(max_id + 1);

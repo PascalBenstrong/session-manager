@@ -3,6 +3,7 @@ import { createMockBrowser } from './mock-browser.js';
 const browserName = new URLSearchParams(location.search).get('browser') || 'firefox';
 const popup = new URLSearchParams(location.search).has('popup');
 const sidebar = new URLSearchParams(location.search).has('sidebar');
+const inspector = new URLSearchParams(location.search).has('inspector');
 document.body.dataset.popup = String(popup);
 
 const mock = createMockBrowser();
@@ -65,7 +66,19 @@ await mock.api.tabs.create({ url: 'https://example.org/new-after-snapshot', titl
 const clip = new URLSearchParams(location.search).get('clip');
 if (clip !== null) smPlatform.readClipboard = async () => clip;
 
-await glue.start_ui('sm-canvas', popup ? 'popup' : sidebar ? 'sidebar' : 'manager');
+// ?inspector&tab=1 — the inspector window, inspecting this preview page itself (with some
+// sample media to list).
+if (inspector) {
+  const sample = document.createElement('div');
+  sample.hidden = true;
+  sample.innerHTML = `<video src="https://cdn.example.com/movie.mp4" poster="https://cdn.example.com/poster.jpg">
+      <source src="https://cdn.example.com/movie.webm" type="video/webm">
+      <track kind="subtitles" srclang="en" src="https://cdn.example.com/movie.en.vtt"></video>
+    <iframe src="about:blank" title="player"></iframe><embed src="https://cdn.example.com/widget.swf" type="application/x-shockwave-flash">`;
+  document.body.appendChild(sample);
+}
+// ?inspector&tab=1 — the inspector window, inspecting this preview page itself.
+await glue.start_ui('sm-canvas', popup ? 'popup' : sidebar ? 'sidebar' : inspector ? 'inspector' : 'manager');
 document.getElementById('sm-loading')?.remove();
 
 // ?click=x,y;x,y — synthetic clicks (for headless screenshots of other views).
