@@ -2,8 +2,9 @@
 //! developer tools, through a content script in the extension's isolated world
 //! (`web/inspect.js`). It runs docked at the bottom of the page (the default; an
 //! iframe the content script adds, `&dock=TOKEN`). Panes: Elements (live DOM tree, picker,
-//! details, context menus, screenshots), Media & frames (video, frame, script... URLs of
-//! every frame), Ads (the ad networks the page runs) and Source.
+//! details, context menus, screenshots), Network, Media & frames (video, frame, script...
+//! URLs of every frame), Capture (record or save the page's media, see `capture_view.rs`),
+//! Ads (the ad networks the page runs) and Source.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -151,6 +152,7 @@ enum Pane {
     Elements,
     Network,
     Media,
+    Capture,
     Ads,
     Source,
 }
@@ -211,6 +213,7 @@ pub struct InspectorView {
     source: Option<Vec<String>>,
     source_query: String,
     network: super::network_view::NetworkPane,
+    capture: super::capture_view::CapturePane,
     /// After a reload: replace the tree once the new page is read, and select this again.
     replace_tree: bool,
     restore_selector: Option<String>,
@@ -271,6 +274,7 @@ impl InspectorView {
             source: None,
             source_query: String::new(),
             network: super::network_view::NetworkPane::new(ctx, tab),
+            capture: super::capture_view::CapturePane::new(ctx, tab),
             replace_tree: false,
             restore_selector: None,
             keep_pane: None,
@@ -474,6 +478,7 @@ impl InspectorView {
                 Pane::Elements => "elements",
                 Pane::Network => "network",
                 Pane::Media => "media",
+                Pane::Capture => "capture",
                 Pane::Ads => "ads",
                 Pane::Source => "source",
             },
@@ -500,12 +505,14 @@ impl InspectorView {
         self.pane = match v["pane"].as_str() {
             Some("network") => Pane::Network,
             Some("media") => Pane::Media,
+            Some("capture") => Pane::Capture,
             Some("ads") => Pane::Ads,
             Some("source") => Pane::Source,
             _ => Pane::Elements,
         };
         match self.pane {
             Pane::Media => self.load_resources(),
+            Pane::Capture => self.capture.refresh(),
             Pane::Ads => self.load_ads(),
             Pane::Source => self.refresh_pane(),
             _ => {}
@@ -556,6 +563,7 @@ impl InspectorView {
         match self.pane {
             Pane::Elements | Pane::Network => self.connect(),
             Pane::Media => self.load_resources(),
+            Pane::Capture => self.capture.refresh(),
             Pane::Ads => self.load_ads(),
             Pane::Source => self.ask(json!({ "op": "source" }), |r| Reply::Source(parse(r))),
         }
@@ -757,6 +765,10 @@ impl InspectorView {
             Pane::Media => {
                 egui::CentralPanel::default().frame(pad).show(ui, |ui| self.media(ui, acts));
             }
+            Pane::Capture => {
+                let title = self.title.clone();
+                egui::CentralPanel::default().frame(pad).show(ui, |ui| self.capture.ui(ui, acts, &title));
+            }
             Pane::Ads => {
                 egui::CentralPanel::default().frame(pad).show(ui, |ui| self.ads(ui, acts, state));
             }
@@ -785,11 +797,19 @@ impl InspectorView {
             segmented(
                 ui,
                 &mut self.pane,
-                &[(Pane::Elements, "Elements"), (Pane::Network, "Network"), (Pane::Media, "Media & frames"), (Pane::Ads, "Ads"), (Pane::Source, "Source")],
+                &[
+                    (Pane::Elements, "Elements"),
+                    (Pane::Network, "Network"),
+                    (Pane::Media, "Media & frames"),
+                    (Pane::Capture, "Capture"),
+                    (Pane::Ads, "Ads"),
+                    (Pane::Source, "Source"),
+                ],
             );
             if self.pane != before {
                 match self.pane {
                     Pane::Media if self.resources.is_none() => self.load_resources(),
+                    Pane::Capture if !self.capture.loaded() => self.capture.refresh(),
                     Pane::Ads if self.ads.is_none() => self.load_ads(),
                     Pane::Source if self.source.is_none() => self.refresh_pane(),
                     _ => {}

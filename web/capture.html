@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Capture — Session Manager</title>
+    <link rel="stylesheet" href="ui.css" />
+  </head>
+  <!-- Capture window: capture.html?tab=ID&frame=F&el=E (record a page's media element) or
+       ?url=URL[&tab=ID&frame=F] (save a stream or file). The player shows what's captured;
+       the controls below it are src/ui/capture_window.rs, the work web/capture-engine.js. -->
+  <body data-popup="false" data-mode="capture">
+    <video id="sm-preview" controls playsinline></video>
+    <canvas id="sm-canvas"></canvas>
+    <div id="sm-loading">Loading…</div>
+    <script type="module" src="capture-engine.js"></script>
+    <script type="module" src="ui.js"></script>
+  </body>
+</html>

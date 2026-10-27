@@ -227,6 +227,7 @@ const PROXIED = [
   'openInspector', 'dockInspector', 'undockInspector', 'moveInspector', 'verifyDock', 'inspectorInject', 'inspect',
   'collectResources', 'collectAdSignals', 'tabInfo', 'captureTabImage',
   'netStart', 'netStop', 'netCommand', 'netReloadAndRecord', 'getThrottle', 'setThrottle', 'sessionGet', 'sessionSet',
+  'collectCaptureMedia', 'captureFlash', 'openCapture', 'sessionList',
 ];
 
 export function installPlatform(api, overrides = {}) {
@@ -625,6 +626,55 @@ export function installPlatform(api, overrides = {}) {
         .flatMap((r) => r.result.items.map((i) => ({ ...i, frame: r.result.frameUrl, top: !!r.result.top })));
     },
 
+    // ---- capture (the inspector's Capture view; capture windows run web/capture-engine.js) ----
+
+    /** Media elements and media URLs of every frame of a tab (see web/capture-page.js). */
+    async collectCaptureMedia(tabId) {
+      // Frames the extension can't reach are left out.
+      await api.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['capture-page.js'] }).catch(() => {});
+      const results = await api.scripting.executeScript({ target: { tabId, allFrames: true }, func: () => globalThis.__smCapture?.list() ?? null });
+      const media = [];
+      const urls = [];
+      for (const r of results) {
+        if (!r || !r.result) continue;
+        const frameId = r.frameId ?? 0;
+        for (const m of r.result.items) media.push({ ...m, frameId, frameUrl: r.result.frameUrl, top: !!r.result.top });
+        for (const u of r.result.urls) urls.push({ ...u, frameId });
+      }
+      return { media, urls };
+    },
+
+    /** Scrolls to a media element of a frame and outlines it for a moment. */
+    async captureFlash(tabId, frameId, id) {
+      const target = { tabId, frameIds: [frameId] };
+      await api.scripting.executeScript({ target, files: ['capture-page.js'] });
+      await api.scripting.executeScript({ target, func: (el) => globalThis.__smCapture?.flash(el), args: [id] });
+    },
+
+    /** Opens a capture window (capture.html, `params` as its query). */
+    async openCapture(params) {
+      const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== ''));
+      await api.windows.create({ url: api.runtime.getURL(`capture.html?${q}`), type: 'popup', width: 980, height: 860 });
+    },
+
+    /** storage.session entries whose keys start with `prefix`, as [key, text] pairs. */
+    async sessionList(prefix) {
+      if (!api.storage.session) return [];
+      const all = await api.storage.session.get(null);
+      return Object.entries(all)
+        .filter(([k]) => k.startsWith(prefix))
+        .map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]);
+    },
+
+    /** Asks the capture window `id` to do something ('stop'). */
+    async captureCommand(id, cmd) {
+      try {
+        await api.runtime.sendMessage({ smCaptureCmd: { id, cmd } });
+      } catch {
+        // Nothing answers (the windows only listen); that's fine.
+      }
+    },
+
     /** A query parameter of this page's URL ('' if missing). */
     locationParam(name) {
       return (globalThis.location && new URLSearchParams(location.search).get(name)) || '';
@@ -652,7 +702,7 @@ export function installPlatform(api, overrides = {}) {
     // permissions.request). egui handles clicks a frame later, so the UI arms an action
     // while the pointer is over its button, and it runs when the pointer is released.
 
-    /** Arms `name` ('sidebar', 'tabHide') for the next pointer release; '' disarms. */
+    /** Arms `name` ('sidebar', 'tabHide', 'capture:…') for the next pointer release; '' disarms. */
     setGestureAction(name) {
       gesture = name || '';
     },
@@ -662,6 +712,8 @@ export function installPlatform(api, overrides = {}) {
         let p;
         if (name === 'sidebar') p = platform.openSidebar();
         else if (name === 'tabHide') p = api.permissions.request({ permissions: ['tabHide'] });
+        // Capture window: picking a tab to capture, audio outputs, picture-in-picture.
+        else if (name.startsWith('capture:') && globalThis.smCapture) p = globalThis.smCapture.gesture(name.slice(8));
         if (p && p.catch) p.catch((e) => console.warn('[session-manager]', name, e));
       } catch (e) {
         console.warn('[session-manager]', name, e);

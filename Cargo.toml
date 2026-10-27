@@ -1,6 +1,6 @@
 [package]
 name = "session-manager"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "Tab session manager and site-data cleaner browser extension (Rust + egui + WebAssembly)"
 license = "MIT"
@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex-lite = "0.1"
+roxmltree = "0.21.2"
 
 # Everything that talks to the browser (background logic, egui UI) only builds for wasm.
 # The pure core (model, search, organize, cleanup matching, state) builds and tests natively.

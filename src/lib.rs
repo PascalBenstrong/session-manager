@@ -6,6 +6,7 @@
 //! browser folder (`firefox/`, `chrome/`) provides.
 
 pub mod ads;
+pub mod capture;
 pub mod cleanup;
 pub mod dedupe;
 pub mod guards;
@@ -19,9 +20,11 @@ pub mod protocol;
 pub mod release_notes;
 pub mod search;
 pub mod state;
+pub mod stream;
 pub mod tab_strip;
 pub mod transfer;
 pub mod url;
+pub mod webm;
 pub mod workspace;
 
 #[cfg(target_arch = "wasm32")]

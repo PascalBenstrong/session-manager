@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Player frame</title><style>body { margin: 0; } video { background: #000; display: block; }</style></head>
+  <body>
+    <video id="inner" width="320" height="180" muted autoplay playsinline></video>
+    <script src="media-stream.js"></script>
+    <script>
+      const v = document.getElementById('inner');
+      v.srcObject = liveStream('#a27');
+      v.play();
+    </script>
+  </body>
+</html>

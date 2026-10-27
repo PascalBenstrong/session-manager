@@ -52,3 +52,28 @@ body[data-mode='inspector'] #sm-loading {
     color: #333;
   }
 }
+
+/* Capture window: the player on top, the controls (canvas) below it. */
+body[data-mode='capture'] #sm-preview {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 44%;
+  background: #000;
+  display: block;
+}
+
+body[data-mode='capture'] #sm-canvas {
+  top: 44%;
+  height: 56%;
+}
+
+body[data-mode='capture'].sm-no-preview #sm-preview {
+  display: none;
+}
+
+body[data-mode='capture'].sm-no-preview #sm-canvas {
+  top: 0;
+  height: 100%;
+}

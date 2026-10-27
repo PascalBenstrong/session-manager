@@ -618,6 +618,45 @@ async function firefox() {
   const inspectorCtx = (await bidi.send('browsingContext.getTree', {})).contexts.find((c) => c.url.includes('inspector.html?tab='));
   await ctx(inspectorCtx.context).screenshot(join(shots, 'firefox-inspector.png'));
   await page.screenshot(join(shots, 'firefox-page.png'));
+
+  // ---- capture (the Firefox ways: mozCaptureStream, the page's own fetch); Edge runs tools/capture-test.mjs
+  await page.navigate('http://127.0.0.1:8123/tools/real/media.html');
+  await sleep(1500);
+  const media = await ext.json(`smPlatform.collectCaptureMedia(${tabId})`);
+  const top = media.media.find((m) => m.top);
+  const inner = media.media.find((m) => !m.top);
+  check('capture lists the videos of the page and its frame', !!top && !!inner && inner.frameId > 0, media.media.map((m) => m.frameUrl).join(', '));
+  await ext.eval(`smPlatform.openCapture({ tab: ${tabId}, frame: 0, el: ${top.id}, title: 'Clip' }).then(() => true)`);
+  const capCtx = await until('the capture window', async () => {
+    const all = [];
+    const walk = (cs) => cs.forEach((c) => (all.push(c), walk(c.children || [])));
+    walk((await bidi.send('browsingContext.getTree', {})).contexts);
+    return all.find((c) => c.url.includes('capture.html'))?.context;
+  });
+  const cap = ctx(capCtx);
+  await until('the capture window to start', () => cap.eval(`!document.getElementById('sm-loading') && typeof smCapture === 'object'`), 15000);
+  const call = (name, args = {}) => cap.json(`smCapture.call(${JSON.stringify(name)}, ${JSON.stringify(JSON.stringify(args))}).then(JSON.parse)`);
+  const rec = { tab: tabId, frame: 0, el: top.id, tracks: 'av', format: 'webm', videoBps: 0, stopAtEnd: true };
+  const info = await call('recordElement', rec).catch((e) => ({ error: e.message }));
+  check('Firefox records a video element (mozCaptureStream)', info.video === 1 && /webm/.test(info.mime || ''), JSON.stringify(info));
+  await sleep(2500);
+  await call('stop');
+  const head = await until('the recording, with its duration', async () => {
+    const b = await cap.json(`smCapture.head(1, 4096).then((b) => Array.from(b))`);
+    for (let i = 0; i + 2 < b.length; i++) if (b[i] === 0x44 && b[i + 1] === 0x89 && b[i + 2] === 0x88) return b;
+    return null;
+  }).catch(() => null);
+  check('the recording is a WebM file with its duration', !!head && head[0] === 0x1a && head[1] === 0x45);
+  const innerRec = await call('recordElement', { ...rec, frame: inner.frameId, el: inner.id, tracks: 'v' }).catch((e) => ({ error: e.message }));
+  check('and the video in the frame', innerRec.video === 1, JSON.stringify(innerRec));
+  await sleep(1000);
+  await call('stop');
+  const stream = 'http://127.0.0.1:8123/tools/real/stream/';
+  const parts = ['v720-init.mp4', 'v720-1.m4s', 'v720-2.m4s', 'v720-3.m4s'].map((n) => ({ url: stream + n }));
+  await call('download', { job: 1, via: { tab: tabId, frame: 0 }, parts, label: '720p', ext: 'mp4' });
+  const text = await cap.eval(`smCapture.head(3, 1e6).then((b) => new TextDecoder().decode(b))`).catch((e) => String(e));
+  check('a stream is fetched through the page and joined in order', text === '[v720 init][v720 seg 1][v720 seg 2][v720 seg 3]', text);
+  await cap.screenshot(join(shots, 'firefox-capture.png'));
 }
 
 /** Minimal WebDriver BiDi client. */

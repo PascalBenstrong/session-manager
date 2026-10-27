@@ -2,6 +2,17 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.8.0] - 2026-10-28
+
+### New
+- Inspector, Capture: the video and audio of a page and all its frames, and the streams (HLS, DASH) and media files it loads. Record one, or save one, in a capture window that keeps going when the page reloads.
+- Record a video's own stream (picture and sound as the page decodes them, without what's drawn over it), its picture only, or its sound only, as WebM (or MP4 where the browser can). Options: from the start, stop at the end, pause and resume, and "listen here" (silence it in the page and hear it in the capture window instead). Recordings play in the window while they're made, and can be seeked in once saved.
+- Or record what the browser shows: choose the tab once, and only the video's area is kept, following it as the page scrolls (videos in the page or in a frame of it). Browsers black out protected (DRM) video in captures, and the extension leaves that as it is.
+- Save a stream as it is, in its original quality and faster than playing it: choose the quality and the sound track (and subtitles for DASH); picture and sound that the stream keeps apart are saved as separate files. Its pieces are fetched the way the page's own player fetches them. Encrypted and protected streams are not saved.
+- Open any media URL (a file, an .m3u8 or an .mpd): play it in the capture window, save it, or record it while it plays.
+- Send what you captured on: save it as a file, upload it to an address of your own (PUT or POST, as the body or a form field, with your own headers such as Authorization), play it on another sound output (speakers, headset), in picture-in-picture or full screen.
+- The Capture view lists the open capture windows, with what they're doing; bring one to the front or stop it from there.
+
 ## [0.7.0] - 2026-10-27
 
 ### New

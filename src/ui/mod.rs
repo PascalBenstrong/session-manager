@@ -9,6 +9,8 @@
 mod backup_view;
 mod cleanup_view;
 mod guards_view;
+mod capture_view;
+mod capture_window;
 mod inspector_view;
 mod mini_view;
 mod network_view;
@@ -40,11 +42,12 @@ const WIDE_LAYOUT: f32 = 860.0;
 static IS_POPUP: AtomicBool = AtomicBool::new(false);
 
 /// `mode`: "popup", "sidebar" (browser sidebar / side panel), "inspector" (inspector
-/// window) or "manager".
+/// window), "capture" (capture window) or "manager".
 pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
     let popup = mode == "popup";
     let sidebar = mode == "sidebar";
     let inspector = mode == "inspector";
+    let capture = mode == "capture";
     IS_POPUP.store(popup, Ordering::Relaxed);
     let document = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let canvas = document
@@ -53,7 +56,7 @@ pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
         .dyn_into::<web_sys::HtmlCanvasElement>()?;
     let runner = Box::leak(Box::new(eframe::WebRunner::new()));
     runner
-        .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, popup, sidebar, inspector)))))
+        .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, popup, sidebar, inspector, capture)))))
         .await
 }
 
@@ -194,6 +197,8 @@ pub struct App {
     guards: guards_view::GuardsView,
     /// The inspector window.
     inspector: Option<inspector_view::InspectorView>,
+    /// The capture window.
+    capture: Option<capture_window::CaptureWindow>,
     ctx: egui::Context,
     inbox: Rc<RefCell<Inbox>>,
     pending: u32,
@@ -221,7 +226,7 @@ pub struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, popup: bool, sidebar: bool, inspector: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, popup: bool, sidebar: bool, inspector: bool, capture: bool) -> Self {
         let theme = theme::load_preference();
         theme::install(&cc.egui_ctx, theme);
 
@@ -258,6 +263,7 @@ impl App {
             side: Default::default(),
             guards: Default::default(),
             inspector: inspector.then(|| inspector_view::InspectorView::new(&cc.egui_ctx)),
+            capture: capture.then(|| capture_window::CaptureWindow::new(&cc.egui_ctx)),
             ctx: cc.egui_ctx.clone(),
             inbox,
             pending: 0,
@@ -866,6 +872,15 @@ impl App {
             let mut acts = Actions::default();
             inspector.ui(ui, &mut acts, self.state.as_ref());
             self.inspector = Some(inspector);
+            self.apply(acts);
+            let dark = ui.visuals().dark_mode;
+            self.toast(&ui.ctx().clone(), dark);
+            return;
+        }
+        if let Some(mut capture) = self.capture.take() {
+            let mut acts = Actions::default();
+            capture.ui(ui, &mut acts);
+            self.capture = Some(capture);
             self.apply(acts);
             let dark = ui.visuals().dark_mode;
             self.toast(&ui.ctx().clone(), dark);

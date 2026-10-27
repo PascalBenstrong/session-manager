@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Media test page</title>
+    <!-- For tools/capture-test.mjs: live videos (top frame and an iframe) and a page that
+         loads an HLS playlist and a DASH manifest (tools/real/stream/). -->
+    <style>
+      body { font: 16px system-ui; margin: 20px; }
+      video { background: #000; display: block; margin: 10px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Media test page</h1>
+    <video id="live" width="320" height="180" muted autoplay playsinline></video>
+    <iframe id="frame" src="media-frame.html" width="360" height="220" title="player frame"></iframe>
+    <script src="media-stream.js"></script>
+    <script>
+      const v = document.getElementById('live');
+      v.srcObject = liveStream('#2a7');
+      v.play();
+      // The streams a player would load.
+      fetch('stream/master.m3u8');
+      fetch('stream/manifest.mpd');
+    </script>
+  </body>
+</html>

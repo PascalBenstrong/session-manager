@@ -102,6 +102,24 @@ extern "C" {
     fn js_set_throttle(rules: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = captureElement)]
     fn js_capture_element(tab_id: f64, node: f64, action: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = collectCaptureMedia)]
+    fn js_collect_capture_media(tab_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = captureFlash)]
+    fn js_capture_flash(tab_id: f64, frame_id: f64, id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = openCapture)]
+    fn js_open_capture(params: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = sessionList)]
+    fn js_session_list(prefix: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = captureCommand)]
+    fn js_capture_command(id: &str, cmd: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smCapture, js_name = call)]
+    fn js_capture_call(name: &str, args: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smCapture, js_name = setListener)]
+    fn js_capture_set_listener(cb: &Function) -> std::result::Result<(), JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smCapture, js_name = head)]
+    fn js_capture_head(take: f64, n: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smCapture, js_name = replaceHead)]
+    fn js_capture_replace_head(take: f64, bytes: &[u8], old_len: f64) -> std::result::Result<JsValue, JsValue>;
     #[wasm_bindgen(js_namespace = smPlatform, js_name = locationParam)]
     pub fn location_param(name: &str) -> String;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getAllCookies)]
@@ -446,6 +464,64 @@ pub async fn set_throttle(rules: &[crate::netlog::ThrottleRule]) -> Result<()> {
 
 pub async fn collect_resources(tab_id: TabId) -> Result<Vec<PageResource>> {
     call_as(js_collect_resources(tab_id as f64)).await
+}
+
+// ---- capture (inspector's Capture view) ----
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct CaptureMediaList {
+    pub media: Vec<crate::capture::PageMedia>,
+    pub urls: Vec<crate::capture::PageMediaUrl>,
+}
+
+/// Media elements and media URLs of every frame of a tab.
+pub async fn collect_capture_media(tab_id: TabId) -> Result<CaptureMediaList> {
+    call_as(js_collect_capture_media(tab_id as f64)).await
+}
+
+/// Scrolls to a media element and outlines it for a moment.
+pub async fn capture_flash(tab_id: TabId, frame_id: i64, id: u64) -> Result<()> {
+    call(js_capture_flash(tab_id as f64, frame_id as f64, id as f64)).await.map(drop)
+}
+
+/// Opens a capture window; `params` become its query (see web/capture.html).
+pub async fn open_capture(params: &std::collections::BTreeMap<&str, String>) -> Result<()> {
+    call(js_open_capture(to_js(params))).await.map(drop)
+}
+
+/// storage.session entries whose keys start with `prefix`: (key, text).
+pub async fn session_list(prefix: &str) -> Result<Vec<(String, String)>> {
+    call_as(js_session_list(prefix)).await
+}
+
+/// Asks a capture window (by its id) to do something ("stop").
+pub async fn capture_command(id: &str, cmd: &str) {
+    let _ = call(js_capture_command(id, cmd)).await;
+}
+
+// ---- capture window (`smCapture`, web/capture-engine.js) ----
+
+/// A request to the capture engine; arguments and result are JSON.
+pub async fn capture_call(name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+    let v = call(js_capture_call(name, &args.to_string())).await?;
+    serde_json::from_str(&v.as_string().unwrap_or_else(|| "null".into())).map_err(|e| e.to_string())
+}
+
+/// `cb` gets the engine's events as JSON.
+pub fn capture_set_listener(cb: &Function) -> Result<()> {
+    js_capture_set_listener(cb).map_err(js_error)
+}
+
+/// The first `n` bytes of a take.
+pub async fn capture_head(take: u32, n: usize) -> Result<Vec<u8>> {
+    let v = call(js_capture_head(take as f64, n as f64)).await?;
+    Ok(js_sys::Uint8Array::new(&v).to_vec())
+}
+
+/// Replaces the first `old_len` bytes of a take with `bytes`. Returns its new size.
+pub fn capture_replace_head(take: u32, bytes: &[u8], old_len: usize) -> Result<u64> {
+    Ok(js_capture_replace_head(take as f64, bytes, old_len as f64).map_err(js_error)?.as_f64().unwrap_or(0.0) as u64)
 }
 
 /// Sends `"pause"` / `"resume"` to the media content script of every frame of a tab.

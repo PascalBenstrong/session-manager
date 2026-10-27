@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.5.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.8.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -69,6 +69,16 @@ Version: 0.5.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Elements: an element picker (hover highlights, click selects), a lazily loaded DOM tree (including open shadow roots), CSS selector search, and for the selected element its path, a unique selector, size and position, attributes, computed style (filterable), text and HTML; scroll into view and delete.
 - Media & frames: the URLs of videos, audio, sources, subtitle tracks, posters, iframes, frames, embeds, objects and scripts in every frame, and media requests from the network log (the streams behind blob: videos), grouped by element type and searchable; copy, open, and block a script.
 - Source: the current page source with line numbers and search.
+
+## Media capture
+- The inspector's Capture view lists the video and audio elements of the page and all its frames (size, length, playing, source: file, Media Source stream or live stream; protected by DRM), and the stream manifests (HLS, DASH) and media files the page requested. A URL box opens any media URL.
+- Recording or saving opens a capture window (capture.html), which does the work and keeps going when the page reloads. Capture windows publish their state (storage.session) for the view, which lists them, brings one to the front, or stops it.
+- Element stream: a content script injected on demand into the element's frame (web/capture-page.js, isolated world) records captureStream() / mozCaptureStream() with MediaRecorder: picture and sound, picture only or sound only; WebM, or MP4 where supported; a chosen bitrate. From the start, stop at the end, pause / resume. Listen here: the element is muted in the page and its sound plays in the window. Chunks go to the window, which plays them as they come (Media Source).
+- Rendered on screen: the user shares a tab (getDisplayMedia, on a click in the window); the capture is cut to the element's area, which the page reports as it moves (for elements of the top frame and of frames directly in it; the frame's position comes from the top frame's script), fitted for the browser's scaling and letterboxing. Chromium processes the frames off the track (works with the window in the background).
+- Protected media (DRM) is not recorded from its stream; captures of it stay as the browser makes them (black). Encrypted HLS and protected DASH streams are not saved.
+- Saving a stream: HLS master and media playlists (variants, audio renditions, fMP4 / TS, byte ranges) and DASH manifests (SegmentTemplate with $Number$ / $Time$ and SegmentTimeline, SegmentList, single files) are parsed in Rust (src/stream.rs); the user picks the quality and sound (and DASH subtitles); separate picture and sound make separate files. Parts are fetched in parallel with retries, in the page's frame (as its player does) for streams found in a page, from the window for URLs.
+- Recorded WebM files get their duration written into the header (src/webm.rs) so they can be seeked.
+- Sinks: save as a file, upload (PUT or POST, raw body or multipart field, custom headers, progress, cancel), play in the window (on a chosen audio output via setSinkId; Firefox: selectAudioOutput), picture-in-picture, full screen. Files stay in the window until saved or uploaded (closing it asks first).
 
 ## Search
 - Search tabs by keyword, title, URL, host, domain, custom tags, groups and workspace.
