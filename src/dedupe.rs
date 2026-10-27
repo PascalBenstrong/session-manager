@@ -168,6 +168,31 @@ impl AppState {
         result
     }
 
+    /// Removes entries added since `since` that show the same page as an older open entry
+    /// in any session: extra copies of a page the browser restored at startup. Saved
+    /// entries are never touched, so a page kept in several sessions stays in all of them.
+    pub fn remove_restored_copies(&mut self, since: f64, o: &DedupeOptions) -> DedupeResult {
+        let older: HashSet<String> = self
+            .sessions
+            .iter()
+            .flat_map(|s| &s.entries)
+            .filter(|e| e.is_open() && e.created_at < since)
+            .map(|e| key(&e.url, o))
+            .collect();
+        let mut result = DedupeResult::default();
+        for s in &mut self.sessions {
+            s.entries.retain(|e| {
+                let copy = e.is_open() && e.created_at >= since && older.contains(&key(&e.url, o));
+                if copy {
+                    result.removed += 1;
+                    result.open_tabs.extend(e.tab_id);
+                }
+                !copy
+            });
+        }
+        result
+    }
+
     /// For "prevent duplicates": an existing entry in the active session that a new,
     /// not yet tracked tab duplicates.
     pub fn duplicate_of_new_tab(&self, tab: &BrowserTab) -> Option<EntryRef> {
@@ -257,6 +282,22 @@ mod tests {
         assert_eq!(b.keep.entry, 13);
         s.remove_duplicates(Scope::All, &DedupeOptions::default());
         assert!(s.sessions[1].entries.is_empty());
+    }
+
+    #[test]
+    fn restored_copies_across_sessions() {
+        let mut s = state();
+        let other = s.sessions[1].id;
+        let open = |id, url: &str, tab, created_at| TabEntry { tab_id: Some(tab), created_at, ..e(id, url) };
+        // b.com: saved unloaded in both sessions (kept); a restored copy of the open c.com
+        // tab and of the saved, unloaded b.com in the other session.
+        s.session_mut(other).unwrap().entries.push(open(21, "https://c.com/", 30, 10.0));
+        s.session_mut(other).unwrap().entries.push(open(22, "https://b.com", 31, 10.0));
+        let r = s.remove_restored_copies(10.0, &DedupeOptions::default());
+        assert_eq!(r, DedupeResult { removed: 1, open_tabs: vec![30] });
+        let ids: Vec<Id> = s.sessions[1].entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![20, 22], "only the copy of an open page is removed");
+        assert_eq!(s.active().entries.len(), 6);
     }
 
     #[test]

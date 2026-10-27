@@ -9,7 +9,8 @@ use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
 
-use crate::cleanup::{self, ALARM_PREFIX, CleanupReport, CleanupSpec, Cookie, SpecMatcher};
+use crate::cleanup::{self, ALARM_PREFIX, CleanupReport, CleanupSpec, CleanupTarget, Cookie, SpecMatcher};
+use crate::dedupe::Scope;
 use crate::model::{AppState, BrowserTab, EntryRef, Id, TabId};
 use crate::organize::{self, OrganizeKey};
 use crate::platform::{self as pf, CreateTab};
@@ -17,6 +18,11 @@ use crate::protocol::{Capabilities, Command, Response, STATE_KEY};
 use crate::state::{RestoreMode, trackable};
 
 const SNAPSHOT_ALARM: &str = "sm-snapshot";
+/// After browser startup, de-duplicate once the browser has stopped restoring tabs for
+/// this long...
+const STARTUP_SETTLE_MS: u32 = 3000;
+/// ...or at the latest this long after startup.
+const STARTUP_MAX_WAIT_MS: f64 = 30_000.0;
 
 thread_local! {
     static STATE: RefCell<AppState> = RefCell::new(AppState::default());
@@ -24,6 +30,11 @@ thread_local! {
     static ORGANIZE_GENERATION: Cell<u32> = const { Cell::new(0) };
     /// > 0 while we open tabs ourselves; "prevent duplicates" must not touch those.
     static OPENING: Cell<u32> = const { Cell::new(0) };
+    /// Set from browser startup until the startup de-duplication ran: (debounce
+    /// generation, startup time).
+    static STARTUP_DEDUPE: Cell<Option<(u32, f64)>> = const { Cell::new(None) };
+    /// When this background instance started.
+    static STARTED_AT: Cell<f64> = const { Cell::new(0.0) };
 }
 
 /// Marks that the extension itself is opening tabs (for the lifetime of the guard).
@@ -55,6 +66,7 @@ fn log(msg: &str) {
 }
 
 pub async fn start() -> Result<(), JsValue> {
+    STARTED_AT.with(|t| t.set(pf::now()));
     CAPS.with(|c| *c.borrow_mut() = pf::capabilities());
 
     let mut state = match pf::storage_get(STATE_KEY).await {
@@ -102,6 +114,7 @@ async fn persist() {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Event {
+    BrowserStartup,
     TabCreated { tab: BrowserTab },
     #[serde(rename_all = "camelCase")]
     TabUpdated { tab: BrowserTab, url_changed: bool },
@@ -119,7 +132,24 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
     let ev: Event = serde_wasm_bindgen::from_value(ev).map_err(|e| format!("bad event: {e}"))?;
     let now = pf::now();
     match ev {
+        Event::BrowserStartup => {
+            if with_state(|s| s.settings.dedupe_on_startup) {
+                // Tabs restored before this event were tracked when the background started.
+                let since = STARTED_AT.with(|t| t.get()).min(now);
+                STARTUP_DEDUPE.with(|d| d.set(Some((0, since))));
+                schedule_startup_dedupe();
+            }
+        }
         Event::TabCreated { tab } => {
+            if STARTUP_DEDUPE.with(|d| d.get()).is_some() {
+                // A tab the browser restores: give it back its saved entry rather than
+                // adding a copy, and wait for the restore to finish before de-duplicating.
+                schedule_startup_dedupe();
+                if with_state(|s| s.link_by_url(&tab)) {
+                    persist().await;
+                    return Ok(JsValue::UNDEFINED);
+                }
+            }
             if prevent_duplicate(&tab, now).await {
                 return Ok(JsValue::UNDEFINED);
             }
@@ -238,6 +268,59 @@ async fn on_cookie_set(cookie: Cookie) {
             log(&e);
         }
     }
+}
+
+/// Debounced de-duplication of every session after browser startup.
+fn schedule_startup_dedupe() {
+    let Some((generation, started)) = STARTUP_DEDUPE.with(|d| {
+        let next = d.get().map(|(g, started)| (g.wrapping_add(1), started));
+        d.set(next);
+        next
+    }) else {
+        return;
+    };
+    spawn_local(async move {
+        if pf::now() - started < STARTUP_MAX_WAIT_MS {
+            pf::sleep(STARTUP_SETTLE_MS).await;
+        }
+        if STARTUP_DEDUPE.with(|d| d.get()).map(|(g, _)| g) != Some(generation) {
+            return;
+        }
+        STARTUP_DEDUPE.with(|d| d.set(None));
+        let sessions: Vec<Id> = with_state(|s| s.sessions.iter().map(|s| s.id).collect());
+        match remove_duplicates_in(&sessions, Some(started)).await {
+            Ok(0) => {}
+            Ok(n) => log(&format!("removed {n} duplicate tab(s) after browser startup")),
+            Err(e) => log(&format!("startup de-duplication failed: {e}")),
+        }
+    });
+}
+
+/// Removes duplicates within each of `sessions` (never across them) and closes the
+/// extra open tabs. With `restored_since`, also tabs restored since then that copy an
+/// open page of any session. Returns how many entries were removed.
+async fn remove_duplicates_in(sessions: &[Id], restored_since: Option<f64>) -> Result<usize, String> {
+    let (removed, open_tabs) = with_state(|s| {
+        let opts = s.settings.dedupe;
+        let mut removed = 0;
+        let mut open_tabs = Vec::new();
+        if let Some(since) = restored_since {
+            let r = s.remove_restored_copies(since, &opts);
+            removed += r.removed;
+            open_tabs.extend(r.open_tabs);
+        }
+        for id in sessions {
+            let r = s.remove_duplicates(Scope::Session(*id), &opts);
+            removed += r.removed;
+            open_tabs.extend(r.open_tabs);
+        }
+        (removed, open_tabs)
+    });
+    if removed > 0 {
+        persist().await;
+        pf::remove_tabs(&open_tabs).await?;
+    }
+    Ok(removed)
 }
 
 fn open_urls(s: &AppState) -> Vec<String> {
@@ -476,6 +559,18 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             }
             ok(info)
         }
+        Command::ClearTabData { tab, data_types, reload } => {
+            let tab = pf::get_tab(tab).await?;
+            let host = crate::url::display_host(&tab.url);
+            let spec = CleanupSpec { target: CleanupTarget::Pages(vec![tab.url.clone()]), data_types, exclude: Vec::new() };
+            let report = run_cleanup(&format!("Tab: {host}"), &spec).await?;
+            with_state(|s| s.push_cleanup_report(report.clone()));
+            persist().await;
+            if reload {
+                pf::reload_tab(tab.id).await?;
+            }
+            Ok(Response { ok: true, info: Some(report.summary()), report: Some(report), ..Default::default() })
+        }
         Command::ClearCleanupLog => {
             with_state(|s| s.cleanup_log.clear());
             persist().await;
@@ -485,12 +580,15 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
 }
 
 async fn load_session(id: Id, discarded: bool, new_window: bool) -> Result<Response, String> {
+    // De-duplicate first, so only one copy of each page gets opened.
+    let deduped = if with_state(|s| s.settings.dedupe_on_session_load) { remove_duplicates_in(&[id], None).await? } else { 0 };
     let (opened, errors) = open_entries(id, None, discarded, new_window).await?;
+    let removed = if deduped > 0 { format!("; removed {deduped} duplicate(s)") } else { String::new() };
     if opened == 0 && errors.is_empty() {
-        return ok("All tabs of this session are already open");
+        return ok(format!("All tabs of this session are already open{removed}"));
     }
     let mode = if discarded { "unloaded" } else { "loaded" };
-    let mut info = format!("Opened {opened} tab(s) {mode}");
+    let mut info = format!("Opened {opened} tab(s) {mode}{removed}");
     if !errors.is_empty() {
         info.push_str(&format!("; {} failed (e.g. {})", errors.len(), errors[0]));
     }

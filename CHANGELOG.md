@@ -11,6 +11,8 @@ All notable changes to Session Manager. This file is compiled into the extension
 - Import saved sessions, or comma separated URL lists from a file, the clipboard or a paste. Files can also be dropped onto the manager.
 - Duplicate tabs: find and remove tabs showing the same page, with adjustable matching, an `is:duplicate` search filter, and an optional "prevent duplicates" mode.
 - "What's new" page with these release notes, and a NEW badge on the toolbar icon after an update.
+- Clear cookies & site data from the toolbar popup: for the current tab (🧹 menu, cookies only or everything, optionally reloading the tab), or for any open tab in the list.
+- Remove duplicate tabs automatically when the browser restarts and restores its tabs, and/or when a session's tabs are reopened. Tabs restored after a restart go back to the session they were saved in.
 
 ### Improved
 - Modern look with dark and light themes (follows the system, or pick one).

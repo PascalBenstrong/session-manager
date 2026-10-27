@@ -3,9 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::cleanup::{CleanupReport, CleanupRule, CleanupSpec};
+use crate::cleanup::{CleanupReport, CleanupRule, CleanupSpec, DataTypes};
 use crate::dedupe::Scope;
-use crate::model::{AppState, AutoRule, EntryRef, Id, Session, Settings};
+use crate::model::{AppState, AutoRule, EntryRef, Id, Session, Settings, TabId};
 use crate::state::{ImportTarget, RestoreMode};
 use crate::organize::OrganizeKey;
 
@@ -43,6 +43,9 @@ pub enum Command {
     DeleteCleanupRule { id: Id },
     RunCleanupRule { id: Id },
     ClearCleanupLog,
+    /// Remove cookies / site data of one tab's site (`None` = the active tab of the
+    /// focused window), optionally reloading the tab afterwards.
+    ClearTabData { tab: Option<TabId>, data_types: DataTypes, reload: bool },
     /// Save the session's current tab list as a named revision.
     CreateSnapshot { session: Id, name: String },
     RestoreSnapshot { session: Id, snapshot: Id, mode: RestoreMode, open: bool },

@@ -1,5 +1,6 @@
 //! Quick switcher shown in the toolbar popup: type to search the session's tabs,
-//! ↑/↓ to move, Enter (or click) to jump to a tab, Esc to close.
+//! ↑/↓ to move, Enter (or click) to jump to a tab, Esc to close. Also clears the
+//! cookies / site data of the current tab or of any open tab in the list.
 
 use std::collections::HashMap;
 
@@ -8,18 +9,26 @@ use eframe::egui::{self, Align, Color32, CursorIcon, Key, Layout, Margin, Modifi
 use super::theme;
 use super::widgets::{ChipKind, avatar, chip, empty_state, icon_button, status_dot};
 use super::{Actions, ViewCtx};
-use crate::model::{EntryRef, Id, TabEntry};
+use crate::cleanup::DataTypes;
+use crate::model::{EntryRef, Id, TabEntry, TabId};
 use crate::protocol::Command;
 use crate::search::{Query, SearchOptions};
 
 const ROW_HEIGHT: f32 = 42.0;
 
-#[derive(Default)]
 pub struct MiniView {
     query: String,
     selected: usize,
     all_sessions: bool,
     focused_once: bool,
+    /// Reload a tab after clearing its site data, so the page reflects it.
+    reload_after_clean: bool,
+}
+
+impl Default for MiniView {
+    fn default() -> Self {
+        Self { query: String::new(), selected: 0, all_sessions: false, focused_once: false, reload_after_clean: true }
+    }
 }
 
 impl MiniView {
@@ -123,7 +132,7 @@ impl MiniView {
                 let session_name = self
                     .all_sessions
                     .then(|| cx.state.session(r.session).map(|s| s.name.as_str()).unwrap_or(""));
-                let resp = row(ui, e, r, i == self.selected, session_name, acts);
+                let resp = row(ui, e, r, i == self.selected, session_name, self.reload_after_clean, acts);
                 if i == self.selected && moved {
                     resp.scroll_to_me(None);
                 }
@@ -134,13 +143,61 @@ impl MiniView {
         });
     }
 
+    /// "🧹" header menu: clear the current tab's cookies / site data.
+    pub fn clean_menu(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
+        let p = theme::palette(ui);
+        let config = egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        egui::containers::menu::MenuButton::new("🧹")
+            .config(config)
+            .ui(ui, |ui| {
+                ui.set_min_width(250.0);
+                ui.label(RichText::new("Current tab").small().color(p.muted));
+                if ui
+                    .button("Clear cookies & site data")
+                    .on_hover_text("Cookies, cache, localStorage, IndexedDB and service workers of the tab's site")
+                    .clicked()
+                {
+                    clean(acts, None, "the current tab's site", DataTypes::default(), self.reload_after_clean);
+                    ui.close();
+                }
+                if ui.button("Clear cookies only").clicked() {
+                    clean(acts, None, "the current tab's site", COOKIES_ONLY, self.reload_after_clean);
+                    ui.close();
+                }
+                ui.separator();
+                ui.checkbox(&mut self.reload_after_clean, "Reload the tab afterwards");
+                ui.label(RichText::new("Hover an open tab in the list and click 🧹 to clean its site.").small().color(p.muted));
+            })
+            .0
+            .on_hover_text("Clear cookies & site data of the current tab");
+    }
+
     pub fn footer(&self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
         ui.label(RichText::new("↑↓ navigate   ⏎ open   Esc close").small().color(p.muted));
     }
 }
 
-fn row(ui: &mut egui::Ui, e: &TabEntry, r: EntryRef, selected: bool, session_name: Option<&str>, acts: &mut Actions) -> egui::Response {
+const COOKIES_ONLY: DataTypes =
+    DataTypes { cookies: true, cache: false, local_storage: false, indexed_db: false, service_workers: false };
+
+/// Asks for confirmation, then clears `tab`'s site data (`None` = the current tab).
+fn clean(acts: &mut Actions, tab: Option<TabId>, site: &str, data_types: DataTypes, reload: bool) {
+    acts.confirm(
+        format!("Remove {} of {site}? You will be logged out of it.", data_types.describe()),
+        Command::ClearTabData { tab, data_types, reload },
+    );
+}
+
+fn row(
+    ui: &mut egui::Ui,
+    e: &TabEntry,
+    r: EntryRef,
+    selected: bool,
+    session_name: Option<&str>,
+    reload_after_clean: bool,
+    acts: &mut Actions,
+) -> egui::Response {
     let p = theme::palette(ui);
     let open = e.is_open();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
@@ -168,9 +225,12 @@ fn row(ui: &mut egui::Ui, e: &TabEntry, r: EntryRef, selected: bool, session_nam
     row.add_space(2.0);
     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if hovered {
-            if open {
+            if let Some(tab_id) = e.tab_id {
                 if icon_button(ui, "🗙", "Close tab").clicked() {
                     acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: true });
+                }
+                if icon_button(ui, "🧹", "Clear this site's cookies & data").clicked() {
+                    clean(acts, Some(tab_id), &host, DataTypes::default(), reload_after_clean);
                 }
             } else if icon_button(ui, "⤓", "Open in background without loading").clicked() {
                 acts.send(Command::OpenEntry { entry: r, discarded: true });

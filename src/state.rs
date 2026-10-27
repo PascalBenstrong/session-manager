@@ -224,35 +224,39 @@ impl AppState {
         let open: BTreeSet<TabId> = tabs.iter().map(|t| t.id).collect();
         self.ignored_tab_ids.retain(|id| open.contains(id));
 
-        let active = self.active_session;
         for t in tabs {
             if linked.contains(&t.id) || self.ignored_tab_ids.contains(&t.id) {
                 continue;
             }
-            // Prefer an unlinked entry with the same URL in the active session, then any session.
-            let order = self
-                .sessions
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.id == active)
-                .chain(self.sessions.iter().enumerate().filter(|(_, s)| s.id != active))
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>();
-            let found = order.into_iter().find_map(|si| {
-                self.sessions[si].entries.iter().position(|e| e.tab_id.is_none() && e.url == t.url).map(|ei| (si, ei))
-            });
-            match found {
-                Some((si, ei)) => {
-                    let e = &mut self.sessions[si].entries[ei];
-                    e.tab_id = Some(t.id);
-                    e.window_id = Some(t.window_id);
-                    linked.insert(t.id);
-                }
-                None => {
-                    self.on_tab_upsert(t, now);
-                }
+            if !self.link_by_url(t) {
+                self.on_tab_upsert(t, now);
             }
         }
+    }
+
+    /// Links a not yet tracked tab to an unlinked entry with the same URL, preferring the
+    /// active session (a tab the browser restored after a restart). Returns true if linked.
+    pub fn link_by_url(&mut self, t: &BrowserTab) -> bool {
+        if t.url.is_empty() || self.locate_tab(t.id).is_some() || self.ignored_tab_ids.contains(&t.id) {
+            return false;
+        }
+        let active = self.active_session;
+        let order = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.id == active)
+            .chain(self.sessions.iter().enumerate().filter(|(_, s)| s.id != active))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let found = order.into_iter().find_map(|si| {
+            self.sessions[si].entries.iter().position(|e| e.tab_id.is_none() && e.url == t.url).map(|ei| (si, ei))
+        });
+        let Some((si, ei)) = found else { return false };
+        let e = &mut self.sessions[si].entries[ei];
+        e.tab_id = Some(t.id);
+        e.window_id = Some(t.window_id);
+        true
     }
 
     // ---- user edits ----
@@ -610,6 +614,23 @@ mod tests {
         assert_eq!(e.iter().find(|e| e.url == "https://b.com").unwrap().tab_id, Some(10));
         assert_eq!(e.iter().find(|e| e.url == "https://a.com").unwrap().tab_id, None);
         assert_eq!(e.iter().find(|e| e.url == "https://new.com").unwrap().tab_id, Some(11));
+    }
+
+    #[test]
+    fn link_by_url_finds_saved_entry_in_any_session() {
+        let mut s = AppState::default();
+        let other = s.create_session("Other", 0.0);
+        s.set_active(other).unwrap();
+        s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
+        s.on_tab_removed(1, true);
+        s.set_active(s.sessions[0].id).unwrap();
+        // tab restored after a restart lands in its saved entry, not as a new one
+        assert!(s.link_by_url(&tab(20, "https://a.com")));
+        assert_eq!(s.session(other).unwrap().entries[0].tab_id, Some(20));
+        assert!(s.active().entries.is_empty());
+        // already linked / no saved entry
+        assert!(!s.link_by_url(&tab(20, "https://a.com")));
+        assert!(!s.link_by_url(&tab(21, "https://a.com")));
     }
 
     #[test]

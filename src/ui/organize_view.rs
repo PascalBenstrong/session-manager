@@ -189,6 +189,18 @@ impl OrganizeView {
                     )
                     .on_hover_text("If the page is saved but unloaded, the new tab simply becomes that saved tab.")
                     .changed();
+                ui.add_space(2.0);
+                ui.label(RichText::new("Automatically remove duplicates (closing the extra tabs):").color(p.muted));
+                changed |= ui
+                    .checkbox(&mut settings.dedupe_on_startup, "When the browser restarts and restores its tabs")
+                    .on_hover_text(
+                        "Restored tabs are matched to their saved tabs; a few seconds after the browser stops                          restoring tabs, duplicates are removed in every session.",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut settings.dedupe_on_session_load, "When a session's tabs are reopened")
+                    .on_hover_text("Before a session is loaded, its duplicates are removed so only one copy of each page opens.")
+                    .changed();
                 let opts = settings.dedupe;
                 if changed {
                     acts.send(Command::UpdateSettings { settings });

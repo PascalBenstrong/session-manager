@@ -53,6 +53,18 @@ export function installPlatform(api, overrides = {}) {
       return (await api.tabs.query({})).map(tabOut);
     },
 
+    /** A tab by id, or (id == null) the active tab of the last focused window. */
+    async getTab(id) {
+      if (id != null) return tabOut(await api.tabs.get(id));
+      const [tab] = await api.tabs.query({ active: true, lastFocusedWindow: true });
+      if (!tab) throw new Error('no active tab');
+      return tabOut(tab);
+    },
+
+    async reloadTab(id) {
+      await api.tabs.reload(id, { bypassCache: true });
+    },
+
     async createTab(o) {
       const props = { url: o.url, active: !!o.active, pinned: !!o.pinned };
       if (o.windowId != null) props.windowId = o.windowId;
@@ -257,6 +269,7 @@ export function installPlatform(api, overrides = {}) {
           .catch(() => {});
       });
       const TRACKED = ['url', 'title', 'favIconUrl', 'pinned', 'discarded'];
+      api.runtime.onStartup?.addListener(() => fire({ type: 'browserStartup' }));
       api.tabs.onCreated.addListener((tab) => fire({ type: 'tabCreated', tab: tabOut(tab) }));
       api.tabs.onUpdated.addListener((_id, change, tab) => {
         if (!TRACKED.some((k) => k in change)) return;

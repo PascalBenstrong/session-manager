@@ -68,7 +68,8 @@ impl CleanupView {
                 self.target = TargetKind::Pattern;
                 self.pattern = p.clone();
             }
-            CleanupTarget::OpenTabs => self.target = TargetKind::OpenTabs,
+            // `Pages` is only used for one-off tab clean-ups, never saved as a rule.
+            CleanupTarget::OpenTabs | CleanupTarget::Pages(_) => self.target = TargetKind::OpenTabs,
             CleanupTarget::AllDomains => self.target = TargetKind::AllDomains,
         }
         self.types = r.spec.data_types;

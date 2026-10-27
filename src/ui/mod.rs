@@ -604,6 +604,11 @@ impl App {
                 if self.popup && icon_button(ui, "⛶", "Open the full manager in a tab").clicked() {
                     open_manager("");
                 }
+                if self.popup {
+                    let mut acts = Actions::default();
+                    self.mini.clean_menu(ui, &mut acts);
+                    self.apply(acts);
+                }
                 self.theme_button(ui);
                 self.session_menu(ui, state, session);
                 self.session_actions(ui, state, session, false);

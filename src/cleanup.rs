@@ -62,6 +62,8 @@ pub enum CleanupTarget {
     Pattern(SitePattern),
     /// Every site that currently has an open tab.
     OpenTabs,
+    /// The sites of these pages (e.g. a single tab), matched like open tabs.
+    Pages(Vec<String>),
     /// Every site.
     #[default]
     AllDomains,
@@ -72,6 +74,7 @@ impl CleanupTarget {
         match self {
             CleanupTarget::Pattern(p) => p.describe(),
             CleanupTarget::OpenTabs => "all open tabs".into(),
+            CleanupTarget::Pages(urls) => hosts_of(urls).into_iter().collect::<Vec<_>>().join(", "),
             CleanupTarget::AllDomains => "all domains".into(),
         }
     }
@@ -189,9 +192,14 @@ impl SpecMatcher {
     pub fn new(spec: &CleanupSpec, open_tab_urls: &[String]) -> Result<Self, String> {
         let target = match &spec.target {
             CleanupTarget::Pattern(p) => Target::Pattern(p.compile()?),
-            CleanupTarget::OpenTabs => Target::Hosts(
-                open_tab_urls.iter().map(|u| url::host(u)).filter(|h| !h.is_empty()).collect(),
-            ),
+            CleanupTarget::OpenTabs => Target::Hosts(hosts_of(open_tab_urls)),
+            CleanupTarget::Pages(urls) => {
+                let hosts = hosts_of(urls);
+                if hosts.is_empty() {
+                    return Err("this page has no site data to clean".into());
+                }
+                Target::Hosts(hosts)
+            }
             CleanupTarget::AllDomains => Target::All,
         };
         let exclude = spec.exclude.iter().map(|p| p.compile()).collect::<Result<Vec<_>, _>>()?;
@@ -216,6 +224,10 @@ impl SpecMatcher {
     fn is_unfiltered(&self) -> bool {
         matches!(self.target, Target::All) && self.exclude.is_empty()
     }
+}
+
+fn hosts_of(urls: &[String]) -> BTreeSet<String> {
+    urls.iter().map(|u| url::host(u)).filter(|h| !h.is_empty()).collect()
 }
 
 /// Builds a cleanup plan.
@@ -315,6 +327,19 @@ mod tests {
         // Parent-domain cookie applies to the open tab too.
         assert_eq!(p.cookies.len(), 2);
         assert_eq!(p.site_data_hosts.unwrap(), vec!["www.example.com".to_string()]);
+    }
+
+    #[test]
+    fn pages_target() {
+        let spec = CleanupSpec { target: CleanupTarget::Pages(vec!["https://www.example.com/login".into()]), ..Default::default() };
+        assert_eq!(spec.target.describe(), "www.example.com");
+        // Open tabs elsewhere don't widen the target.
+        let p = plan(&spec, &cookies(), &["https://other.org/".into()], &[]).unwrap();
+        assert_eq!(p.cookies.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(p.site_data_hosts.unwrap(), vec!["www.example.com".to_string()]);
+
+        let internal = CleanupSpec { target: CleanupTarget::Pages(vec!["about:blank".into()]), ..Default::default() };
+        assert!(plan(&internal, &cookies(), &[], &[]).is_err());
     }
 
     #[test]

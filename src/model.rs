@@ -153,6 +153,11 @@ pub struct Settings {
     /// A newly opened tab whose page is already in the active session is merged into it:
     /// switch to the existing open tab (closing the new one), or link to the unloaded entry.
     pub prevent_duplicates: bool,
+    /// After the browser starts and restores its tabs, remove duplicate tabs in every
+    /// session (closing extra copies).
+    pub dedupe_on_startup: bool,
+    /// Before loading a session's tabs, remove its duplicates so only one copy is opened.
+    pub dedupe_on_session_load: bool,
 }
 
 impl Default for Settings {
@@ -167,6 +172,8 @@ impl Default for Settings {
             max_auto_snapshots: 20,
             dedupe: DedupeOptions::default(),
             prevent_duplicates: false,
+            dedupe_on_startup: false,
+            dedupe_on_session_load: false,
         }
     }
 }

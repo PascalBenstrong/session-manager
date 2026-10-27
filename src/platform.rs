@@ -16,6 +16,10 @@ extern "C" {
     fn js_info() -> JsValue;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = queryTabs)]
     fn js_query_tabs() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getTab)]
+    fn js_get_tab(id: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = reloadTab)]
+    fn js_reload_tab(id: f64) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = createTab)]
     fn js_create_tab(opts: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = createWindow)]
@@ -108,6 +112,16 @@ pub async fn sleep(ms: u32) {
 
 pub async fn query_tabs() -> Result<Vec<BrowserTab>> {
     call_as(js_query_tabs()).await
+}
+
+/// A tab by id, or the active tab of the focused window when `id` is `None`.
+pub async fn get_tab(id: Option<TabId>) -> Result<BrowserTab> {
+    let id = id.map_or(JsValue::NULL, |id| JsValue::from_f64(id as f64));
+    call_as(js_get_tab(id)).await
+}
+
+pub async fn reload_tab(id: TabId) -> Result<()> {
+    call(js_reload_tab(id as f64)).await.map(drop)
 }
 
 #[derive(Serialize, Default)]

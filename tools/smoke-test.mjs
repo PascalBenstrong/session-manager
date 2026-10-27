@@ -11,7 +11,7 @@ import { createMockBrowser } from './mock-browser.js';
 const browserName = process.argv[2] || 'firefox';
 const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', browserName);
 
-const { api, tabs, cookies, storage, alarms, removedSiteData, ev, clone } = createMockBrowser();
+const { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, ev, clone } = createMockBrowser();
 globalThis.browser = api;
 globalThis.chrome = api;
 
@@ -326,6 +326,77 @@ await step('prevent duplicates: switch to the open copy, adopt the unloaded one'
   assert.equal(tabs.size, before + 2, 'both copies opened when loading a session');
   api.tabs.update = origUpdate;
   await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, prevent_duplicates: false } });
+});
+
+await step('clear cookies & site data of the current tab / a given tab', async () => {
+  for (const t of tabs.values()) t.active = false;
+  const cur = await api.tabs.create({ url: 'https://www.shop.example/cart', active: true });
+  const other = await api.tabs.create({ url: 'https://news.example/' });
+  cookies.push(
+    { name: 'sid', domain: '.shop.example', path: '/', secure: true },
+    { name: 'pref', domain: 'www.shop.example', path: '/', secure: true },
+    { name: 'n', domain: 'news.example', path: '/', secure: true },
+  );
+  const r = await send({ cmd: 'ClearTabData', tab: null, data_types: { cookies: true, cache: true, localStorage: true, indexedDb: true, serviceWorkers: true }, reload: true });
+  assert.equal(r.report.cookies_removed, 2);
+  assert.deepEqual(r.report.hosts, ['www.shop.example']);
+  assert.ok(cookies.some((c) => c.name === 'n'), 'other sites untouched');
+  assert.deepEqual(reloaded, [cur.id]);
+  assert.equal(stored().cleanup_log[0].label, 'Tab: www.shop.example');
+
+  // a specific tab, cookies only, no reload
+  const before = removedSiteData.length;
+  const r2 = await send({ cmd: 'ClearTabData', tab: other.id, data_types: { cookies: true, cache: false, localStorage: false, indexedDb: false, serviceWorkers: false }, reload: false });
+  assert.equal(r2.report.cookies_removed, 1);
+  assert.equal(removedSiteData.length, before, 'no site data removal for cookies only');
+  assert.deepEqual(reloaded, [cur.id]);
+
+  const internal = await api.tabs.create({ url: 'about:blank' });
+  const bad = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'ClearTabData', tab: internal.id, data_types: {}, reload: false })));
+  assert.ok(!bad.ok && /no site data/.test(bad.error));
+  await api.tabs.remove([cur.id, other.id, internal.id]);
+});
+
+await step('auto-remove duplicates when a session is reopened', async () => {
+  await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, dedupe_on_session_load: true } });
+  await send({ cmd: 'ImportSessions', sessions: [{ name: 'Twice3', entries: [{ url: 'https://twice3.example/a' }, { url: 'https://twice3.example/a#2' }, { url: 'https://twice3.example/b' }] }] });
+  const t3 = stored().sessions.find((s) => s.name === 'Twice3');
+  const before = tabs.size;
+  const r = await send({ cmd: 'LoadSession', id: t3.id, discarded: true, new_window: false });
+  await tick();
+  assert.match(r.info, /Opened 2 tab\(s\) unloaded; removed 1 duplicate/);
+  assert.equal(tabs.size, before + 2, 'only one copy opened');
+  assert.equal(stored().sessions.find((s) => s.id === t3.id).entries.length, 2);
+  await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, dedupe_on_session_load: false } });
+});
+
+await step('auto-remove duplicates after the browser restarts and restores tabs', async () => {
+  // Saved, unloaded tabs in an inactive session (its window was closed on quit).
+  await send({ cmd: 'ImportSessions', sessions: [{ name: 'Restored', entries: [{ url: 'https://restore.example/a' }, { url: 'https://restore.example/b' }] }] });
+  const sid = stored().sessions.find((s) => s.name === 'Restored').id;
+  const active = stored().active_session;
+  await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, dedupe_on_startup: true } });
+  ev.startup.fire();
+  await tick();
+  // The browser restores the tabs after startup; one page twice.
+  const a = await api.tabs.create({ url: 'https://restore.example/a' });
+  const b = await api.tabs.create({ url: 'https://restore.example/b' });
+  const a2 = await api.tabs.create({ url: 'https://restore.example/a' });
+  await tick();
+  const entries = () => stored().sessions.find((s) => s.id === sid).entries;
+  assert.equal(entries().length, 2, 'restored tabs linked to their saved entries');
+  assert.deepEqual(entries().map((e) => e.tab_id), [a.id, b.id]);
+  await new Promise((r) => setTimeout(r, 3300));
+  assert.ok(tabs.has(a.id) && tabs.has(b.id));
+  assert.ok(!tabs.has(a2.id), 'extra restored copy closed');
+  const all = stored().sessions.flatMap((s) => s.entries);
+  assert.ok(!all.some((e) => e.tab_id === a2.id), 'and its entry removed');
+  assert.equal(all.filter((e) => e.url === 'https://twice.example/a').length, 1, 'older duplicates in a session removed too');
+  // The startup window is over: new tabs are tracked normally again.
+  const late = await api.tabs.create({ url: 'https://restore.example/b' });
+  await tick();
+  assert.ok(stored().sessions.find((s) => s.id === active).entries.some((e) => e.tab_id === late.id));
+  await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, dedupe_on_startup: false } });
 });
 
 await step('install/update sets the NEW badge; viewing release notes clears it', async () => {

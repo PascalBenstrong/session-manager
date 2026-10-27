@@ -11,17 +11,24 @@ export function createMockBrowser() {
   const storage = {};
   const alarms = new Map();
   const removedSiteData = [];
+  const reloaded = [];
   const ev = {
     created: listeners(), updated: listeners(), removed: listeners(), activated: listeners(),
     cookie: listeners(), alarm: listeners(), message: listeners(), storage: listeners(), installed: listeners(),
+    startup: listeners(),
   };
   const clone = (o) => JSON.parse(JSON.stringify(o));
 
   const api = {
     tabs: {
       async query(q) {
-        return [...tabs.values()].filter((t) => !q.url || t.url === q.url).map(clone);
+        return [...tabs.values()].filter((t) => (!q.url || t.url === q.url) && (!q.active || t.active)).map(clone);
       },
+      async get(id) {
+        if (!tabs.has(id)) throw new Error(`No tab with id: ${id}`);
+        return clone(tabs.get(id));
+      },
+      async reload(id) { reloaded.push(id); },
       async create(p) {
         const t = { id: nextTabId++, windowId: p.windowId ?? 1, index: tabs.size, url: p.url, title: p.title || '',
           pinned: !!p.pinned, active: !!p.active, discarded: !!p.discarded };
@@ -89,6 +96,7 @@ export function createMockBrowser() {
       },
       onMessage: ev.message,
       onInstalled: ev.installed,
+      onStartup: ev.startup,
     },
     action: {
       badge: '',
@@ -96,5 +104,5 @@ export function createMockBrowser() {
       async setBadgeBackgroundColor() {},
     },
   };
-  return { api, tabs, cookies, storage, alarms, removedSiteData, ev, clone };
+  return { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, ev, clone };
 }
