@@ -16,6 +16,7 @@ pub mod protocol;
 pub mod release_notes;
 pub mod search;
 pub mod state;
+pub mod tab_strip;
 pub mod transfer;
 pub mod url;
 pub mod workspace;
@@ -41,10 +42,11 @@ mod wasm {
         crate::background::start().await
     }
 
-    /// Entry point for UI pages. `popup` selects the compact layout.
+    /// Entry point for UI pages. `mode`: "popup" (toolbar quick switcher), "sidebar"
+    /// (browser sidebar / side panel) or "manager" (full page).
     #[wasm_bindgen]
-    pub async fn start_ui(canvas_id: String, popup: bool) -> Result<(), JsValue> {
+    pub async fn start_ui(canvas_id: String, mode: String) -> Result<(), JsValue> {
         console_error_panic_hook::set_once();
-        crate::ui::start(&canvas_id, popup).await
+        crate::ui::start(&canvas_id, &mode).await
     }
 }

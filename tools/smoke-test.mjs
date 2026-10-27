@@ -11,7 +11,8 @@ import { createMockBrowser } from './mock-browser.js';
 const browserName = process.argv[2] || 'firefox';
 const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', browserName);
 
-const { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, ev, clone } = createMockBrowser();
+const { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, titlePrefaces, ev, clone } =
+  createMockBrowser();
 globalThis.browser = api;
 globalThis.chrome = api;
 
@@ -504,6 +505,92 @@ await step('media limit: background video is paused, resumed when its tab is act
   await tick();
   assert.deepEqual(tabMessages, []);
 });
+
+const settle = () => new Promise((r) => setTimeout(r, 800)); // the tab strip sync is debounced
+const entryOf = (tabId) => stored().sessions.flatMap((s) => s.entries).find((e) => e.tab_id === tabId);
+const browserUi = async (changes) => {
+  const st = stored();
+  await send({ cmd: 'UpdateSettings', settings: { ...st.settings, browser_ui: { ...st.settings.browser_ui, ...changes } } });
+};
+
+await step('workspaces as native tab groups, both ways', async () => {
+  const rules = stored().workspaces.find((w) => w.name === 'Rules');
+  await browserUi({ tab_groups: true, collapse_inactive: true });
+  const wsTab = await api.tabs.create({ url: 'https://more.rules.example/x' });
+  await settle();
+  const group = () => [...groups.values()].find((g) => g.title === '💻 Rules');
+  assert.ok(group(), 'the workspace has a native group');
+  assert.equal(group().color, 'green');
+  const members = stored().sessions.flatMap((s) => s.entries).filter((e) => e.workspace === rules.id && e.tab_id);
+  assert.ok(members.length >= 2 && members.every((e) => tabs.get(e.tab_id).groupId === group().id), 'all its tabs are in it');
+  assert.ok(group().collapsed, 'collapsed: the active tab is in another workspace');
+  // A tab the user drags into the group joins the workspace...
+  const plain = await api.tabs.create({ url: 'https://plain2.example/' });
+  await settle();
+  assert.equal(entryOf(plain.id).workspace, null);
+  await api.tabs.group({ tabIds: [plain.id], groupId: group().id });
+  await settle();
+  assert.equal(entryOf(plain.id).workspace, rules.id);
+  assert.ok(entryOf(plain.id).workspace_manual);
+  // ...and leaves it when dragged out (and stays out).
+  await api.tabs.ungroup([plain.id]);
+  await settle();
+  assert.equal(entryOf(plain.id).workspace, null);
+  assert.equal(tabs.get(plain.id).groupId, -1);
+  // Activating a tab of the workspace makes it current and expands its group.
+  for (const t of tabs.values()) t.active = false;
+  tabs.get(wsTab.id).active = true;
+  ev.activated.fire({ tabId: wsTab.id, windowId: 1 });
+  await settle();
+  assert.equal(stored().active_workspace, rules.id);
+  assert.ok(!group().collapsed);
+  await browserUi({ tab_groups: false });
+});
+
+await step('new tab in a workspace joins it once it shows a page', async () => {
+  const rules = stored().workspaces.find((w) => w.name === 'Rules');
+  const before = new Set(tabs.keys());
+  await send({ cmd: 'NewTabInWorkspace', workspace: rules.id });
+  const t = [...tabs.values()].find((x) => !before.has(x.id));
+  assert.ok(t.active && !t.url, 'a new tab page');
+  t.url = 'https://unrelated.example/';
+  ev.updated.fire(t.id, { url: t.url }, clone(t));
+  await tick();
+  assert.equal(entryOf(t.id).workspace, rules.id);
+});
+
+if (browserName === 'firefox') {
+  await step('hide other workspaces (Firefox): permission, switching, window title', async () => {
+    const rules = stored().workspaces.find((w) => w.name === 'Rules');
+    const r = await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Home', icon: '🏠', rules: [{ Site: { kind: 'Domain', value: 'home.example' } }] } });
+    const home = r.state.workspaces.find((w) => w.name === 'Home');
+    const homeTab = await api.tabs.create({ url: 'https://home.example/1' });
+    const loose = await api.tabs.create({ url: 'https://loose.example/' });
+    const rulesTab = [...tabs.values()].find((t) => entryOf(t.id)?.workspace === rules.id);
+    await browserUi({ hide_inactive: true, show_in_title: true });
+    await send({ cmd: 'SetActiveWorkspace', id: rules.id });
+    await settle();
+    assert.ok(!tabs.get(homeTab.id).hidden, 'nothing is hidden without the tabHide permission');
+    assert.equal(titlePrefaces[1], '💻 Rules — ');
+    await api.permissions.request({ permissions: ['tabHide'] });
+    await settle();
+    assert.ok(tabs.get(homeTab.id).hidden, "the other workspace's tabs are hidden");
+    assert.ok(!tabs.get(rulesTab.id).hidden && !tabs.get(loose.id).hidden, 'its own tabs and tabs without a workspace show');
+    // Switching shows the other workspace, goes to its tab and hides the rest.
+    await send({ cmd: 'SetActiveWorkspace', id: home.id });
+    await settle();
+    assert.ok(!tabs.get(homeTab.id).hidden && tabs.get(homeTab.id).active);
+    assert.ok(tabs.get(rulesTab.id).hidden);
+    assert.equal(titlePrefaces[1], '🏠 Home — ');
+    // "All" shows everything; turning hiding off too.
+    await send({ cmd: 'SetActiveWorkspace', id: rules.id });
+    await settle();
+    await browserUi({ hide_inactive: false, show_in_title: false });
+    await settle();
+    assert.ok([...tabs.values()].every((t) => !t.hidden), 'every tab shows again');
+    assert.equal(titlePrefaces[1], '');
+  });
+}
 
 await step('install/update sets the NEW badge; viewing release notes clears it', async () => {
   ev.installed.fire({ reason: 'update', previousVersion: '0.1.0' });

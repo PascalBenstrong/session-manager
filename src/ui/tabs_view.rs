@@ -7,7 +7,8 @@ use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Margin, RichText, S
 
 use super::theme::{self, RADIUS};
 use super::widgets::{
-    ChipKind, avatar_sized, badge, chip, color_swatch, danger_button, empty_state, icon_button, icon_button_colored,
+    ChipKind, DraggedTab, avatar_sized, badge, chip, color_swatch, danger_button, drag_ghost, empty_state, icon_button,
+    icon_button_colored,
     parse_list, pill, primary_button, status_dot, tab_state_color, text_input, workspace_chip, ws_color,
 };
 use super::{Actions, ViewCtx};
@@ -38,12 +39,6 @@ Example:  ws:work host:^docs -is:unloaded \"release notes\"";
 const ROW_HEIGHT: f32 = 48.0;
 const COMPACT_ROW_HEIGHT: f32 = 32.0;
 const HEADER_HEIGHT: f32 = 38.0;
-
-/// Drag-and-drop payload: a tab row dragged onto a workspace header.
-struct DraggedTab {
-    entry: EntryRef,
-    title: String,
-}
 
 /// Kind of a new workspace rule in the rule editor.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -315,7 +310,7 @@ impl TabsView {
         let p = theme::palette(ui);
         let cid = ui.make_persistent_id(("ws-collapsed", ws.map_or(NO_WORKSPACE, |w| w.id)));
         let mut collapsed = ui.data(|d| d.get_temp::<bool>(cid)).unwrap_or(false);
-        if self.workspace_header(ui, rc, ws, entries, collapsed, acts) {
+        if self.workspace_header(ui, cx, rc, ws, entries, collapsed, acts) {
             collapsed = !collapsed;
             ui.data_mut(|d| d.insert_temp(cid, collapsed));
         }
@@ -345,9 +340,11 @@ impl TabsView {
 
     /// Colored header of a workspace section. Clicking it opens the workspace settings;
     /// tabs can be dropped on it. Returns true if the section should collapse / expand.
+    #[allow(clippy::too_many_arguments)]
     fn workspace_header(
         &mut self,
         ui: &mut egui::Ui,
+        cx: &ViewCtx,
         rc: &RowCtx,
         ws: Option<&Workspace>,
         entries: &[&TabEntry],
@@ -399,6 +396,11 @@ impl TabsView {
             }
             row.label(RichText::new(meta).small().color(p.muted));
 
+            let current = ws.is_some_and(|w| cx.state.active_workspace == Some(w.id));
+            if current {
+                row.label(RichText::new("● current").small().color(color))
+                    .on_hover_text("The workspace you're in: new tabs can join it, and the browser shows it");
+            }
             row.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(w) = ws {
                     let tip = if settings_open { "Close the workspace settings" } else { "Workspace settings" };
@@ -414,6 +416,13 @@ impl TabsView {
                 }
                 let loaded: Vec<EntryRef> =
                     entries.iter().filter(|e| e.is_open() && !e.discarded).map(|e| rc.entry_ref(e)).collect();
+                if let Some(w) = ws
+                    && hovered
+                    && !current
+                    && icon_button(ui, "⇄", &format!("Switch to {}", w.name)).clicked()
+                {
+                    acts.send(Command::SetActiveWorkspace { id: Some(w.id) });
+                }
                 if hovered
                     && !loaded.is_empty()
                     && icon_button(ui, "💤", &format!("Hibernate the {} loaded tab(s) listed here", loaded.len())).clicked()
@@ -529,6 +538,14 @@ impl TabsView {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
+                    if cx.state.active_workspace != Some(ws.id)
+                        && ui
+                            .add(primary_button(ui, "⇄ Switch to it"))
+                            .on_hover_text("Go to its most recently used tab; the browser shows this workspace")
+                            .clicked()
+                    {
+                        acts.send(Command::SetActiveWorkspace { id: Some(ws.id) });
+                    }
                     if ui.button("🔍 Search in this workspace").clicked() {
                         self.opts.workspaces = [ws.id].into();
                         self.show_filters = true;
@@ -1281,30 +1298,4 @@ fn no_tabs(ui: &mut egui::Ui, total: usize) {
     } else {
         empty_state(ui, "🔍", "No tabs match", "Try a different search or clear the filters.");
     }
-}
-
-/// The title of a dragged tab, following the pointer.
-fn drag_ghost(ui: &egui::Ui) {
-    let Some(d) = egui::DragAndDrop::payload::<DraggedTab>(ui.ctx()) else { return };
-    let Some(pos) = ui.ctx().pointer_interact_pos() else { return };
-    let p = theme::palette(ui);
-    let mut title: String = d.title.chars().take(48).collect();
-    if title.len() < d.title.len() {
-        title.push('…');
-    }
-    egui::Area::new(egui::Id::unique("drag-ghost"))
-        .fixed_pos(pos + egui::vec2(14.0, 10.0))
-        .order(egui::Order::Tooltip)
-        .interactable(false)
-        .show(ui.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(p.surface)
-                .stroke(Stroke::new(1.0, p.accent))
-                .corner_radius(8)
-                .shadow(ui.visuals().popup_shadow)
-                .inner_margin(Margin::symmetric(10, 5))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(format!("⠿ {title}")).color(p.text));
-                });
-        });
 }

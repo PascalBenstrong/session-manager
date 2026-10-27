@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.3.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.4.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -28,6 +28,13 @@ Version: 0.3.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Rules add tabs to a workspace automatically when they are opened or change (page, group or tags): when the URL matches a site pattern, when the tab is added to a group (the extension's groups or the browser's native tab groups), when it has a tag, or when it matches a search. The first workspace (in display order) with a matching rule wins. Rules never take a tab out of a workspace, and leave tabs the user placed by hand alone (until the user lets the rules decide again).
 - Allow searching in one or more workspaces, or across all workspaces.
 - Deleting a workspace keeps its tabs, without a workspace.
+
+## Workspaces in the browser
+- Optionally mirror workspaces as native tab groups (title = icon and name, the workspace's color), in every window. Moving a tab into a workspace's group (in the same window) puts it in that workspace; moving it out takes it out. Tabs without a workspace keep their own groups. Optionally collapse the groups of workspaces other than the active tab's.
+- One workspace is current: the workspace of the tab last used, or the one switched to. Switching goes to the workspace's most recently used tab. New tabs can join the current workspace.
+- A browser sidebar (Firefox) / side panel (Chrome) lists the window's tabs by workspace, with a workspace switcher, new tabs per workspace, drag and drop between workspaces, and optionally the active session's saved tabs.
+- Firefox: optionally hide the tabs of other workspaces than the current one (tabs without a workspace and pinned tabs always show), using the optional `tabHide` permission, which is requested when the option is turned on. Optionally show the current workspace in the window title.
+- Firefox: a guide in Settings explains how to hide Firefox's horizontal tab bar with `userChrome.css`: the `about:config` preference to change (`toolkit.legacyUserProfileCustomizations.stylesheets` = `true`), where the file goes, and the stylesheet (copy or download). It opens the pages it mentions where Firefox allows that, and copies their address otherwise.
 
 ## Hibernating tabs
 - Allow hibernating (unloading) tabs: all browser tabs, a session's, a workspace's, the tabs matching a search, tabs not used for a while, or a single tab. Hibernated tabs stay open and reload when selected.
@@ -101,5 +108,8 @@ Version: 0.3.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - "Clean up whenever a new value is set" applies to cookies only. Other storage has no change events extensions can observe.
 - File pickers close extension popups, so saving and importing happen in the manager page.
 - Grouping by domain uses a heuristic registrable domain (common `co.uk`-style suffixes), not the full Public Suffix List.
+- Extensions can't restyle or replace the browser's tab bar; workspaces appear there as native tab groups (or, in Firefox, by hiding tabs). Hiding Firefox's own tab bar takes a `userChrome.css` that the user installs.
+- Firefox doesn't let extensions open `about:config` or `about:support`, or change preferences and files in the profile.
+- Chrome cannot hide tabs. Tab groups need Chrome / Edge, or Firefox 139+.
 - The media limit relies on a content script, which only runs in pages loaded after the extension was installed or updated, and not in browser-internal pages.
 - Browsers refuse to hibernate the active tab. Chromium may give a hibernated tab a new id; the extension follows the change.

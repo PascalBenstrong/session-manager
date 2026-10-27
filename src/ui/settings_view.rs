@@ -6,7 +6,9 @@ use super::theme;
 use super::widgets::section_card;
 use super::{Actions, ViewCtx};
 use crate::media::MediaPolicy;
+use crate::platform as pf;
 use crate::protocol::Command;
+use crate::tab_strip::{FIREFOX_EXTENSION_ID, USER_CHROME_PREF, sidebar_command_id, user_chrome_css};
 
 pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
     let p = theme::palette(ui);
@@ -35,6 +37,97 @@ pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
                 "Tabs of a closed window, or of a browser that quits, stay in the session as unloaded. \
                  Closing a single tab always removes it.",
             );
+        });
+
+        section_card(ui, "Workspaces in the browser", "Show your workspaces in the browser's own tab bar, sidebar and window title.", |ui| {
+            let caps = cx.caps;
+            let b = &mut s.browser_ui;
+            ui.add_enabled_ui(caps.tab_groups, |ui| {
+                changed |= setting(
+                    ui,
+                    &mut b.tab_groups,
+                    "Show workspaces as tab groups",
+                    "Each workspace's tabs sit in a native tab group with its icon, name and color. Dragging a tab into \
+                     or out of a group moves it between workspaces.",
+                );
+            });
+            if !caps.tab_groups {
+                note(ui, "This browser doesn't let extensions make tab groups (Chrome, Edge and Firefox 139+ do).");
+            }
+            ui.add_enabled_ui(caps.tab_groups && b.tab_groups, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        changed |= setting(
+                            ui,
+                            &mut b.collapse_inactive,
+                            "Collapse the other workspaces",
+                            "Only the group of the workspace you're in stays open.",
+                        );
+                    });
+                });
+            });
+
+            if caps.hide_tabs {
+                let hover = ui
+                    .scope(|ui| {
+                        changed |= setting(
+                            ui,
+                            &mut b.hide_inactive,
+                            "Hide the tabs of other workspaces",
+                            "Only the current workspace's tabs (and tabs without a workspace) are in the tab bar. Switch \
+                             workspaces from the sidebar or a workspace's settings.",
+                        );
+                    })
+                    .response
+                    .contains_pointer();
+                // Firefox asks for the "Hide and show browser tabs" permission (only on a click).
+                if hover && !caps.hide_tabs_allowed {
+                    acts.arm("tabHide");
+                }
+                if b.hide_inactive && !caps.hide_tabs_allowed {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("⚠ Firefox needs your permission to hide tabs.").color(p.warn));
+                        let r = ui.button("Allow hiding tabs");
+                        if r.contains_pointer() {
+                            acts.arm("tabHide");
+                        }
+                    });
+                }
+                changed |= setting(
+                    ui,
+                    &mut b.show_in_title,
+                    "Show the current workspace in the window title",
+                    "E.g. \"💼 Work — Page title\".",
+                );
+            } else {
+                note(ui, "Hiding other workspaces' tabs needs Firefox. Here, collapse the other workspaces' groups instead.");
+            }
+            changed |= setting(
+                ui,
+                &mut b.new_tabs_join_active,
+                "New tabs join the current workspace",
+                "Tabs that no workspace rule places go to the workspace you're in.",
+            );
+
+            if caps.sidebar {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    let r = ui.button("◨ Open the workspace sidebar");
+                    if r.contains_pointer() {
+                        acts.arm("sidebar");
+                    }
+                    let how = if caps.browser == "firefox" {
+                        "Shortcut: Alt+Shift+W, or View → Sidebar → Session Manager."
+                    } else {
+                        "Shortcut: Alt+Shift+W, or pick Session Manager in the side panel menu."
+                    };
+                    ui.label(RichText::new(how).small().color(p.muted));
+                });
+            }
+            if caps.browser == "firefox" {
+                user_chrome_guide(ui, cx, acts);
+            }
         });
 
         section_card(
@@ -138,6 +231,117 @@ fn setting(ui: &mut egui::Ui, value: &mut bool, title: &str, description: &str) 
     });
     ui.add_space(6.0);
     changed
+}
+
+fn note(ui: &mut egui::Ui, text: &str) {
+    let p = theme::palette(ui);
+    ui.label(RichText::new(text).small().color(p.muted));
+    ui.add_space(4.0);
+}
+
+/// Steps to hide Firefox's horizontal tab bar with `userChrome.css`, so the sidebar is the
+/// tab bar. Extensions can't change this themselves (nor open `about:config`), so it says
+/// exactly what to change and copies what can be copied.
+fn user_chrome_guide(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
+    let p = theme::palette(ui);
+    let id = if cx.caps.extension_id.is_empty() { FIREFOX_EXTENSION_ID } else { &cx.caps.extension_id };
+    let css = user_chrome_css(&sidebar_command_id(id));
+    ui.separator();
+    egui::CollapsingHeader::new(RichText::new("Hide Firefox's tab bar (userChrome.css)").strong())
+        .id_salt("user-chrome")
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "With the sidebar as your tab bar, Firefox's own tab bar can go. Firefox only allows that with a \
+                     userChrome.css file in your profile, which extensions can't write for you. It takes four steps:",
+                )
+                .color(p.muted),
+            );
+            ui.add_space(6.0);
+
+            step(ui, "1", "Allow userChrome.css");
+            ui.label("Open about:config, accept the warning, search for this preference and set it to true:");
+            ui.horizontal_wrapped(|ui| {
+                code(ui, USER_CHROME_PREF);
+                ui.label(RichText::new("→").color(p.muted));
+                code(ui, "true");
+                if ui.button("Copy name").clicked() {
+                    ui.ctx().copy_text(USER_CHROME_PREF.to_string());
+                    acts.notice("Preference name copied");
+                }
+                if ui.button("Open about:config").on_hover_text("If Firefox refuses, the address is copied instead").clicked() {
+                    acts.open_page("about:config");
+                }
+            });
+            ui.add_space(6.0);
+
+            step(ui, "2", "Open your profile folder");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Open about:support and, next to");
+                code(ui, "Profile Folder");
+                ui.label("click");
+                code(ui, "Open Folder");
+                ui.label(". Create a folder named");
+                code(ui, "chrome");
+                ui.label("in it, if there is none.");
+            });
+            if ui.button("Open about:support").clicked() {
+                acts.open_page("about:support");
+            }
+            ui.add_space(6.0);
+
+            step(ui, "3", "Add the stylesheet");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Save this as");
+                code(ui, "chrome/userChrome.css");
+                ui.label("(or add it to the end of the file you have):");
+            });
+            egui::Frame::new()
+                .fill(p.input)
+                .stroke(egui::Stroke::new(1.0, p.border))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(RichText::new(&css).monospace()).selectable(true));
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Copy CSS").clicked() {
+                    ui.ctx().copy_text(css.clone());
+                    acts.notice("userChrome.css copied");
+                }
+                if ui.button("Download userChrome.css").on_hover_text("Saved to your downloads; move it into the chrome folder").clicked() {
+                    match pf::download_text("userChrome.css", &css, "text/css") {
+                        Ok(()) => acts.notice("Downloaded userChrome.css: move it into your profile's chrome folder"),
+                        Err(e) => acts.notice(format!("Could not download: {e}")),
+                    }
+                }
+            });
+            ui.add_space(6.0);
+
+            step(ui, "4", "Restart Firefox");
+            ui.label(
+                RichText::new(
+                    "To bring the tab bar back, delete those lines (or set the preference back to false) and restart. \
+                     If the window buttons disappear with the tab bar, turn on Title Bar in Customize Toolbar….",
+                )
+                .small()
+                .color(p.muted),
+            );
+        });
+}
+
+fn step(ui: &mut egui::Ui, n: &str, title: &str) {
+    let p = theme::palette(ui);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(n).strong().color(p.accent_hover));
+        ui.label(RichText::new(title).strong());
+    });
+}
+
+fn code(ui: &mut egui::Ui, text: &str) {
+    let p = theme::palette(ui);
+    ui.add(egui::Label::new(RichText::new(text).monospace().background_color(p.surface_hover)).selectable(true));
 }
 
 fn yes_no(b: bool) -> &'static str {

@@ -17,6 +17,8 @@ export function tabOut(t) {
     audible: !!t.audible,
     lastAccessed: t.lastAccessed || 0,
     groupTitle: null,
+    groupId: t.groupId != null && t.groupId >= 0 ? t.groupId : null,
+    hidden: !!t.hidden,
   };
 }
 
@@ -48,6 +50,10 @@ export function installPlatform(api, overrides = {}) {
   // service worker woken up by an event doesn't lose it.
   const queue = [];
   let handler = null;
+  // UI pages: the action to run on the next pointer release (see setGestureAction), and
+  // this page's window (for opening the side panel without waiting).
+  let gesture = '';
+  let pageWindowId = null;
 
   function emit(ev) {
     if (handler) return Promise.resolve(handler(ev));
@@ -70,7 +76,13 @@ export function installPlatform(api, overrides = {}) {
 
   const platform = {
     info() {
-      return { browser: 'unknown', tabGroups: !!(api.tabs.group && api.tabGroups), perHostCache: false };
+      return {
+        browser: 'unknown',
+        tabGroups: !!(api.tabs.group && api.tabGroups),
+        perHostCache: false,
+        sidebar: !!(api.sidePanel || api.sidebarAction),
+        extensionId: api.runtime.id || '',
+      };
     },
 
     // ---- tabs ----
@@ -92,7 +104,8 @@ export function installPlatform(api, overrides = {}) {
     },
 
     async createTab(o) {
-      const props = { url: o.url, active: !!o.active, pinned: !!o.pinned };
+      const props = { active: !!o.active, pinned: !!o.pinned };
+      if (o.url) props.url = o.url; // none: the new tab page
       if (o.windowId != null) props.windowId = o.windowId;
       let tab = await api.tabs.create(props);
       if (o.discarded && !o.active && !o.pinned) {
@@ -116,6 +129,10 @@ export function installPlatform(api, overrides = {}) {
       if (ids.length) await api.tabs.remove(ids);
     },
 
+    async activateTab(id) {
+      await api.tabs.update(id, { active: true });
+    },
+
     async focusTab(id) {
       const t = await api.tabs.update(id, { active: true });
       await api.windows.update(t.windowId, { focused: true });
@@ -134,6 +151,86 @@ export function installPlatform(api, overrides = {}) {
 
     async ungroupTabs(ids) {
       if (api.tabs.ungroup && ids.length) await api.tabs.ungroup(ids);
+    },
+
+    // ---- native tab groups (workspaces in the tab strip) ----
+    async queryTabGroups() {
+      if (!api.tabGroups) return [];
+      return (await api.tabGroups.query({})).map((g) => ({
+        id: g.id,
+        windowId: g.windowId,
+        title: g.title || '',
+        color: g.color || '',
+        collapsed: !!g.collapsed,
+      }));
+    },
+
+    /** Adds tabs to a group (groupId == null: a new group in windowId). Resolves to the group id. */
+    async groupInto(ids, groupId, windowId) {
+      const opts = groupId != null ? { tabIds: ids, groupId } : { tabIds: ids, createProperties: { windowId } };
+      return await api.tabs.group(opts);
+    },
+
+    /** props: { title, color, collapsed? } */
+    async updateTabGroup(id, props) {
+      await api.tabGroups.update(id, props);
+    },
+
+    // ---- hiding tabs (Firefox, with the optional tabHide permission) ----
+    async hideTabs(ids) {
+      if (api.tabs.hide && ids.length) await api.tabs.hide(ids);
+    },
+
+    async showTabs(ids) {
+      if (api.tabs.show && ids.length) await api.tabs.show(ids);
+    },
+
+    /** Text before the window title (Firefox only). */
+    async setTitlePreface(_windowId, _text) {},
+
+    async hasPermission(name) {
+      try {
+        return await api.permissions.contains({ permissions: [name] });
+      } catch {
+        return false;
+      }
+    },
+
+    async currentWindowId() {
+      return (await api.windows.getCurrent()).id;
+    },
+
+    /** Opens a page in a new tab (fails for pages extensions may not open, like about:config). */
+    async openUrl(url) {
+      await api.tabs.create({ url, active: true });
+    },
+
+    // ---- user gestures ----
+    // Some APIs only work while handling a user's click (Firefox: sidebarAction.open,
+    // permissions.request). egui handles clicks a frame later, so the UI arms an action
+    // while the pointer is over its button, and it runs when the pointer is released.
+
+    /** Arms `name` ('sidebar', 'tabHide') for the next pointer release; '' disarms. */
+    setGestureAction(name) {
+      gesture = name || '';
+    },
+
+    runGesture(name) {
+      try {
+        let p;
+        if (name === 'sidebar') p = platform.openSidebar();
+        else if (name === 'tabHide') p = api.permissions.request({ permissions: ['tabHide'] });
+        if (p && p.catch) p.catch((e) => console.warn('[session-manager]', name, e));
+      } catch (e) {
+        console.warn('[session-manager]', name, e);
+      }
+    },
+
+    /** Opens the sidebar / side panel. Must run inside a user gesture. */
+    openSidebar() {
+      if (api.sidebarAction) return api.sidebarAction.open();
+      if (api.sidePanel && pageWindowId != null) return api.sidePanel.open({ windowId: pageWindowId });
+      return undefined;
     },
 
     /** Unloads tabs. Resolves to { discarded: ids, errors: messages }. */
@@ -331,6 +428,15 @@ export function installPlatform(api, overrides = {}) {
         fireInOrder(() => ({ type: 'tabRemoved', tabId, windowClosing: !!(info && info.isWindowClosing) })),
       );
       api.tabs.onActivated.addListener((info) => fireInOrder(() => ({ type: 'tabActivated', tabId: info.tabId })));
+      // tabHide granted or revoked.
+      api.permissions?.onAdded?.addListener(() => fire({ type: 'permissionsChanged' }));
+      api.permissions?.onRemoved?.addListener(() => fire({ type: 'permissionsChanged' }));
+      // Chrome: the keyboard shortcut for the side panel (a command counts as a user gesture).
+      api.commands?.onCommand?.addListener((command, tab) => {
+        if (command === 'open-sidebar' && api.sidePanel && tab) {
+          api.sidePanel.open({ windowId: tab.windowId }).catch((e) => console.warn('[session-manager] side panel', e));
+        }
+      });
       if (api.tabs.onReplaced) {
         api.tabs.onReplaced.addListener((added, removed) => fireInOrder(() => ({ type: 'tabReplaced', added, removed })));
       }
@@ -373,5 +479,18 @@ export function installPlatform(api, overrides = {}) {
 
   Object.assign(platform, overrides);
   globalThis.smPlatform = platform;
+  if (globalThis.document && globalThis.addEventListener) {
+    addEventListener(
+      'pointerup',
+      () => {
+        if (gesture) platform.runGesture(gesture);
+      },
+      true,
+    );
+    api.windows?.getCurrent?.().then(
+      (w) => (pageWindowId = w.id),
+      () => {},
+    );
+  }
   return platform;
 }

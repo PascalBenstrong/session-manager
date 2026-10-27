@@ -2,6 +2,7 @@ import { createMockBrowser } from './mock-browser.js';
 
 const browserName = new URLSearchParams(location.search).get('browser') || 'firefox';
 const popup = new URLSearchParams(location.search).has('popup');
+const sidebar = new URLSearchParams(location.search).has('sidebar');
 document.body.dataset.popup = String(popup);
 
 const mock = createMockBrowser();
@@ -64,7 +65,7 @@ await mock.api.tabs.create({ url: 'https://example.org/new-after-snapshot', titl
 const clip = new URLSearchParams(location.search).get('clip');
 if (clip !== null) smPlatform.readClipboard = async () => clip;
 
-await glue.start_ui('sm-canvas', popup);
+await glue.start_ui('sm-canvas', popup ? 'popup' : sidebar ? 'sidebar' : 'manager');
 document.getElementById('sm-loading')?.remove();
 
 // ?click=x,y;x,y — synthetic clicks (for headless screenshots of other views).

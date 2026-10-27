@@ -1,6 +1,6 @@
 //! Persistent data model shared by the background logic and the UI.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +176,24 @@ pub struct Settings {
     pub media: MediaSettings,
     /// How the tab list looks.
     pub tab_list: TabListSettings,
+    /// How workspaces show up in the browser itself.
+    pub browser_ui: BrowserUiSettings,
+}
+
+/// Workspaces in the browser's own interface (tab strip, window title).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct BrowserUiSettings {
+    /// Mirror workspaces as native tab groups (title, color).
+    pub tab_groups: bool,
+    /// Collapse the groups of workspaces other than the active tab's.
+    pub collapse_inactive: bool,
+    /// Hide the tabs of other workspaces than the current one (Firefox).
+    pub hide_inactive: bool,
+    /// Show the current workspace in the window title (Firefox).
+    pub show_in_title: bool,
+    /// New tabs that no rule places join the current workspace.
+    pub new_tabs_join_active: bool,
 }
 
 /// How the Tabs view lists tabs.
@@ -248,6 +266,7 @@ impl Default for Settings {
             dedupe_on_session_load: false,
             media: MediaSettings::default(),
             tab_list: TabListSettings::default(),
+            browser_ui: BrowserUiSettings::default(),
         }
     }
 }
@@ -270,6 +289,11 @@ pub struct AppState {
     pub workspaces: Vec<Workspace>,
     /// Media currently playing in tabs, and tabs we paused (for the media limit).
     pub media: MediaState,
+    /// The workspace in use: the workspace of the tab last activated, or the one switched to.
+    pub active_workspace: Option<Id>,
+    /// Tabs opened for a workspace whose entry doesn't exist yet (a new tab page becomes an
+    /// entry once it shows a page).
+    pub pending_workspace: BTreeMap<TabId, Id>,
 }
 
 impl Default for AppState {
@@ -286,6 +310,8 @@ impl Default for AppState {
             cleanup_log: Vec::new(),
             workspaces: Vec::new(),
             media: MediaState::default(),
+            active_workspace: None,
+            pending_workspace: BTreeMap::new(),
         };
         let id = s.alloc_id();
         s.sessions.push(Session { id, name: "Default".into(), ..Default::default() });
@@ -349,4 +375,8 @@ pub struct BrowserTab {
     pub last_accessed: f64,
     /// Title of the native tab group the tab is in.
     pub group_title: Option<String>,
+    /// Id of the native tab group the tab is in.
+    pub group_id: Option<i64>,
+    /// Hidden from the tab strip (Firefox).
+    pub hidden: bool,
 }

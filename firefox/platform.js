@@ -11,14 +11,24 @@ installPlatform(api, {
       tabGroups: !!(api.tabs.group && api.tabGroups),
       // browsingData.remove({hostnames}) does not support the HTTP cache in Firefox.
       perHostCache: false,
+      sidebar: !!api.sidebarAction,
+      // tabs.hide needs the optional tabHide permission (asked for when it is turned on).
+      hideTabs: true,
+      titlePreface: true,
+      extensionId: api.runtime.id || '',
     };
+  },
+
+  async setTitlePreface(windowId, text) {
+    await api.windows.update(windowId, { titlePreface: text });
   },
 
   // Firefox can create tabs directly in the discarded (unloaded) state.
   async createTab(o) {
-    const props = { url: o.url, active: !!o.active, pinned: !!o.pinned };
+    const props = { active: !!o.active, pinned: !!o.pinned };
+    if (o.url) props.url = o.url; // none: the new tab page
     if (o.windowId != null) props.windowId = o.windowId;
-    if (o.discarded && !o.active && !o.pinned && LAZY_SCHEMES.test(o.url)) {
+    if (o.url && o.discarded && !o.active && !o.pinned && LAZY_SCHEMES.test(o.url)) {
       props.discarded = true;
       if (o.title) props.title = o.title;
     }

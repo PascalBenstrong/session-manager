@@ -26,6 +26,8 @@ extern "C" {
     fn js_create_window() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = removeTabs)]
     fn js_remove_tabs(ids: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = activateTab)]
+    fn js_activate_tab(id: f64) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = focusTab)]
     fn js_focus_tab(id: f64) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = moveTabs)]
@@ -38,6 +40,26 @@ extern "C" {
     fn js_discard_tabs(ids: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = mediaCommand)]
     fn js_media_command(tab_id: f64, cmd: &str, audio: bool) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = queryTabGroups)]
+    fn js_query_tab_groups() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = groupInto)]
+    fn js_group_into(ids: JsValue, group_id: JsValue, window_id: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = updateTabGroup)]
+    fn js_update_tab_group(id: f64, props: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = hideTabs)]
+    fn js_hide_tabs(ids: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = showTabs)]
+    fn js_show_tabs(ids: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = setTitlePreface)]
+    fn js_set_title_preface(window_id: f64, text: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = hasPermission)]
+    fn js_has_permission(name: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = currentWindowId)]
+    fn js_current_window_id() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = openUrl)]
+    fn js_open_url(url: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(js_namespace = smPlatform, js_name = setGestureAction)]
+    pub fn set_gesture_action(name: &str);
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getAllCookies)]
     fn js_get_all_cookies() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = removeCookie)]
@@ -165,6 +187,11 @@ pub async fn focus_tab(id: TabId) -> Result<()> {
     call(js_focus_tab(id as f64)).await.map(drop)
 }
 
+/// Selects a tab in its window, without focusing the window.
+pub async fn activate_tab(id: TabId) -> Result<()> {
+    call(js_activate_tab(id as f64)).await.map(drop)
+}
+
 pub async fn move_tabs(ids: &[TabId], window_id: TabId, index: i64) -> Result<()> {
     call(js_move_tabs(to_js(ids), window_id as f64, index as f64)).await.map(drop)
 }
@@ -187,6 +214,55 @@ pub struct Discarded {
 /// Unloads tabs (keeping them in the tab strip).
 pub async fn discard_tabs(ids: &[TabId]) -> Result<Discarded> {
     call_as(js_discard_tabs(to_js(ids))).await
+}
+
+pub async fn query_tab_groups() -> Result<Vec<crate::tab_strip::NativeGroup>> {
+    call_as(js_query_tab_groups()).await
+}
+
+/// Adds tabs to a native group (`None`: a new group in `window_id`). Returns the group id.
+pub async fn group_into(ids: &[TabId], group: Option<i64>, window_id: TabId) -> Result<i64> {
+    let group = group.map_or(JsValue::NULL, |g| JsValue::from_f64(g as f64));
+    let id = call(js_group_into(to_js(ids), group, window_id as f64)).await?;
+    id.as_f64().map(|v| v as i64).ok_or_else(|| "the browser returned no group".to_string())
+}
+
+#[derive(Serialize)]
+pub struct GroupProps<'a> {
+    pub title: &'a str,
+    pub color: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collapsed: Option<bool>,
+}
+
+pub async fn update_tab_group(id: i64, props: &GroupProps<'_>) -> Result<()> {
+    call(js_update_tab_group(id as f64, to_js(props))).await.map(drop)
+}
+
+pub async fn hide_tabs(ids: &[TabId]) -> Result<()> {
+    call(js_hide_tabs(to_js(ids))).await.map(drop)
+}
+
+pub async fn show_tabs(ids: &[TabId]) -> Result<()> {
+    call(js_show_tabs(to_js(ids))).await.map(drop)
+}
+
+pub async fn set_title_preface(window_id: TabId, text: &str) -> Result<()> {
+    call(js_set_title_preface(window_id as f64, text)).await.map(drop)
+}
+
+pub async fn has_permission(name: &str) -> bool {
+    call(js_has_permission(name)).await.ok().and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// The window of this page (sidebar / side panel).
+pub async fn current_window_id() -> Result<TabId> {
+    let v = call(js_current_window_id()).await?;
+    v.as_f64().map(|v| v as TabId).ok_or_else(|| "no window".to_string())
+}
+
+pub async fn open_url(url: &str) -> Result<()> {
+    call(js_open_url(url)).await.map(drop)
 }
 
 /// Sends `"pause"` / `"resume"` to the media content script of every frame of a tab.

@@ -72,6 +72,11 @@ pub enum Command {
     AutoPlaceEntries { entries: Option<Vec<EntryRef>> },
     /// Unload tabs to free memory. `force` includes pinned tabs and tabs playing media.
     Hibernate { target: HibernateTarget, force: bool },
+    /// Switch to a workspace (`None`: no current workspace, show every tab): focus its
+    /// most recently used tab and, if enabled, hide the other workspaces' tabs.
+    SetActiveWorkspace { id: Option<Id> },
+    /// Open a new tab that joins a workspace (`None`: the current one).
+    NewTabInWorkspace { workspace: Option<Id> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -99,6 +104,15 @@ pub struct Capabilities {
     pub browser: String,
     pub tab_groups: bool,
     pub per_host_cache: bool,
+    /// A sidebar / side panel is available.
+    pub sidebar: bool,
+    /// Tabs can be hidden (Firefox, with the optional tabHide permission).
+    pub hide_tabs: bool,
+    /// The tabHide permission was granted.
+    pub hide_tabs_allowed: bool,
+    /// The window title can get a preface (Firefox).
+    pub title_preface: bool,
+    pub extension_id: String,
 }
 
 #[cfg(test)]

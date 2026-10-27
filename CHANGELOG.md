@@ -2,6 +2,15 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.4.0] - 2026-10-27
+
+### New
+- Workspaces as tab groups: each workspace's tabs sit in a native tab group with its icon, name and color. Dragging a tab into or out of a group moves it between workspaces. Optionally, only the group of the workspace you're in stays open.
+- Workspace sidebar (Firefox sidebar, Chrome side panel): the window's tabs listed by workspace, a workspace switcher, and new tabs per workspace. Open it with Alt+Shift+W or from the popup.
+- Switch workspaces from the sidebar, the Tabs view or a workspace's settings. The current workspace follows the tab you use, and new tabs can join it.
+- Firefox: hide the tabs of other workspaces, so the tab bar only shows the current workspace. Optionally show the workspace in the window title.
+- Firefox: a step-by-step guide in Settings to hide Firefox's own tab bar with userChrome.css, naming the preference to change and providing the stylesheet to copy or download.
+
 ## [0.3.0] - 2026-10-27
 
 ### New

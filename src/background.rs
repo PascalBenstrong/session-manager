@@ -18,6 +18,7 @@ use crate::organize::{self, OrganizeKey};
 use crate::platform::{self as pf, CreateTab};
 use crate::protocol::{Capabilities, Command, Response, STATE_KEY};
 use crate::state::{RestoreMode, trackable};
+use crate::tab_strip;
 
 const SNAPSHOT_ALARM: &str = "sm-snapshot";
 /// After browser startup, de-duplicate once the browser has stopped restoring tabs for
@@ -37,6 +38,12 @@ thread_local! {
     static STARTUP_DEDUPE: Cell<Option<(u32, f64)>> = const { Cell::new(None) };
     /// When this background instance started.
     static STARTED_AT: Cell<f64> = const { Cell::new(0.0) };
+    static STRIP_GENERATION: Cell<u32> = const { Cell::new(0) };
+    /// A tab strip sync is running / another one was asked for meanwhile.
+    static STRIP_RUNNING: Cell<bool> = const { Cell::new(false) };
+    static STRIP_AGAIN: Cell<bool> = const { Cell::new(false) };
+    /// Window title prefaces we set, by window.
+    static TITLES: RefCell<std::collections::HashMap<TabId, String>> = RefCell::new(Default::default());
 }
 
 /// Marks that the extension itself is opening tabs (for the lifetime of the guard).
@@ -70,6 +77,7 @@ fn log(msg: &str) {
 pub async fn start() -> Result<(), JsValue> {
     STARTED_AT.with(|t| t.set(pf::now()));
     CAPS.with(|c| *c.borrow_mut() = pf::capabilities());
+    refresh_permissions().await;
 
     let mut state = match pf::storage_get(STATE_KEY).await {
         Ok(Some(json)) => serde_json::from_str::<AppState>(&json).unwrap_or_else(|e| {
@@ -96,7 +104,16 @@ pub async fn start() -> Result<(), JsValue> {
     });
     pf::set_event_handler(handler.as_ref().unchecked_ref());
     handler.forget();
+    schedule_strip_sync();
     Ok(())
+}
+
+/// Whether the optional tabHide permission was granted.
+async fn refresh_permissions() {
+    if CAPS.with(|c| c.borrow().hide_tabs) {
+        let allowed = pf::has_permission("tabHide").await;
+        CAPS.with(|c| c.borrow_mut().hide_tabs_allowed = allowed);
+    }
 }
 
 async fn persist() {
@@ -128,6 +145,8 @@ enum Event {
     /// The media content script reports playback in a frame.
     #[serde(rename_all = "camelCase")]
     MediaState { tab_id: TabId, frame_id: i64, playing: bool, video: bool, pip: bool },
+    /// An optional permission was granted or revoked.
+    PermissionsChanged,
     CookieSet { cookie: Cookie },
     Alarm { name: String },
     Message { payload: String },
@@ -161,6 +180,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             if with_state(|s| s.on_tab_upsert(&tab, now)) {
                 persist().await;
                 schedule_auto_organize();
+                schedule_strip_sync();
             }
         }
         Event::TabUpdated { tab, url_changed } => {
@@ -172,6 +192,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 if url_changed {
                     schedule_auto_organize();
                 }
+                schedule_strip_sync();
             }
         }
         Event::TabRemoved { tab_id, window_closing } => {
@@ -184,6 +205,11 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 persist().await;
             }
             enforce_media().await;
+            schedule_strip_sync();
+        }
+        Event::PermissionsChanged => {
+            refresh_permissions().await;
+            schedule_strip_sync();
         }
         Event::MediaState { tab_id, frame_id, playing, video, pip } => {
             let report = MediaReport { playing, video, pip };
@@ -343,6 +369,11 @@ fn open_urls(s: &AppState) -> Vec<String> {
 // ---------------------------------------------------------------- commands
 
 async fn execute(cmd: Command) -> Response {
+    if cmd != Command::GetState {
+        // Most commands change what the tab strip should show; the sync is debounced and
+        // does nothing when nothing changed.
+        schedule_strip_sync();
+    }
     let result = run_command(cmd).await;
     let mut resp = match result {
         Ok(r) => r,
@@ -455,6 +486,10 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok("Rules applied to existing tabs")
         }
         Command::UpdateSettings { settings } => {
+            let was_hiding = with_state(|s| s.settings.browser_ui.hide_inactive);
+            if was_hiding && !settings.browser_ui.hide_inactive {
+                show_workspace_tabs().await;
+            }
             with_state(|s| {
                 if !settings.media.enabled() {
                     s.media = Default::default();
@@ -504,6 +539,43 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok(format!("Workspace rules moved {n} tab(s)"))
         }
         Command::Hibernate { target, force } => hibernate_tabs(&target, force).await,
+        Command::SetActiveWorkspace { id } => {
+            with_state(|s| s.set_active_workspace(id))?;
+            persist().await;
+            let Some(id) = id else {
+                show_workspace_tabs().await;
+                return ok("Showing all workspaces");
+            };
+            // Go to the workspace's most recently used open tab.
+            let (name, target) = with_state(|s| {
+                let target = s
+                    .sessions
+                    .iter()
+                    .flat_map(|x| &x.entries)
+                    .filter(|e| e.workspace == Some(id) && e.tab_id.is_some())
+                    .max_by(|a, b| a.last_accessed.total_cmp(&b.last_accessed))
+                    .and_then(|e| e.tab_id);
+                (s.workspace(id).map(|w| w.label()).unwrap_or_default(), target)
+            });
+            if let Some(tab) = target
+                && let Err(e) = pf::focus_tab(tab).await
+            {
+                log(&format!("could not switch to tab {tab}: {e}"));
+            }
+            ok(format!("Switched to {name}"))
+        }
+        Command::NewTabInWorkspace { workspace } => {
+            let ws = workspace.or(with_state(|s| s.active_workspace));
+            with_state(|s| s.set_active_workspace(ws))?;
+            let tab = pf::create_tab(&CreateTab { active: true, ..Default::default() }).await?;
+            with_state(|s| {
+                if let Some(w) = ws {
+                    s.pending_workspace.insert(tab.id, w);
+                }
+            });
+            persist().await;
+            ok("")
+        }
         Command::RunCleanup { label, spec } => {
             let report = run_cleanup(&label, &spec).await?;
             with_state(|s| s.push_cleanup_report(report.clone()));
@@ -793,6 +865,128 @@ async fn enforce_media() {
     persist().await;
 }
 
+// ---------------------------------------------------------------- tab strip
+
+fn workspace_of(s: &AppState, t: &BrowserTab) -> Option<Id> {
+    s.entry_for_tab(t.id).and_then(|e| e.workspace)
+}
+
+/// Debounced [`sync_tab_strip`]; a run asked for while one runs follows it.
+fn schedule_strip_sync() {
+    if STRIP_RUNNING.with(|r| r.get()) {
+        STRIP_AGAIN.with(|a| a.set(true));
+        return;
+    }
+    let generation = STRIP_GENERATION.with(|g| {
+        g.set(g.get().wrapping_add(1));
+        g.get()
+    });
+    spawn_local(async move {
+        pf::sleep(300).await;
+        if STRIP_GENERATION.with(|g| g.get()) != generation || STRIP_RUNNING.with(|r| r.get()) {
+            return;
+        }
+        STRIP_RUNNING.with(|r| r.set(true));
+        if let Err(e) = sync_tab_strip().await {
+            log(&format!("could not update the tab strip: {e}"));
+        }
+        STRIP_RUNNING.with(|r| r.set(false));
+        if STRIP_AGAIN.with(|a| a.replace(false)) {
+            schedule_strip_sync();
+        }
+    });
+}
+
+/// Makes the browser's tab strip show the workspaces: hides other workspaces' tabs,
+/// mirrors workspaces as native tab groups and puts the current one in the window title,
+/// as enabled in the settings.
+async fn sync_tab_strip() -> Result<(), String> {
+    let ui = with_state(|s| s.settings.browser_ui);
+    let caps = CAPS.with(|c| c.borrow().clone());
+    let mut tabs = pf::query_tabs().await?;
+    let mut opened = false;
+
+    // Hide first: switching away from a hidden tab changes which group is collapsed.
+    if ui.hide_inactive && caps.hide_tabs && caps.hide_tabs_allowed {
+        let (current, tracked) = with_state(|s| {
+            // Only tabs we track: tabs hidden by other extensions are not ours to show.
+            let tracked: Vec<BrowserTab> = tabs.iter().filter(|t| s.locate_tab(t.id).is_some()).cloned().collect();
+            (s.active_workspace, tracked)
+        });
+        let plan = STATE.with(|s| {
+            let s = s.borrow();
+            tab_strip::plan_visibility(current, &tracked, |t| workspace_of(&s, t))
+        });
+        if !plan.is_empty() {
+            pf::show_tabs(&plan.show).await?;
+            for id in &plan.activate {
+                pf::activate_tab(*id).await?;
+            }
+            for window in &plan.new_tab_in {
+                let tab = pf::create_tab(&CreateTab { active: true, window_id: Some(*window), ..Default::default() }).await?;
+                with_state(|s| {
+                    if let Some(w) = s.active_workspace {
+                        s.pending_workspace.insert(tab.id, w);
+                    }
+                });
+                opened = true;
+            }
+            pf::hide_tabs(&plan.hide).await?;
+            tabs = pf::query_tabs().await?;
+        }
+    }
+
+    if ui.tab_groups && caps.tab_groups {
+        let groups = pf::query_tab_groups().await?;
+        let plan = STATE.with(|s| {
+            let s = s.borrow();
+            tab_strip::plan_groups(&s.workspaces, &tabs, &groups, |t| workspace_of(&s, t), ui.collapse_inactive)
+        });
+        for g in &plan.groups {
+            let id = match g.group {
+                Some(id) if g.tab_ids.is_empty() => id,
+                group => pf::group_into(&g.tab_ids, group, g.window_id).await?,
+            };
+            if g.update || g.group.is_none() {
+                let props = pf::GroupProps { title: &g.title, color: g.color, collapsed: g.collapsed };
+                pf::update_tab_group(id, &props).await?;
+            }
+        }
+        pf::ungroup_tabs(&plan.ungroup).await?;
+    }
+
+    if caps.title_preface {
+        let text = with_state(|s| {
+            let current = s.active_workspace.and_then(|id| s.workspace(id)).filter(|_| ui.show_in_title);
+            tab_strip::title_preface(current)
+        });
+        let windows: std::collections::BTreeSet<TabId> = tabs.iter().map(|t| t.window_id).collect();
+        for w in windows {
+            // Windows start without a preface; only touch them once there is one.
+            let last = TITLES.with(|t| t.borrow().get(&w).cloned()).unwrap_or_default();
+            if last != text {
+                pf::set_title_preface(w, &text).await?;
+                TITLES.with(|t| t.borrow_mut().insert(w, text.clone()));
+            }
+        }
+    }
+    if opened {
+        persist().await;
+    }
+    Ok(())
+}
+
+/// Shows the tabs hidden for workspaces (when hiding is turned off, or no workspace is current).
+async fn show_workspace_tabs() {
+    let ids: Vec<TabId> = match pf::query_tabs().await {
+        Ok(tabs) => with_state(|s| tabs.iter().filter(|t| t.hidden && s.locate_tab(t.id).is_some()).map(|t| t.id).collect()),
+        Err(e) => return log(&format!("could not query tabs: {e}")),
+    };
+    if let Err(e) = pf::show_tabs(&ids).await {
+        log(&format!("could not show tabs: {e}"));
+    }
+}
+
 // ---------------------------------------------------------------- organize
 
 async fn organize_tabs(key: OrganizeKey, native_groups: bool) -> Result<usize, String> {
@@ -801,7 +995,8 @@ async fn organize_tabs(key: OrganizeKey, native_groups: bool) -> Result<usize, S
         let s = s.borrow();
         organize::plan(key, &tabs, |id| s.entry_for_tab(id))
     });
-    let use_groups = native_groups && CAPS.with(|c| c.borrow().tab_groups);
+    // While workspaces are shown as tab groups, those are the only groups we make.
+    let use_groups = native_groups && CAPS.with(|c| c.borrow().tab_groups) && !with_state(|s| s.settings.browser_ui.tab_groups);
     let mut moved = 0;
     for p in &plans {
         if p.order.is_empty() {

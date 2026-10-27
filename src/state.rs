@@ -135,6 +135,9 @@ impl AppState {
             if url_changed {
                 self.apply_auto_rules(&mut e);
             }
+            if group_changed {
+                self.follow_native_group(&mut e, before.browser_group.as_deref(), before.window_id, false);
+            }
             if url_changed || group_changed {
                 self.place_entry(&mut e);
             }
@@ -148,7 +151,16 @@ impl AppState {
         let id = self.alloc_id();
         let mut e = entry_from_tab(id, tab, now);
         self.apply_auto_rules(&mut e);
+        if let Some(w) = self.pending_workspace.remove(&tab.id) {
+            e.workspace = Some(w);
+            e.workspace_manual = true;
+        } else {
+            self.follow_native_group(&mut e, None, None, true);
+        }
         self.place_entry(&mut e);
+        if e.workspace.is_none() && self.settings.browser_ui.new_tabs_join_active {
+            e.workspace = self.active_workspace;
+        }
         let active = self.active_session;
         match self.session_mut(active) {
             Some(s) => s.entries.push(e),
@@ -160,7 +172,7 @@ impl AppState {
     /// A browser tab was closed.
     pub fn on_tab_removed(&mut self, tab_id: TabId, window_closing: bool) -> bool {
         self.ignored_tab_ids.remove(&tab_id);
-        let media = self.media.forget_tab(tab_id);
+        let media = self.media.forget_tab(tab_id) | self.pending_workspace.remove(&tab_id).is_some();
         let Some(r) = self.locate_tab(tab_id) else { return media };
         if window_closing && self.settings.keep_tabs_on_window_close {
             let e = self.entry_mut(r).expect("located");
@@ -177,7 +189,12 @@ impl AppState {
     pub fn on_tab_activated(&mut self, tab_id: TabId, now: f64) -> bool {
         match self.locate_tab(tab_id) {
             Some(r) => {
-                self.entry_mut(r).expect("located").last_accessed = now;
+                let e = self.entry_mut(r).expect("located");
+                e.last_accessed = now;
+                // The current workspace follows the tab in use.
+                if let Some(w) = e.workspace {
+                    self.active_workspace = Some(w);
+                }
                 true
             }
             None => false,
@@ -190,6 +207,9 @@ impl AppState {
             self.ignored_tab_ids.insert(added);
         }
         self.media.replace_tab(added, removed);
+        if let Some(w) = self.pending_workspace.remove(&removed) {
+            self.pending_workspace.insert(added, w);
+        }
         match self.locate_tab(removed) {
             Some(r) => {
                 self.entry_mut(r).expect("located").tab_id = Some(added);
@@ -243,6 +263,7 @@ impl AppState {
         let open: BTreeSet<TabId> = tabs.iter().map(|t| t.id).collect();
         self.ignored_tab_ids.retain(|id| open.contains(id));
         self.media.retain_open(&open);
+        self.pending_workspace.retain(|id, _| open.contains(id));
 
         for t in tabs {
             if linked.contains(&t.id) || self.ignored_tab_ids.contains(&t.id) {

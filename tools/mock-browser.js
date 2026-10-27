@@ -13,17 +13,35 @@ export function createMockBrowser() {
   const removedSiteData = [];
   const reloaded = [];
   const tabMessages = [];
+  const groups = new Map();
+  let nextGroupId = 100;
+  const granted = new Set();
+  const titlePrefaces = {};
   const ev = {
     created: listeners(), updated: listeners(), removed: listeners(), activated: listeners(),
     cookie: listeners(), alarm: listeners(), message: listeners(), storage: listeners(), installed: listeners(),
-    startup: listeners(),
+    startup: listeners(), groupUpdated: listeners(), permAdded: listeners(), permRemoved: listeners(),
   };
   const clone = (o) => JSON.parse(JSON.stringify(o));
+  // Puts tabs in a native group (-1: none), like the browser, and drops emptied groups.
+  const setGroup = (ids, groupId) => {
+    for (const id of ids) {
+      const t = tabs.get(id);
+      if (t.groupId === groupId) continue;
+      t.groupId = groupId;
+      ev.updated.fire(id, { groupId }, clone(t));
+    }
+    for (const g of groups.keys()) {
+      if (![...tabs.values()].some((t) => t.groupId === g)) groups.delete(g);
+    }
+  };
 
   const api = {
     tabs: {
       async query(q) {
-        return [...tabs.values()].filter((t) => (!q.url || t.url === q.url) && (!q.active || t.active)).map(clone);
+        return [...tabs.values()]
+          .filter((t) => (!q.url || t.url === q.url) && (!q.active || t.active) && (q.groupId == null || t.groupId === q.groupId))
+          .map(clone);
       },
       async get(id) {
         if (!tabs.has(id)) throw new Error(`No tab with id: ${id}`);
@@ -32,12 +50,35 @@ export function createMockBrowser() {
       async reload(id) { reloaded.push(id); },
       async create(p) {
         const t = { id: nextTabId++, windowId: p.windowId ?? 1, index: tabs.size, url: p.url, title: p.title || '',
-          pinned: !!p.pinned, active: !!p.active, discarded: !!p.discarded };
+          pinned: !!p.pinned, active: !!p.active, discarded: !!p.discarded, groupId: -1, hidden: false };
+        if (t.active) for (const o of tabs.values()) if (o.windowId === t.windowId) o.active = false;
         tabs.set(t.id, t);
         ev.created.fire(clone(t));
         return clone(t);
       },
-      async update(id, p) { Object.assign(tabs.get(id), p); return clone(tabs.get(id)); },
+      async update(id, p) {
+        const t = tabs.get(id);
+        if (p.active) for (const o of tabs.values()) if (o.windowId === t.windowId) o.active = false;
+        Object.assign(t, p);
+        return clone(t);
+      },
+      async group({ tabIds, groupId, createProperties }) {
+        let id = groupId;
+        if (id == null) {
+          id = nextGroupId++;
+          groups.set(id, { id, windowId: createProperties?.windowId ?? 1, title: '', color: 'grey', collapsed: false });
+        }
+        if (!groups.has(id)) throw new Error(`No group with id: ${id}`);
+        setGroup([].concat(tabIds), id);
+        return id;
+      },
+      async ungroup(ids) { setGroup([].concat(ids), -1); },
+      async hide(ids) {
+        if (!granted.has('tabHide')) throw new Error('Missing tabHide permission');
+        for (const id of [].concat(ids)) tabs.get(id).hidden = true;
+        return ids;
+      },
+      async show(ids) { for (const id of [].concat(ids)) tabs.get(id).hidden = false; },
       async remove(ids) {
         for (const id of [].concat(ids)) { tabs.delete(id); ev.removed.fire(id, { isWindowClosing: false, windowId: 1 }); }
       },
@@ -54,7 +95,20 @@ export function createMockBrowser() {
     },
     windows: {
       async create() { return { id: 2, tabs: [] }; },
-      async update() {},
+      async update(id, p) { if (p && 'titlePreface' in p) titlePrefaces[id] = p.titlePreface; },
+      async getCurrent() { return { id: 1 }; },
+    },
+    tabGroups: {
+      async query() { return [...groups.values()].map(clone); },
+      async get(id) { return clone(groups.get(id)); },
+      async update(id, p) { Object.assign(groups.get(id), p); ev.groupUpdated.fire(clone(groups.get(id))); return clone(groups.get(id)); },
+      onUpdated: ev.groupUpdated,
+    },
+    permissions: {
+      async contains({ permissions }) { return permissions.every((p) => granted.has(p)); },
+      async request({ permissions }) { permissions.forEach((p) => granted.add(p)); ev.permAdded.fire({ permissions }); return true; },
+      onAdded: ev.permAdded,
+      onRemoved: ev.permRemoved,
     },
     cookies: {
       async getAllCookieStores() { return [{ id: 'default' }]; },
@@ -88,6 +142,7 @@ export function createMockBrowser() {
       onAlarm: ev.alarm,
     },
     runtime: {
+      id: 'session-manager@local.extension',
       getURL: (p) => `moz-extension://test/${p}`,
       // In a real browser the UI's message reaches the background's onMessage listener.
       sendMessage(msg) {
@@ -107,5 +162,5 @@ export function createMockBrowser() {
       async setBadgeBackgroundColor() {},
     },
   };
-  return { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, ev, clone };
+  return { api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, granted, titlePrefaces, ev, clone };
 }

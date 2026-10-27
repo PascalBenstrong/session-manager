@@ -4,12 +4,14 @@
 //!
 //! Layout: the toolbar popup is a quick switcher (search + jump to a tab); wide manager
 //! pages get a sidebar (sessions + views); narrow manager pages get a compact header.
+//! The browser sidebar / side panel page shows the tabs of its window by workspace.
 
 mod backup_view;
 mod cleanup_view;
 mod mini_view;
 mod organize_view;
 mod settings_view;
+mod sidebar_view;
 mod tabs_view;
 mod theme;
 mod whats_new_view;
@@ -17,12 +19,13 @@ mod widgets;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Margin, RichText, ThemePreference};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::model::{AppState, EntryRef, Id, Session};
+use crate::model::{AppState, EntryRef, Id, Session, TabId};
 use crate::platform as pf;
 use crate::protocol::{Capabilities, Command, Response, STATE_KEY};
 use widgets::{badge, icon_button, nav_item, primary_button, segmented, text_input};
@@ -30,7 +33,14 @@ use widgets::{badge, icon_button, nav_item, primary_button, segmented, text_inpu
 /// Width from which the sidebar layout is used.
 const WIDE_LAYOUT: f32 = 860.0;
 
-pub async fn start(canvas_id: &str, popup: bool) -> Result<(), JsValue> {
+/// This page is the toolbar popup (which closes itself after some actions).
+static IS_POPUP: AtomicBool = AtomicBool::new(false);
+
+/// `mode`: "popup", "sidebar" (browser sidebar / side panel) or "manager".
+pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
+    let popup = mode == "popup";
+    let sidebar = mode == "sidebar";
+    IS_POPUP.store(popup, Ordering::Relaxed);
     let document = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let canvas = document
         .get_element_by_id(canvas_id)
@@ -38,7 +48,7 @@ pub async fn start(canvas_id: &str, popup: bool) -> Result<(), JsValue> {
         .dyn_into::<web_sys::HtmlCanvasElement>()?;
     let runner = Box::leak(Box::new(eframe::WebRunner::new()));
     runner
-        .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, popup)))))
+        .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, popup, sidebar)))))
         .await
 }
 
@@ -47,6 +57,10 @@ pub async fn start(canvas_id: &str, popup: bool) -> Result<(), JsValue> {
 struct Inbox {
     responses: Vec<Response>,
     pushed_state: Option<AppState>,
+    /// The window of a sidebar page.
+    window_id: Option<TabId>,
+    /// Messages for the toast: (text, error).
+    notices: Vec<(String, bool)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,6 +118,11 @@ pub(crate) struct Actions {
     navigate: Option<&'static str>,
     /// Close the popup once the queued commands have completed.
     close: bool,
+    /// Action to run on the next pointer release (see `smPlatform.setGestureAction`).
+    gesture: Option<&'static str>,
+    /// Browser pages to open (e.g. "about:config").
+    open_pages: Vec<String>,
+    notice: Option<String>,
 }
 
 impl Actions {
@@ -129,6 +148,22 @@ impl Actions {
     pub fn navigate(&mut self, view: &'static str) {
         self.navigate = Some(view);
     }
+
+    /// Arms an action that needs a user gesture ("sidebar", "tabHide") while the pointer is
+    /// over the button that triggers it; it runs when the pointer is released.
+    pub fn arm(&mut self, gesture: &'static str) {
+        self.gesture = Some(gesture);
+    }
+
+    /// Opens a browser page; if extensions may not open it, its address is copied instead.
+    pub fn open_page(&mut self, url: impl Into<String>) {
+        self.open_pages.push(url.into());
+    }
+
+    /// Shows a message in the toast.
+    pub fn notice(&mut self, text: impl Into<String>) {
+        self.notice = Some(text.into());
+    }
 }
 
 /// Read-only context handed to views.
@@ -140,6 +175,13 @@ pub(crate) struct ViewCtx<'a> {
 
 pub struct App {
     popup: bool,
+    /// The browser sidebar / side panel page.
+    sidebar: bool,
+    /// The window of the sidebar page.
+    window_id: Option<TabId>,
+    /// Gesture action armed in this frame.
+    gesture: Option<&'static str>,
+    side: sidebar_view::SidebarView,
     ctx: egui::Context,
     inbox: Rc<RefCell<Inbox>>,
     pending: u32,
@@ -167,7 +209,7 @@ pub struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, popup: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, popup: bool, sidebar: bool) -> Self {
         let theme = theme::load_preference();
         theme::install(&cc.egui_ctx, theme);
 
@@ -186,8 +228,22 @@ impl App {
             pf::on_state_changed(STATE_KEY, cb.as_ref().unchecked_ref());
             cb.forget();
         }
+        if sidebar {
+            let inbox = inbox.clone();
+            let ctx = cc.egui_ctx.clone();
+            spawn_local(async move {
+                if let Ok(id) = pf::current_window_id().await {
+                    inbox.borrow_mut().window_id = Some(id);
+                    ctx.request_repaint();
+                }
+            });
+        }
         let mut app = Self {
             popup,
+            sidebar,
+            window_id: None,
+            gesture: None,
+            side: Default::default(),
             ctx: cc.egui_ctx.clone(),
             inbox,
             pending: 0,
@@ -236,8 +292,17 @@ impl App {
         if let Some(c) = acts.confirm {
             self.confirm = Some(c);
         }
+        if let Some(g) = acts.gesture {
+            self.gesture = Some(g);
+        }
+        if let Some(text) = acts.notice {
+            self.set_status(text, false);
+        }
+        for url in acts.open_pages {
+            self.open_page(url);
+        }
         if let Some(view) = acts.navigate {
-            if self.popup {
+            if self.popup || self.sidebar {
                 open_manager(view);
             } else if let Some(v) = View::from_hash(view) {
                 self.view = v;
@@ -256,11 +321,36 @@ impl App {
         self.status = Some(Status { text: text.into(), error, at: pf::now() });
     }
 
+    /// Opens a browser page in a tab. Firefox refuses `about:config` and similar pages to
+    /// extensions, so the address is copied first, to paste into the address bar.
+    fn open_page(&mut self, url: String) {
+        self.ctx.copy_text(url.clone());
+        let inbox = self.inbox.clone();
+        let ctx = self.ctx.clone();
+        spawn_local(async move {
+            let notice = match pf::open_url(&url).await {
+                Ok(()) => (format!("Opened {url}"), false),
+                Err(_) => (
+                    format!("The browser doesn't let extensions open {url}. The address is copied: paste it into the address bar."),
+                    false,
+                ),
+            };
+            inbox.borrow_mut().notices.push(notice);
+            ctx.request_repaint();
+        });
+    }
+
     fn drain_inbox(&mut self) {
-        let (responses, pushed) = {
+        let (responses, pushed, notices) = {
             let mut inbox = self.inbox.borrow_mut();
-            (std::mem::take(&mut inbox.responses), inbox.pushed_state.take())
+            if let Some(w) = inbox.window_id.take() {
+                self.window_id = Some(w);
+            }
+            (std::mem::take(&mut inbox.responses), inbox.pushed_state.take(), std::mem::take(&mut inbox.notices))
         };
+        for (text, error) in notices {
+            self.set_status(text, error);
+        }
         if let Some(s) = pushed {
             self.state = Some(s);
         }
@@ -612,6 +702,15 @@ impl App {
                 if self.popup && icon_button(ui, "⛶", "Open the full manager in a tab").clicked() {
                     open_manager("");
                 }
+                if self.popup && self.caps.sidebar {
+                    let r = icon_button(ui, "◨", "Open the workspace sidebar");
+                    if r.contains_pointer() {
+                        self.gesture = Some("sidebar");
+                    }
+                    if r.clicked() {
+                        close_window();
+                    }
+                }
                 if self.popup {
                     let mut acts = Actions::default();
                     self.mini.clean_menu(ui, &mut acts);
@@ -706,6 +805,44 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.gesture = None;
+        self.frame(ui);
+        pf::set_gesture_action(self.gesture.unwrap_or(""));
+    }
+}
+
+impl App {
+    /// Browser sidebar / side panel: workspace switcher, then this window's tabs.
+    fn sidebar_ui(&mut self, ui: &mut egui::Ui, state: &AppState) -> Actions {
+        let p = theme::palette(ui);
+        let mut acts = Actions::default();
+        let caps = self.caps.clone();
+        let cx = ViewCtx { state, caps: &caps, viewed: state.active_session };
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(10, 8)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("◧").size(18.0).color(p.accent));
+                    ui.label(RichText::new("Workspaces").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, "⛶", "Open the full manager").clicked() {
+                            open_manager("");
+                        }
+                        self.theme_button(ui);
+                    });
+                });
+                self.side.switcher(ui, &cx, &mut acts);
+            });
+        egui::Panel::bottom("footer")
+            .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(10, 6)))
+            .show(ui, |ui| self.side.footer(ui, &cx, &mut acts));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(8, 8)))
+            .show(ui, |ui| self.side.show(ui, &cx, self.window_id, &mut acts));
+        acts
+    }
+
+    fn frame(&mut self, ui: &mut egui::Ui) {
         self.drain_inbox();
         if !self.popup {
             let hash = pf::location_hash();
@@ -729,8 +866,8 @@ impl eframe::App for App {
         let session = state.session(viewed).cloned().unwrap_or_else(|| state.active().clone());
         let wide = !self.popup && ui.available_width() >= WIDE_LAYOUT;
 
-        if self.popup {
-            let acts = self.popup_ui(ui, &state, &session);
+        if self.popup || self.sidebar {
+            let acts = if self.popup { self.popup_ui(ui, &state, &session) } else { self.sidebar_ui(ui, &state) };
             self.apply(acts);
             self.confirm_modal(ui);
             self.toast(&ui.ctx().clone(), dark);
@@ -792,7 +929,11 @@ fn open_manager(view: &'static str) {
     });
 }
 
+/// Closes the popup (other pages stay open).
 fn close_window() {
+    if !IS_POPUP.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(w) = web_sys::window() {
         let _ = w.close();
     }

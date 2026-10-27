@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Session Manager",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Track tabs in sessions, search and organize them, and clean cookies & site data.",
   "minimum_chrome_version": "120",
   "icons": {
@@ -18,7 +18,8 @@
     "browsingData",
     "alarms",
     "tabGroups",
-    "clipboardRead"
+    "clipboardRead",
+    "sidePanel"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -47,12 +48,21 @@
       "32": "icons/icon-32.png"
     }
   },
+  "side_panel": {
+    "default_path": "sidebar.html"
+  },
   "commands": {
     "_execute_action": {
       "suggested_key": {
         "default": "Alt+Shift+S"
       },
       "description": "Open the Session Manager quick switcher"
+    },
+    "open-sidebar": {
+      "suggested_key": {
+        "default": "Alt+Shift+W"
+      },
+      "description": "Open the workspace side panel"
     }
   },
   "content_security_policy": {

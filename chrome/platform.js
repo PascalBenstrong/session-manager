@@ -11,6 +11,8 @@ installPlatform(api, {
       browser: 'chrome',
       tabGroups: !!(api.tabs.group && api.tabGroups),
       perHostCache: true,
+      sidebar: !!api.sidePanel,
+      extensionId: api.runtime.id || '',
     };
   },
 

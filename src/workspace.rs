@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AppState, EntryRef, Id, TabEntry};
+use crate::model::{AppState, EntryRef, Id, TabEntry, TabId};
 use crate::pattern::{CompiledPattern, SitePattern};
 use crate::search::{Query, SearchOptions};
 
@@ -64,6 +64,21 @@ impl WorkspaceColor {
             WorkspaceColor::Purple => [0xa1, 0x42, 0xf4],
             WorkspaceColor::Cyan => [0x24, 0xc1, 0xe0],
             WorkspaceColor::Orange => [0xfa, 0x90, 0x3e],
+        }
+    }
+
+    /// The color's name in the browsers' tab group API.
+    pub fn native(self) -> &'static str {
+        match self {
+            WorkspaceColor::Grey => "grey",
+            WorkspaceColor::Blue => "blue",
+            WorkspaceColor::Red => "red",
+            WorkspaceColor::Yellow => "yellow",
+            WorkspaceColor::Green => "green",
+            WorkspaceColor::Pink => "pink",
+            WorkspaceColor::Purple => "purple",
+            WorkspaceColor::Cyan => "cyan",
+            WorkspaceColor::Orange => "orange",
         }
     }
 
@@ -154,6 +169,7 @@ impl Default for Workspace {
 }
 
 impl Workspace {
+    /// Icon and name; also the title of the native tab group mirroring the workspace.
     pub fn label(&self) -> String {
         format!("{} {}", self.icon, self.name)
     }
@@ -235,6 +251,10 @@ impl AppState {
         if self.workspaces.len() == before {
             return Err("no such workspace".into());
         }
+        if self.active_workspace == Some(id) {
+            self.active_workspace = None;
+        }
+        self.pending_workspace.retain(|_, w| *w != id);
         for e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()).filter(|e| e.workspace == Some(id)) {
             e.workspace = None;
             e.workspace_manual = false;
@@ -296,9 +316,56 @@ impl AppState {
         Placer::new(&self.workspaces).place(e)
     }
 
+    /// Makes a workspace the current one (`None` = none).
+    pub fn set_active_workspace(&mut self, id: Option<Id>) -> Result<(), String> {
+        if let Some(id) = id {
+            self.workspace(id).ok_or("no such workspace")?;
+        }
+        self.active_workspace = id;
+        Ok(())
+    }
+
+    /// The workspace whose native tab group is titled `title`.
+    pub fn workspace_by_label(&self, title: &str) -> Option<Id> {
+        self.workspaces.iter().find(|w| w.label() == title).map(|w| w.id)
+    }
+
+    /// While workspaces are mirrored as native tab groups, a tab moved into a workspace's
+    /// group joins the workspace, and a tab taken out of it (in the same window) leaves it.
+    /// A new tab opened inside a group (e.g. from a link) joins it like a rule would.
+    pub(crate) fn follow_native_group(&self, e: &mut TabEntry, prev_group: Option<&str>, prev_window: Option<TabId>, is_new: bool) -> bool {
+        if !self.settings.browser_ui.tab_groups {
+            return false;
+        }
+        match e.browser_group.as_deref().and_then(|t| self.workspace_by_label(t)) {
+            Some(w) if e.workspace != Some(w) => {
+                e.workspace = Some(w);
+                e.workspace_manual = !is_new;
+                true
+            }
+            Some(_) => false,
+            None => {
+                let left = prev_group.and_then(|t| self.workspace_by_label(t));
+                // Moving a tab to another window takes it out of its group too; that
+                // doesn't mean it should leave the workspace.
+                if !is_new && left.is_some() && left == e.workspace && prev_window == e.window_id {
+                    e.workspace = None;
+                    e.workspace_manual = true;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     /// Clears references to workspaces that don't exist.
     pub(crate) fn drop_dangling_workspaces(&mut self) {
         let ids: std::collections::HashSet<Id> = self.workspaces.iter().map(|w| w.id).collect();
+        if self.active_workspace.is_some_and(|w| !ids.contains(&w)) {
+            self.active_workspace = None;
+        }
+        self.pending_workspace.retain(|_, w| ids.contains(w));
         for e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()) {
             if e.workspace.is_some_and(|w| !ids.contains(&w)) {
                 e.workspace = None;
@@ -371,6 +438,48 @@ mod tests {
         // until the rules are asked to decide again
         assert_eq!(s.auto_place(Some(&[r2]), true), 1);
         assert_eq!(s.entry(r2).unwrap().workspace, Some(work));
+    }
+
+    #[test]
+    fn native_groups_and_current_workspace() {
+        let mut s = AppState::default();
+        s.settings.browser_ui.tab_groups = true;
+        let rust = s.save_workspace(Workspace { name: "Rust".into(), icon: "💻".into(), ..Default::default() }).unwrap();
+        let news = s.save_workspace(ws("News", vec![])).unwrap();
+        let grouped = |id, title: Option<&str>| BrowserTab { group_title: title.map(Into::into), ..tab(id, "https://a.com") };
+        // a new tab opened inside the workspace's group joins it (not as a manual choice)
+        s.on_tab_upsert(&grouped(1, Some("💻 Rust")), 1.0);
+        let e = |s: &AppState| s.entry_for_tab(1).unwrap().clone();
+        assert_eq!((e(&s).workspace, e(&s).workspace_manual), (Some(rust), false));
+        // dragging it out of the group (same window) takes it out of the workspace
+        s.on_tab_upsert(&grouped(1, None), 2.0);
+        assert_eq!((e(&s).workspace, e(&s).workspace_manual), (None, true));
+        // dragging it into a group joins that workspace
+        let news_label = s.workspace(news).unwrap().label();
+        s.on_tab_upsert(&grouped(1, Some(&news_label)), 3.0);
+        assert_eq!(e(&s).workspace, Some(news));
+        // moving it to another window (which ungroups it) keeps the workspace
+        s.on_tab_upsert(&BrowserTab { window_id: 2, ..grouped(1, None) }, 4.0);
+        assert_eq!(e(&s).workspace, Some(news));
+
+        // the current workspace follows the active tab; new tabs may join it
+        s.on_tab_activated(1, 5.0);
+        assert_eq!(s.active_workspace, Some(news));
+        s.on_tab_upsert(&tab(2, "https://b.com"), 6.0);
+        assert_eq!(s.entry_for_tab(2).unwrap().workspace, None);
+        s.settings.browser_ui.new_tabs_join_active = true;
+        s.on_tab_upsert(&tab(3, "https://c.com"), 6.0);
+        assert_eq!(s.entry_for_tab(3).unwrap().workspace, Some(news));
+        // a tab opened for a workspace gets it once it shows a page
+        s.pending_workspace.insert(4, rust);
+        assert!(!s.on_tab_upsert(&tab(4, "about:newtab"), 7.0));
+        s.on_tab_upsert(&tab(4, "https://d.com"), 7.0);
+        assert_eq!(s.entry_for_tab(4).unwrap().workspace, Some(rust));
+        assert!(s.pending_workspace.is_empty());
+
+        s.delete_workspace(news).unwrap();
+        assert_eq!(s.active_workspace, None);
+        assert!(s.set_active_workspace(Some(news)).is_err());
     }
 
     #[test]

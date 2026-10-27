@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Margin, RichText, Sense, Stroke, Vec2};
 
 use super::theme::{self, CARD_RADIUS, RADIUS};
-use crate::model::{Session, TabEntry};
+use crate::model::{EntryRef, Session, TabEntry};
 use crate::pattern::{PatternKind, SitePattern};
 use crate::workspace::{Workspace, WorkspaceColor};
 
@@ -329,4 +329,36 @@ pub fn pattern_error(p: &SitePattern) -> Option<String> {
 /// Single-line text input with the app's padding.
 pub fn text_input<'a>(text: &'a mut String, hint: &str, width: f32) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(text).hint_text(hint.to_string()).desired_width(width).margin(egui::vec2(8.0, 5.0))
+}
+
+/// Drag-and-drop payload: a tab row dragged onto a workspace header.
+pub struct DraggedTab {
+    pub entry: EntryRef,
+    pub title: String,
+}
+
+/// The title of a dragged tab, following the pointer.
+pub fn drag_ghost(ui: &egui::Ui) {
+    let Some(d) = egui::DragAndDrop::payload::<DraggedTab>(ui.ctx()) else { return };
+    let Some(pos) = ui.ctx().pointer_interact_pos() else { return };
+    let p = theme::palette(ui);
+    let mut title: String = d.title.chars().take(48).collect();
+    if title.len() < d.title.len() {
+        title.push('…');
+    }
+    egui::Area::new(egui::Id::unique("drag-ghost"))
+        .fixed_pos(pos + egui::vec2(14.0, 10.0))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0, p.accent))
+                .corner_radius(8)
+                .shadow(ui.visuals().popup_shadow)
+                .inner_margin(Margin::symmetric(10, 5))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(format!("⠿ {title}")).color(p.text));
+                });
+        });
 }
