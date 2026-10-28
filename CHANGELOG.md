@@ -2,6 +2,11 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.8.1] - 2026-10-28
+
+### New
+- Open a workspace's saved tabs: ⤓ on a workspace's header (in the tab list, or in the sidebar when it shows saved tabs) opens its closed tabs listed there, and "⤓ Open its closed tabs" in the workspace's settings opens all of them in the session. They open unloaded and in the background, in their workspace, and load when you select them.
+
 ## [0.8.0] - 2026-10-28
 
 ### New
@@ -12,7 +17,6 @@ All notable changes to Session Manager. This file is compiled into the extension
 - Open any media URL (a file, an .m3u8 or an .mpd): play it in the capture window, save it, or record it while it plays.
 - Send what you captured on: save it as a file, upload it to an address of your own (PUT or POST, as the body or a form field, with your own headers such as Authorization), play it on another sound output (speakers, headset), in picture-in-picture or full screen.
 - The Capture view lists the open capture windows, with what they're doing; bring one to the front or stop it from there.
-- Open a workspace's saved tabs: ⤓ on a workspace's header (in the tab list, or in the sidebar when it shows saved tabs) opens its closed tabs listed there, and "⤓ Open its closed tabs" in the workspace's settings opens all of them in the session. They open unloaded and in the background, in their workspace, and load when you select them.
 
 ## [0.7.0] - 2026-10-27
 
