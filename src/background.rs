@@ -511,6 +511,30 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             open_entry(entry, discarded).await?;
             ok("")
         }
+        Command::OpenEntries { entries, discarded } => {
+            // Grouped by session, in the order given.
+            let mut by_session: Vec<(Id, Vec<Id>)> = Vec::new();
+            for r in &entries {
+                match by_session.iter_mut().find(|(s, _)| *s == r.session) {
+                    Some((_, ids)) => ids.push(r.entry),
+                    None => by_session.push((r.session, vec![r.entry])),
+                }
+            }
+            let (mut opened, mut errors) = (0, Vec::new());
+            for (session, ids) in by_session {
+                let (n, e) = open_entries(session, Some(&ids), discarded, false).await?;
+                opened += n;
+                errors.extend(e);
+            }
+            if opened == 0 && errors.is_empty() {
+                return ok("All these tabs are already open");
+            }
+            let mut info = format!("Opened {opened} tab(s) {}", if discarded { "unloaded" } else { "loaded" });
+            if !errors.is_empty() {
+                info.push_str(&format!("; {} failed (e.g. {})", errors.len(), errors[0]));
+            }
+            ok(info)
+        }
         Command::FocusLastTab { session } => {
             let last = with_state(|s| s.session(session).and_then(|s| s.last_accessed()).map(|e| (e.id, e.title.clone())));
             let Some((entry, title)) = last else { return Err("session has no tabs".into()) };

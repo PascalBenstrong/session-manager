@@ -28,6 +28,9 @@ pub enum Command {
     LoadSession { id: Id, discarded: bool, new_window: bool },
     /// Focus the entry's tab, or open it if closed.
     OpenEntry { entry: EntryRef, discarded: bool },
+    /// Open the closed ones of these entries in the background (`discarded`: unloaded), e.g.
+    /// a workspace's saved tabs.
+    OpenEntries { entries: Vec<EntryRef>, discarded: bool },
     /// Focus (or open) the most recently used tab of a session.
     FocusLastTab { session: Id },
     RemoveEntries { entries: Vec<EntryRef>, close_tabs: bool },

@@ -429,6 +429,13 @@ impl TabsView {
                 {
                     acts.send(Command::Hibernate { target: HibernateTarget::Entries(loaded), force: false });
                 }
+                let closed: Vec<EntryRef> = entries.iter().filter(|e| !e.is_open()).map(|e| rc.entry_ref(e)).collect();
+                if hovered
+                    && !closed.is_empty()
+                    && icon_button(ui, "⤓", &format!("Open the {} closed tab(s) listed here, unloaded, in the background", closed.len())).clicked()
+                {
+                    acts.send(Command::OpenEntries { entries: closed, discarded: true });
+                }
             });
         }
         let tip = if ws.is_some() { "Click for the workspace settings · drop tabs here" } else { "Drop tabs here to take them out of their workspace" };
@@ -549,6 +556,24 @@ impl TabsView {
                     if ui.button("🔍 Search in this workspace").clicked() {
                         self.opts.workspaces = [ws.id].into();
                         self.show_filters = true;
+                    }
+                    let closed: Vec<EntryRef> = cx
+                        .state
+                        .session(cx.viewed)
+                        .map(|s| {
+                            s.entries
+                                .iter()
+                                .filter(|e| e.workspace == Some(ws.id) && !e.is_open())
+                                .map(|e| EntryRef { session: s.id, entry: e.id })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if ui
+                        .add_enabled(!closed.is_empty(), egui::Button::new(format!("⤓ Open its closed tabs ({})", closed.len())))
+                        .on_hover_text("Open its tabs of this session that aren't open, unloaded and in the background (they load when you select them)")
+                        .clicked()
+                    {
+                        acts.send(Command::OpenEntries { entries: closed, discarded: true });
                     }
                     let tabs = cx.state.workspace_entries(ws.id);
                     let loaded = tabs.iter().filter_map(|r| cx.state.entry(*r)).filter(|e| e.is_open() && !e.discarded).count();

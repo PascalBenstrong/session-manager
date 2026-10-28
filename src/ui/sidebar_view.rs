@@ -190,6 +190,13 @@ impl SidebarView {
                 {
                     acts.send(Command::NewTabInWorkspace { workspace: Some(w.id) });
                 }
+                let closed: Vec<EntryRef> = list.iter().filter(|(_, e)| !e.is_open()).map(|(r, _)| *r).collect();
+                if hovered
+                    && !closed.is_empty()
+                    && icon_button(ui, "⤓", &format!("Open its {} saved tab(s), unloaded, in the background", closed.len())).clicked()
+                {
+                    acts.send(Command::OpenEntries { entries: closed, discarded: true });
+                }
             });
         }
         if let Some(w) = ws {

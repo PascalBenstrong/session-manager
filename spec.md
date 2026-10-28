@@ -27,6 +27,7 @@ Version: 0.8.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Clicking a workspace in the tab list expands its settings. Tabs can be dragged onto a workspace, or moved with the tab editor and the bulk actions.
 - Rules add tabs to a workspace automatically when they are opened or change (page, group or tags): when the URL matches a site pattern, when the tab is added to a group (the extension's groups or the browser's native tab groups), when it has a tag, or when it matches a search. The first workspace (in display order) with a matching rule wins. Rules never take a tab out of a workspace, and leave tabs the user placed by hand alone (until the user lets the rules decide again).
 - Allow searching in one or more workspaces, or across all workspaces.
+- Open a workspace's closed tabs (those listed under its header, or all of them in the session) unloaded and in the background; they keep their workspace.
 - Deleting a workspace keeps its tabs, without a workspace.
 
 ## Workspaces in the browser

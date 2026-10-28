@@ -442,6 +442,38 @@ await step('workspaces: rules place new tabs, group rules, manual choice, delete
   assert.ok(!bad.ok && /regex/.test(bad.error));
 });
 
+await step('a workspace’s saved tabs open unloaded, in the background, in their workspace', async () => {
+  let r = await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Reading', rules: [] } });
+  const ws = r.state.workspaces.find((w) => w.name === 'Reading');
+  const urls = ['https://read.example/1', 'https://read.example/2'];
+  const made = [];
+  for (const url of urls) made.push(await api.tabs.create({ url }));
+  await tick();
+  const refOf = (t) => {
+    const s = stored().sessions.find((x) => x.entries.some((e) => e.tab_id === t.id));
+    return { session: s.id, entry: s.entries.find((e) => e.tab_id === t.id).id };
+  };
+  const refs = made.map(refOf);
+  await send({ cmd: 'AssignWorkspace', entries: refs, workspace: ws.id });
+  // Their window closes: they stay saved, closed.
+  for (const t of made) {
+    tabs.delete(t.id);
+    ev.removed.fire(t.id, { isWindowClosing: true, windowId: 1 });
+  }
+  await tick();
+  const entries = () => stored().sessions.flatMap((x) => x.entries).filter((e) => e.workspace === ws.id);
+  assert.ok(entries().every((e) => e.tab_id == null), 'saved, closed');
+  r = await send({ cmd: 'OpenEntries', entries: refs, discarded: true });
+  assert.match(r.info, /Opened 2 tab\(s\) unloaded/);
+  const opened = [...tabs.values()].filter((t) => urls.includes(t.url));
+  assert.equal(opened.length, 2);
+  assert.ok(opened.every((t) => t.discarded && !t.active), 'unloaded and inactive');
+  assert.ok(entries().every((e) => e.tab_id != null && e.workspace === ws.id), 'linked, still in the workspace');
+  r = await send({ cmd: 'OpenEntries', entries: refs, discarded: true });
+  assert.match(r.info, /already open/);
+  assert.equal([...tabs.values()].filter((t) => urls.includes(t.url)).length, 2, 'no second copies');
+});
+
 await step('hibernate: all tabs skips active / pinned; force includes pinned', async () => {
   for (const t of tabs.values()) t.discarded = false;
   const pinned = await api.tabs.create({ url: 'https://pinned.example/', pinned: true });

@@ -106,6 +106,7 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
 **Workspaces**
 - Group tabs into workspaces, each with a name, color and icon. Workspaces are shared by all sessions. The Tabs view lists tabs under colored workspace headers, with a *No workspace* section for the rest.
 - **Click a workspace's header** to open its settings: rename it, pick an icon and color, edit its rules, search in it, hibernate its tabs, reorder it, or delete it (its tabs are kept). The ▾ arrow folds the section.
+- **Open a workspace's saved tabs:** ⤓ on a workspace header (shown on hover; in the sidebar too, with *Saved*) opens the closed tabs listed under it, and *⤓ Open its closed tabs* in its settings opens all of them in the session. They open unloaded and in the background, in their workspace, and load when you select them.
 - **Move tabs** by dragging them onto a workspace header, with *Workspace* in a tab's ✏ editor, or with *Workspace ▾* in the bulk bar for every search match.
 - **Rules** add tabs automatically when they open, navigate, or get a group or tag:
   - *Site*: domain, exact host, URL prefix, glob or regex.
