@@ -474,6 +474,16 @@ await step('a workspace’s saved tabs open unloaded, in the background, in thei
   assert.equal([...tabs.values()].filter((t) => urls.includes(t.url)).length, 2, 'no second copies');
 });
 
+await step('every save gets a newer revision (pages keep the newest state they get)', async () => {
+  const before = stored().revision;
+  assert.ok(before > 0, 'saved states have a revision');
+  const r = await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Rev', rules: [] } });
+  assert.ok(stored().revision > before, 'it goes up');
+  assert.equal(r.state.revision, stored().revision, 'replies carry the revision saved');
+  await send({ cmd: 'DeleteWorkspace', id: r.state.workspaces.find((w) => w.name === 'Rev').id });
+  assert.ok(stored().revision > r.state.revision);
+});
+
 await step('hibernate: all tabs skips active / pinned; force includes pinned', async () => {
   for (const t of tabs.values()) t.discarded = false;
   const pinned = await api.tabs.create({ url: 'https://pinned.example/', pinned: true });

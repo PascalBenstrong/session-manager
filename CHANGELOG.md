@@ -2,6 +2,11 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.8.3] - 2026-10-29
+
+### Fixed
+- Removing tabs (and other changes) could seem not to work: the tab list sometimes kept showing the tabs until you moved the mouse, or until the next change. A page could get an older copy of the tabs after a newer one and show it; it now keeps the newest.
+
 ## [0.8.2] - 2026-10-28
 
 ### New

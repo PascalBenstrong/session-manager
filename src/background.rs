@@ -30,6 +30,8 @@ const STARTUP_MAX_WAIT_MS: f64 = 30_000.0;
 
 thread_local! {
     static STATE: RefCell<AppState> = RefCell::new(AppState::default());
+    /// The last revision saved (it only goes up, also when the state is reset or replaced).
+    static REVISION: Cell<u64> = const { Cell::new(0) };
     static CAPS: RefCell<Capabilities> = RefCell::new(Capabilities::default());
     static ORGANIZE_GENERATION: Cell<u32> = const { Cell::new(0) };
     /// > 0 while we open tabs ourselves; "prevent duplicates" must not touch those.
@@ -180,7 +182,16 @@ async fn refresh_permissions() {
 }
 
 async fn persist() {
-    let json = STATE.with(|s| serde_json::to_string(&*s.borrow()));
+    let json = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let next = REVISION.with(|r| {
+            let n = r.get().max(s.revision) + 1;
+            r.set(n);
+            n
+        });
+        s.revision = next;
+        serde_json::to_string(&*s)
+    });
     match json {
         Ok(json) => {
             if let Err(e) = pf::storage_set(STATE_KEY, &json).await {

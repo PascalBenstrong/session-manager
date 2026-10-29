@@ -238,7 +238,10 @@ impl App {
                 if let Some(json) = v.as_string()
                     && let Ok(state) = serde_json::from_str::<AppState>(&json)
                 {
-                    inbox.borrow_mut().pushed_state = Some(state);
+                    let mut inbox = inbox.borrow_mut();
+                    if inbox.pushed_state.as_ref().is_none_or(|p| state.revision >= p.revision) {
+                        inbox.pushed_state = Some(state);
+                    }
                     ctx.request_repaint();
                 }
             });
@@ -372,12 +375,12 @@ impl App {
             self.set_status(text, error);
         }
         if let Some(s) = pushed {
-            self.state = Some(s);
+            self.accept_state(s);
         }
         for r in responses {
             self.pending = self.pending.saturating_sub(1);
             if let Some(s) = r.state {
-                self.state = Some(s);
+                self.accept_state(s);
             }
             if let Some(c) = r.capabilities {
                 self.caps = c;
@@ -401,6 +404,14 @@ impl App {
             && self.viewed_session.is_none_or(|id| state.session(id).is_none())
         {
             self.viewed_session = Some(state.active_session);
+        }
+    }
+
+    /// Takes a state from the background unless it's older than the one shown (replies and
+    /// storage changes can arrive out of order).
+    fn accept_state(&mut self, s: AppState) {
+        if self.state.as_ref().is_none_or(|cur| s.revision >= cur.revision) {
+            self.state = Some(s);
         }
     }
 

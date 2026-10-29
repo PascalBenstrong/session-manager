@@ -302,6 +302,9 @@ pub struct AppState {
     pub block_rules: Vec<BlockRule>,
     /// Tabs recently opened by pages (newest first, bounded).
     pub popup_log: Vec<PopupEvent>,
+    /// Goes up every time the state is saved. A page gets the state both in replies and
+    /// from storage changes, which can arrive out of order: it keeps the newest one.
+    pub revision: u64,
 }
 
 impl Default for AppState {
@@ -322,6 +325,7 @@ impl Default for AppState {
             pending_workspace: BTreeMap::new(),
             block_rules: Vec::new(),
             popup_log: Vec::new(),
+            revision: 0,
         };
         let id = s.alloc_id();
         s.sessions.push(Session { id, name: "Default".into(), ..Default::default() });
