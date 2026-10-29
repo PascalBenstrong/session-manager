@@ -209,14 +209,14 @@ impl SidebarView {
         }
         if !collapsed {
             for (r, e) in list {
-                row(ui, *r, e, Some(*r) == active_tab, e.tab_id.is_some_and(|t| playing.contains(&t)), acts);
+                row(ui, cx, *r, e, Some(*r) == active_tab, e.tab_id.is_some_and(|t| playing.contains(&t)), acts);
             }
         }
         ui.add_space(4.0);
     }
 }
 
-fn row(ui: &mut egui::Ui, r: EntryRef, e: &TabEntry, active: bool, playing: bool, acts: &mut Actions) {
+fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool, playing: bool, acts: &mut Actions) {
     let p = theme::palette(ui);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), Sense::click_and_drag());
     resp.dnd_set_drag_payload(DraggedTab { entry: r, title: e.display_title().to_string() });
@@ -244,9 +244,18 @@ fn row(ui: &mut egui::Ui, r: EntryRef, e: &TabEntry, active: bool, playing: bool
     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if hovered {
             if e.is_open() {
-                if icon_button(ui, "🗙", "Close tab").clicked() {
+                if icon_button(ui, "🗙", "Close the tab (it's removed from the session and its workspace)").clicked() {
                     acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: true });
                 }
+            } else if icon_button(ui, "🗑", "Delete this saved tab (from the session and its workspace)").clicked() {
+                acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: false });
+            }
+            if let Some(ws) = e.workspace.and_then(|id| cx.state.workspace(id))
+                && icon_button(ui, "◌", &format!("Take it out of {}", ws.name)).clicked()
+            {
+                acts.send(Command::AssignWorkspace { entries: vec![r], workspace: None });
+            }
+            if e.is_open() {
                 if !e.discarded && !active && icon_button(ui, "💤", "Hibernate this tab").clicked() {
                     acts.send(Command::Hibernate { target: HibernateTarget::Entries(vec![r]), force: true });
                 }
@@ -269,8 +278,65 @@ fn row(ui: &mut egui::Ui, r: EntryRef, e: &TabEntry, active: bool, playing: bool
     } else {
         ""
     };
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(format!("{}{state}\n{}", e.display_title(), e.url));
+    let resp = resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(format!("{}{state}\n{}\n\nRight-click for more", e.display_title(), e.url));
     if resp.clicked() {
         acts.send(Command::OpenEntry { entry: r, discarded: false });
+    }
+    resp.context_menu(|ui| row_menu(ui, cx, r, e, active, acts));
+}
+
+/// A tab's right-click menu: open, move between workspaces, hibernate, close or delete.
+fn row_menu(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool, acts: &mut Actions) {
+    ui.set_min_width(220.0);
+    if e.is_open() {
+        if ui.button("Switch to it").clicked() {
+            acts.send(Command::OpenEntry { entry: r, discarded: false });
+            ui.close();
+        }
+    } else {
+        if ui.button("Open").clicked() {
+            acts.send(Command::OpenEntry { entry: r, discarded: false });
+            ui.close();
+        }
+        if ui.button("⤓ Open in background, unloaded").clicked() {
+            acts.send(Command::OpenEntry { entry: r, discarded: true });
+            ui.close();
+        }
+    }
+    ui.menu_button("Move to workspace", |ui| {
+        ui.set_min_width(180.0);
+        for w in &cx.state.workspaces {
+            let text = RichText::new(w.label()).color(ws_color(w.color));
+            if ui.add_enabled(e.workspace != Some(w.id), egui::Button::new(text)).clicked() {
+                acts.send(Command::AssignWorkspace { entries: vec![r], workspace: Some(w.id) });
+                ui.close();
+            }
+        }
+    });
+    if let Some(ws) = e.workspace.and_then(|id| cx.state.workspace(id))
+        && ui.button(format!("◌ Take out of {}", ws.name)).clicked()
+    {
+        acts.send(Command::AssignWorkspace { entries: vec![r], workspace: None });
+        ui.close();
+    }
+    if e.is_open() && !e.discarded && !active && ui.button("💤 Hibernate").clicked() {
+        acts.send(Command::Hibernate { target: HibernateTarget::Entries(vec![r]), force: true });
+        ui.close();
+    }
+    ui.separator();
+    if e.is_open() {
+        if ui.button("Stop tracking (keep the tab open)").on_hover_text("Remove it from the session and its workspace; the tab stays").clicked() {
+            acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: false });
+            ui.close();
+        }
+        if ui.button(RichText::new("🗙 Close and remove").color(theme::palette(ui).danger)).clicked() {
+            acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: true });
+            ui.close();
+        }
+    } else if ui.button(RichText::new("🗑 Delete saved tab").color(theme::palette(ui).danger)).clicked() {
+        acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: false });
+        ui.close();
     }
 }

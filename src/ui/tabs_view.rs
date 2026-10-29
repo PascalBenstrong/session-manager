@@ -1,7 +1,7 @@
 //! Tabs view: search, tabs listed by workspace (or another key), per-tab and bulk
 //! actions, workspace settings and hibernation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Margin, RichText, Sense, Stroke, UiBuilder};
 
@@ -141,6 +141,13 @@ pub struct TabsView {
     new_ws: Option<String>,
     /// Open the settings of the next workspace created (the count before creating it).
     open_created: Option<usize>,
+    /// Selected tabs (checkboxes, Ctrl-click, Shift-click, Ctrl+A): the selection bar acts on them.
+    selection: BTreeSet<EntryRef>,
+    /// Where a Shift-click range starts.
+    anchor: Option<EntryRef>,
+    /// The rows in the order drawn (this frame, and the last one for Shift-click ranges).
+    order: Vec<EntryRef>,
+    prev_order: Vec<EntryRef>,
 }
 
 impl TabsView {
@@ -184,52 +191,94 @@ impl TabsView {
         let rc = RowCtx { owner: &owner, session_names: &session_names, playing: &playing };
         let refs = rc.refs(&matched);
 
+        // Only tabs that are listed stay selected.
+        self.prev_order = std::mem::take(&mut self.order);
+        let listed: HashSet<EntryRef> = refs.iter().copied().collect();
+        self.selection.retain(|r| listed.contains(r));
+        if !ui.ctx().egui_wants_keyboard_input() {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.selection.clear();
+            }
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                self.selection.extend(refs.iter().copied());
+            }
+        }
+
         self.search_bar(ui, cx, &rc, &matched, total, query_error.as_deref(), acts);
         let filtering = !self.query.trim().is_empty() || !self.opts.groups.is_empty() || !self.opts.workspaces.is_empty();
-        if filtering && !matched.is_empty() && query_error.is_none() {
-            self.bulk_bar(ui, cx, &refs, &matched, acts);
+        // (While tabs are selected, their bar floats over the bottom of the list instead.)
+        if self.selection.is_empty() && filtering && !matched.is_empty() && query_error.is_none() {
+            self.bulk_bar(ui, cx, &refs, &matched, &refs, false, acts);
         }
         if self.new_ws.is_some() {
             self.new_workspace_form(ui, cx, acts);
         }
         ui.add_space(6.0);
 
-        let grouping = state.settings.tab_list.grouping;
+        let view = ui.max_rect();
+        let selecting = !self.selection.is_empty();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if grouping == TabGrouping::Workspace {
-                self.by_workspace(ui, cx, &rc, &matched, filtering, total, acts);
-                return;
-            }
-            if matched.is_empty() {
-                no_tabs(ui, total);
-                return;
-            }
-            match grouping.organize_key() {
-                None => {
-                    for e in &matched {
-                        self.row(ui, cx, &rc, e, acts);
-                    }
-                }
-                Some(key) => {
-                    for (k, entries) in group_entries(key, matched.iter().copied()) {
-                        let name = k.as_deref().unwrap_or("Ungrouped");
-                        let id = ui.make_persistent_id(("group", key.label(), k.clone()));
-                        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
-                            .show_header(ui, |ui| {
-                                ui.label(RichText::new(name).strong());
-                                badge(ui, &entries.len().to_string(), false);
-                            })
-                            .body_unindented(|ui| {
-                                for e in entries {
-                                    self.row(ui, cx, &rc, e, acts);
-                                }
-                            });
-                        ui.add_space(4.0);
-                    }
-                }
+            self.list(ui, cx, &rc, &matched, filtering, total, acts);
+            if selecting {
+                // Room to scroll the last rows above the selection bar.
+                ui.add_space(110.0);
             }
         });
+        if selecting {
+            let (sel_entries, sel_refs): (Vec<&TabEntry>, Vec<EntryRef>) =
+                matched.iter().zip(&refs).filter(|(_, r)| self.selection.contains(r)).map(|(e, r)| (*e, *r)).unzip();
+            let p = theme::palette(ui);
+            // Floats over the bottom of the list, so selecting doesn't move the rows.
+            egui::Area::new(egui::Id::unique("tabs-selection-bar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(view.center_bottom() - egui::vec2(0.0, 12.0))
+                .pivot(egui::Align2::CENTER_BOTTOM)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new().fill(p.surface).corner_radius(12).shadow(ui.visuals().popup_shadow).show(ui, |ui| {
+                        ui.set_max_width((view.width() - 24.0).max(200.0));
+                        self.bulk_bar(ui, cx, &sel_refs, &sel_entries, &refs, true, acts);
+                    });
+                });
+        }
         drag_ghost(ui);
+    }
+
+    /// The tabs, by workspace or by another key.
+    #[allow(clippy::too_many_arguments)]
+    fn list(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, rc: &RowCtx, matched: &[&TabEntry], filtering: bool, total: usize, acts: &mut Actions) {
+        let grouping = cx.state.settings.tab_list.grouping;
+        if grouping == TabGrouping::Workspace {
+            self.by_workspace(ui, cx, rc, matched, filtering, total, acts);
+            return;
+        }
+        if matched.is_empty() {
+            no_tabs(ui, total);
+            return;
+        }
+        match grouping.organize_key() {
+            None => {
+                for e in matched {
+                    self.row(ui, cx, rc, e, acts);
+                }
+            }
+            Some(key) => {
+                for (k, entries) in group_entries(key, matched.iter().copied()) {
+                    let name = k.as_deref().unwrap_or("Ungrouped");
+                    let id = ui.make_persistent_id(("group", key.label(), k.clone()));
+                    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                        .show_header(ui, |ui| {
+                            ui.label(RichText::new(name).strong());
+                            badge(ui, &entries.len().to_string(), false);
+                        })
+                        .body_unindented(|ui| {
+                            for e in entries {
+                                self.row(ui, cx, rc, e, acts);
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ workspaces
@@ -357,7 +406,9 @@ impl TabsView {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), HEADER_HEIGHT), Sense::click());
         let drop_hover = resp.dnd_hover_payload::<DraggedTab>().is_some();
         if let Some(d) = resp.dnd_release_payload::<DraggedTab>() {
-            acts.send(Command::AssignWorkspace { entries: vec![d.entry], workspace: ws.map(|w| w.id) });
+            // A selected tab brings the rest of the selection along.
+            let entries = if self.selection.contains(&d.entry) { self.selection.iter().copied().collect() } else { vec![d.entry] };
+            acts.send(Command::AssignWorkspace { entries, workspace: ws.map(|w| w.id) });
         }
         let mut toggle = false;
         if ui.is_rect_visible(rect) {
@@ -428,6 +479,20 @@ impl TabsView {
                     && icon_button(ui, "💤", &format!("Hibernate the {} loaded tab(s) listed here", loaded.len())).clicked()
                 {
                     acts.send(Command::Hibernate { target: HibernateTarget::Entries(loaded), force: false });
+                }
+                let all: Vec<EntryRef> = rc.refs(entries);
+                if hovered && !all.is_empty() {
+                    let every = all.iter().all(|r| self.selection.contains(r));
+                    let (icon, tip) = if every { ("☐", "Unselect its tabs") } else { ("☑", "Select its tabs") };
+                    if icon_button(ui, icon, tip).clicked() {
+                        for r in &all {
+                            if every {
+                                self.selection.remove(r);
+                            } else {
+                                self.selection.insert(*r);
+                            }
+                        }
+                    }
                 }
                 let closed: Vec<EntryRef> = entries.iter().filter(|e| !e.is_open()).map(|e| rc.entry_ref(e)).collect();
                 if hovered
@@ -987,9 +1052,22 @@ impl TabsView {
         .on_hover_text("Only search in these groups");
     }
 
-    fn bulk_bar(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, refs: &[EntryRef], matched: &[&TabEntry], acts: &mut Actions) {
+    /// Actions on several tabs: the selected ones (`selected`), or those matching the search.
+    /// `listed` is every tab listed (for "Select all").
+    #[allow(clippy::too_many_arguments)]
+    fn bulk_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &ViewCtx,
+        refs: &[EntryRef],
+        matched: &[&TabEntry],
+        listed: &[EntryRef],
+        selected: bool,
+        acts: &mut Actions,
+    ) {
         let p = theme::palette(ui);
         let n = refs.len();
+        let these = if selected { "selected" } else { "matching" };
         ui.add_space(4.0);
         egui::Frame::new()
             .fill(p.accent_soft())
@@ -998,7 +1076,17 @@ impl TabsView {
             .inner_margin(Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("{n} matching")).color(p.accent_hover).strong());
+                    ui.label(RichText::new(format!("{n} {these}")).color(p.accent_hover).strong());
+                    if selected {
+                        if n < listed.len() && ui.button(format!("Select all {}", listed.len())).on_hover_text("Ctrl+A").clicked() {
+                            self.selection.extend(listed.iter().copied());
+                        }
+                        if ui.button("✕ Clear").on_hover_text("Clear the selection (Esc)").clicked() {
+                            self.selection.clear();
+                        }
+                    } else if ui.button("☑ Select them").on_hover_text("Select the matching tabs, to pick some out or act on them").clicked() {
+                        self.selection.extend(refs.iter().copied());
+                    }
                     ui.add(text_input(&mut self.bulk_tag, "tag", 90.0));
                     let tag_ok = !self.bulk_tag.trim().is_empty();
                     if ui.add_enabled(tag_ok, egui::Button::new("+ Tag")).clicked() {
@@ -1020,13 +1108,28 @@ impl TabsView {
                         workspace_menu(ui, cx, refs, acts);
                     })
                     .response
-                    .on_hover_text("Move the matching tabs to a workspace");
+                    .on_hover_text(format!("Move the {these} tabs to a workspace"));
+                    let in_ws: Vec<EntryRef> = matched.iter().zip(refs).filter(|(e, _)| e.workspace.is_some()).map(|(_, r)| *r).collect();
+                    if !in_ws.is_empty()
+                        && ui
+                            .button(format!("◌ Out of workspace ({})", in_ws.len()))
+                            .on_hover_text("Take them out of their workspace (they stay open)")
+                            .clicked()
+                    {
+                        acts.send(Command::AssignWorkspace { entries: in_ws, workspace: None });
+                    }
+                    let closed: Vec<EntryRef> = matched.iter().zip(refs).filter(|(e, _)| !e.is_open()).map(|(_, r)| *r).collect();
+                    if !closed.is_empty()
+                        && ui.button(format!("⤓ Open {}", closed.len())).on_hover_text("Open the closed ones, unloaded and in the background").clicked()
+                    {
+                        acts.send(Command::OpenEntries { entries: closed, discarded: true });
+                    }
                     // `refs` and `matched` are parallel.
                     let loaded: Vec<EntryRef> =
                         matched.iter().zip(refs).filter(|(e, _)| e.is_open() && !e.discarded).map(|(_, r)| *r).collect();
                     if ui
                         .add_enabled(!loaded.is_empty(), egui::Button::new(format!("💤 Hibernate {}", loaded.len())))
-                        .on_hover_text("Unload the matching open tabs (active, pinned and playing tabs are skipped)")
+                        .on_hover_text(format!("Unload the {these} open tabs (active, pinned and playing tabs are skipped)"))
                         .clicked()
                     {
                         acts.send(Command::Hibernate { target: HibernateTarget::Entries(loaded), force: false });
@@ -1056,7 +1159,7 @@ impl TabsView {
                         let open = matched.iter().filter(|e| e.is_open()).count();
                         if ui.add_enabled(open > 0, danger_button(ui, format!("Close {open} open tab(s)…"))).clicked() {
                             acts.confirm(
-                                format!("Close {open} open tab(s) and remove all {n} matching tab(s) from the session?"),
+                                format!("Close {open} open tab(s) and remove all {n} {these} tab(s) from the session?"),
                                 Command::RemoveEntries { entries: refs.to_vec(), close_tabs: true },
                             );
                             ui.close();
@@ -1079,7 +1182,10 @@ impl TabsView {
         // The whole row is the click (and drag) target; its contents are drawn on top
         // and only the small action buttons take clicks themselves.
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click_and_drag());
-        resp.dnd_set_drag_payload(DraggedTab { entry: r, title: e.display_title().to_string() });
+        let selected = self.selection.contains(&r);
+        let title = if selected && self.selection.len() > 1 { format!("{} tabs", self.selection.len()) } else { e.display_title().to_string() };
+        resp.dnd_set_drag_payload(DraggedTab { entry: r, title });
+        self.order.push(r);
         if !ui.is_rect_visible(rect) {
             if editing {
                 self.editor(ui, cx, e, r, acts);
@@ -1088,13 +1194,35 @@ impl TabsView {
         }
         let hovered = ui.rect_contains_pointer(rect) && !egui::DragAndDrop::has_any_payload(ui.ctx());
         let dragged = resp.dragged();
-        let fill = if hovered || dragged { p.surface_hover } else { p.surface };
-        let stroke = if editing { Stroke::new(1.0, p.accent) } else { Stroke::new(1.0, Color32::TRANSPARENT) };
+        let fill = if selected {
+            p.accent_soft()
+        } else if hovered || dragged {
+            p.surface_hover
+        } else {
+            p.surface
+        };
+        let stroke = if editing {
+            Stroke::new(1.0, p.accent)
+        } else if selected {
+            Stroke::new(1.0, p.accent.gamma_multiply(0.5))
+        } else {
+            Stroke::new(1.0, Color32::TRANSPARENT)
+        };
         ui.painter().rect(rect, if look.compact { 8.0 } else { 10.0 }, fill, stroke, egui::StrokeKind::Inside);
 
         let mut row = ui.new_child(
             UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 0.0))).layout(Layout::left_to_right(Align::Center)),
         );
+        // The checkbox shows while selecting, or on the row under the pointer.
+        if hovered || !self.selection.is_empty() {
+            let mut checked = selected;
+            if row.checkbox(&mut checked, "").on_hover_text("Select (or Ctrl-click the row; Shift-click for a range)").clicked() {
+                let shift = row.input(|i| i.modifiers.shift);
+                self.click_select(r, shift);
+            }
+        } else {
+            row.add_space(row.spacing().icon_width + row.spacing().item_spacing.x);
+        }
         let host = e.host();
         let playing = e.tab_id.is_some_and(|t| rc.playing.contains(&t));
         let paused = e.tab_id.is_some_and(|t| cx.state.media.paused.contains(&t));
@@ -1105,6 +1233,11 @@ impl TabsView {
             if hovered || editing {
                 if icon_button(ui, "🗑", "Remove from session (the tab stays open)").clicked() {
                     acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: false });
+                }
+                if let Some(ws) = e.workspace.and_then(|id| cx.state.workspace(id))
+                    && icon_button(ui, "◌", &format!("Take it out of {} (it stays open)", ws.name)).clicked()
+                {
+                    acts.send(Command::AssignWorkspace { entries: vec![r], workspace: None });
                 }
                 if open {
                     if icon_button(ui, "🗙", "Close tab (also removes it from the session)").clicked() {
@@ -1188,14 +1321,34 @@ impl TabsView {
         };
         let resp = resp
             .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(format!("{}\n\nClick to {action} · drag onto a workspace to move it", e.url));
+            .on_hover_text(format!("{}\n\nClick to {action} · Ctrl-click to select · drag onto a workspace to move it", e.url));
         if resp.clicked() {
-            acts.send(Command::OpenEntry { entry: r, discarded: false });
+            let mods = ui.input(|i| i.modifiers);
+            if mods.command || mods.shift {
+                self.click_select(r, mods.shift);
+            } else {
+                acts.send(Command::OpenEntry { entry: r, discarded: false });
+            }
         }
 
         if editing {
             self.editor(ui, cx, e, r, acts);
         }
+    }
+
+    /// Toggles a row's selection, or (`range`) selects the rows from the last one clicked to it.
+    fn click_select(&mut self, r: EntryRef, range: bool) {
+        let pos = |x: EntryRef| self.prev_order.iter().position(|o| *o == x);
+        if range
+            && let Some(a) = self.anchor
+            && let (Some(i), Some(j)) = (pos(a), pos(r))
+        {
+            let span: Vec<EntryRef> = self.prev_order[i.min(j)..=i.max(j)].to_vec();
+            self.selection.extend(span);
+        } else if !self.selection.remove(&r) {
+            self.selection.insert(r);
+        }
+        self.anchor = Some(r);
     }
 
     fn editor(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, e: &TabEntry, r: EntryRef, acts: &mut Actions) {

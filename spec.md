@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.8.1. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.8.2. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -33,6 +33,7 @@ Version: 0.8.1. Release notes: [CHANGELOG.md](CHANGELOG.md).
 ## Workspaces in the browser
 - Optionally mirror workspaces as native tab groups (title = icon and name, the workspace's color), in every window. Moving a tab into a workspace's group (in the same window) puts it in that workspace; moving it out takes it out. Tabs without a workspace keep their own groups. Optionally collapse the groups of workspaces other than the active tab's.
 - One workspace is current: the workspace of the tab last used, or the one switched to. Switching goes to the workspace's most recently used tab. New tabs can join the current workspace.
+- The sidebar's tabs can be taken out of their workspace, moved to another, closed, or (saved ones) deleted, from buttons and a right-click menu.
 - A browser sidebar (Firefox) / side panel (Chrome) lists the window's tabs by workspace, with a workspace switcher, new tabs per workspace, drag and drop between workspaces, and optionally the active session's saved tabs.
 - Firefox: optionally hide the tabs of other workspaces than the current one (tabs without a workspace and pinned tabs always show), using the optional `tabHide` permission, which is requested when the option is turned on. Optionally show the current workspace in the window title.
 - Firefox: a guide in Settings explains how to hide Firefox's horizontal tab bar with `userChrome.css`: the `about:config` preference to change (`toolkit.legacyUserProfileCustomizations.stylesheets` = `true`), where the file goes, and the stylesheet (copy or download). It opens the pages it mentions where Firefox allows that, and copies their address otherwise.
@@ -86,6 +87,7 @@ Version: 0.8.1. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Match by text appearing (contains), exact match, prefix, suffix, glob and regular expression, with optional case sensitivity.
 - Optionally search only in certain groups, or across all sessions.
 - Support negation and state filters: open, unloaded, hibernated, playing media, pinned, grouped, ungrouped, tagged, duplicate, and not used for a given time.
+- Allow selecting several tabs (checkboxes, Ctrl-click, Shift-click ranges, select all, a workspace's tabs) and acting on them: workspace (move in or out), open unloaded, hibernate, tag, group, move to a session, remove from the session, close.
 - Allow adding all tabs that match a search to a group, custom tag or workspace (and untagging, moving, hibernating, removing or closing them).
 
 ## Organizing

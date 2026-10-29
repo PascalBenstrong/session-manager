@@ -2,6 +2,13 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.8.2] - 2026-10-28
+
+### New
+- Select several tabs in the Tabs view: tick their boxes, Ctrl-click them, Shift-click for a range, Ctrl+A for all listed (Esc clears), or ☑ on a workspace's header for its tabs. A bar at the bottom acts on them: move them to a workspace or out of theirs, open the closed ones unloaded, hibernate, tag, group, move to another session, stop tracking, or close them. Dragging a selected tab onto a workspace moves them all.
+- Sidebar: ◌ takes a tab out of its workspace, 🗙 closes a tab and 🗑 deletes a saved one (both also take it out of the session and its workspace). Right-click a tab for all of these, and to move it to another workspace.
+- Tabs view: ◌ on a tab takes it out of its workspace.
+
 ## [0.8.1] - 2026-10-28
 
 ### New
