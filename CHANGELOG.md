@@ -2,6 +2,13 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.8.4] - 2026-11-01
+
+### New
+- Be in no workspace: "◌ No workspace" in the sidebar's switcher (it replaces "All"), or ⇄ on the "No workspace" header in the Tabs view. It goes to your most recently used tab outside workspaces, and new tabs stay out of workspaces.
+- The sidebar lists only the current workspace's tabs (in no workspace, the tabs outside workspaces); a search still looks through every workspace.
+- Sidebar: drop a tab on a workspace in the switcher to move it there, or on "◌ No workspace" to take it out of its workspace.
+
 ## [0.8.3] - 2026-10-29
 
 ### Fixed
