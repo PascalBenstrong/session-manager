@@ -662,27 +662,28 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
         Command::SetActiveWorkspace { id } => {
             with_state(|s| s.set_active_workspace(id))?;
             persist().await;
-            let Some(id) = id else {
+            if id.is_none() {
                 show_workspace_tabs().await;
-                return ok("Showing all workspaces");
-            };
-            // Go to the workspace's most recently used open tab.
+            }
+            // Go to the workspace's most recently used open tab (with none, to the most
+            // recently used tab outside workspaces).
             let (name, target) = with_state(|s| {
                 let target = s
                     .sessions
                     .iter()
                     .flat_map(|x| &x.entries)
-                    .filter(|e| e.workspace == Some(id) && e.tab_id.is_some())
+                    .filter(|e| e.tab_id.is_some() && e.workspace.and_then(|w| s.workspace(w)).map(|w| w.id) == id)
                     .max_by(|a, b| a.last_accessed.total_cmp(&b.last_accessed))
                     .and_then(|e| e.tab_id);
-                (s.workspace(id).map(|w| w.label()).unwrap_or_default(), target)
+                let name = id.and_then(|id| s.workspace(id)).map(|w| w.label());
+                (name, target)
             });
             if let Some(tab) = target
                 && let Err(e) = pf::focus_tab(tab).await
             {
                 log(&format!("could not switch to tab {tab}: {e}"));
             }
-            ok(format!("Switched to {name}"))
+            ok(name.map_or("No current workspace".to_string(), |n| format!("Switched to {n}")))
         }
         Command::SaveBlockRule { rule } => {
             let new = rule.id == 0;

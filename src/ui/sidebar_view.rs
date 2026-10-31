@@ -26,7 +26,8 @@ pub struct SidebarView {
 }
 
 impl SidebarView {
-    /// "All" plus one pill per workspace; the current one is highlighted.
+    /// "No workspace" plus one pill per workspace; the current one is highlighted. Tabs
+    /// dropped on a pill move to that workspace (or out of workspaces).
     pub fn switcher(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         if cx.state.workspaces.is_empty() {
             return;
@@ -37,24 +38,18 @@ impl SidebarView {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             let (fg, fill) = if current.is_none() { (p.on_accent, p.accent) } else { (p.muted, p.surface_hover) };
-            if pill(ui, "All", fg, fill, Sense::click())
+            let resp = pill(ui, "◌ No workspace", fg, fill, Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text("No current workspace: show every tab")
-                .clicked()
-            {
-                acts.send(Command::SetActiveWorkspace { id: None });
-            }
+                .on_hover_text("Be in no workspace: list the tabs outside workspaces · drop tabs here to take them out");
+            pill_actions(ui, &resp, None, acts);
             for w in &cx.state.workspaces {
                 let color = ws_color(w.color);
                 let on = current == Some(w.id);
                 let (fg, fill) = if on { (Color32::WHITE, color.gamma_multiply(0.85)) } else { (color, color.gamma_multiply(0.16)) };
-                if pill(ui, &w.label(), fg, fill, Sense::click())
+                let resp = pill(ui, &w.label(), fg, fill, Sense::click())
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text(format!("Switch to {}", w.name))
-                    .clicked()
-                {
-                    acts.send(Command::SetActiveWorkspace { id: Some(w.id) });
-                }
+                    .on_hover_text(format!("Switch to {} · drop tabs here to move them", w.name));
+                pill_actions(ui, &resp, Some(w.id), acts);
             }
         });
     }
@@ -113,24 +108,41 @@ impl SidebarView {
             .map(|(r, _)| *r);
         let filtering = !self.query.trim().is_empty();
 
+        // Only the current workspace is listed (with none current, the tabs outside
+        // workspaces); a search looks through every workspace.
+        let current = state.active_workspace.and_then(|id| state.workspace(id)).map(|w| w.id);
         ui.add_space(6.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let known: HashSet<Id> = state.workspaces.iter().map(|w| w.id).collect();
+            let mut shown = 0;
             for w in &state.workspaces {
+                if !filtering && current != Some(w.id) {
+                    continue;
+                }
                 let list: Vec<_> = entries.iter().filter(|(_, e)| e.workspace == Some(w.id)).collect();
                 if filtering && list.is_empty() {
                     continue;
                 }
+                shown += list.len();
                 self.section(ui, cx, Some(w), &list, active_tab, &playing, acts);
             }
             let rest: Vec<_> = entries.iter().filter(|(_, e)| e.workspace.is_none_or(|w| !known.contains(&w))).collect();
-            if !rest.is_empty() {
+            if if filtering { !rest.is_empty() } else { current.is_none() } {
+                shown += rest.len();
                 self.section(ui, cx, None, &rest, active_tab, &playing, acts);
             }
-            if entries.is_empty() {
+            if shown == 0 {
                 ui.add_space(20.0);
                 ui.vertical_centered(|ui| {
-                    let text = if filtering { "No tabs match" } else { "No tabs in this window" };
+                    let text = if filtering {
+                        "No tabs match"
+                    } else if entries.is_empty() {
+                        "No tabs in this window"
+                    } else if current.is_some() {
+                        "No tabs of this workspace in this window"
+                    } else {
+                        "No tabs outside workspaces in this window"
+                    };
                     ui.label(RichText::new(text).color(p.muted));
                 });
             }
@@ -154,7 +166,7 @@ impl SidebarView {
         let cid = ui.make_persistent_id(("side-collapsed", id));
         let mut collapsed = ui.data(|d| d.get_temp::<bool>(cid)).unwrap_or(false);
         let color = ws.map_or(p.muted, |w| ws_color(w.color));
-        let current = ws.is_some_and(|w| cx.state.active_workspace == Some(w.id));
+        let current = cx.state.active_workspace == ws.map(|w| w.id);
 
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), HEADER_HEIGHT), Sense::click());
         let drop_hover = resp.dnd_hover_payload::<DraggedTab>().is_some();
@@ -199,12 +211,12 @@ impl SidebarView {
                 }
             });
         }
-        if let Some(w) = ws {
-            let resp = resp
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text(format!("Switch to {} · drop tabs here to move them", w.name));
-            if resp.clicked() {
-                acts.send(Command::SetActiveWorkspace { id: Some(w.id) });
+        if !current {
+            let tip = ws.map_or("Be in no workspace · drop tabs here to take them out".to_string(), |w| {
+                format!("Switch to {} · drop tabs here to move them", w.name)
+            });
+            if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                acts.send(Command::SetActiveWorkspace { id: ws.map(|w| w.id) });
             }
         }
         if !collapsed {
@@ -213,6 +225,18 @@ impl SidebarView {
             }
         }
         ui.add_space(4.0);
+    }
+}
+
+/// A switcher pill: click to switch to its workspace, drop tabs on it to move them there.
+fn pill_actions(ui: &egui::Ui, resp: &egui::Response, ws: Option<Id>, acts: &mut Actions) {
+    if resp.dnd_hover_payload::<DraggedTab>().is_some() {
+        ui.painter().rect_stroke(resp.rect, 8.0, Stroke::new(1.5, theme::palette(ui).accent), egui::StrokeKind::Outside);
+    }
+    if let Some(d) = resp.dnd_release_payload::<DraggedTab>() {
+        acts.send(Command::AssignWorkspace { entries: vec![d.entry], workspace: ws });
+    } else if resp.clicked() {
+        acts.send(Command::SetActiveWorkspace { id: ws });
     }
 }
 

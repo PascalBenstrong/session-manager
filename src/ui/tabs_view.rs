@@ -447,10 +447,14 @@ impl TabsView {
             }
             row.label(RichText::new(meta).small().color(p.muted));
 
-            let current = ws.is_some_and(|w| cx.state.active_workspace == Some(w.id));
+            let current = cx.state.active_workspace == ws.map(|w| w.id);
             if current {
-                row.label(RichText::new("● current").small().color(color))
-                    .on_hover_text("The workspace you're in: new tabs can join it, and the browser shows it");
+                let tip = if ws.is_some() {
+                    "The workspace you're in: new tabs can join it, and the browser shows it"
+                } else {
+                    "You're in no workspace: new tabs stay out of workspaces"
+                };
+                row.label(RichText::new("● current").small().color(color)).on_hover_text(tip);
             }
             row.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(w) = ws {
@@ -467,12 +471,9 @@ impl TabsView {
                 }
                 let loaded: Vec<EntryRef> =
                     entries.iter().filter(|e| e.is_open() && !e.discarded).map(|e| rc.entry_ref(e)).collect();
-                if let Some(w) = ws
-                    && hovered
-                    && !current
-                    && icon_button(ui, "⇄", &format!("Switch to {}", w.name)).clicked()
-                {
-                    acts.send(Command::SetActiveWorkspace { id: Some(w.id) });
+                let switch_tip = ws.map_or("Leave the current workspace (no workspace)".to_string(), |w| format!("Switch to {}", w.name));
+                if hovered && !current && icon_button(ui, "⇄", &switch_tip).clicked() {
+                    acts.send(Command::SetActiveWorkspace { id: ws.map(|w| w.id) });
                 }
                 if hovered
                     && !loaded.is_empty()

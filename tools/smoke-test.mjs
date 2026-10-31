@@ -626,7 +626,14 @@ if (browserName === 'firefox') {
     assert.ok(!tabs.get(homeTab.id).hidden && tabs.get(homeTab.id).active);
     assert.ok(tabs.get(rulesTab.id).hidden);
     assert.equal(titlePrefaces[1], '🏠 Home — ');
-    // "All" shows everything; turning hiding off too.
+    // No workspace shows everything and goes to the tab outside workspaces; turning hiding off too.
+    await send({ cmd: 'SetActiveWorkspace', id: null });
+    await settle();
+    assert.equal(stored().active_workspace, null);
+    assert.ok([...tabs.values()].every((t) => !t.hidden), 'no workspace: every tab shows');
+    const activeTab = [...tabs.values()].find((t) => t.active && t.windowId === tabs.get(loose.id).windowId);
+    assert.equal(entryOf(activeTab.id)?.workspace, null, 'it goes to a tab outside workspaces');
+    assert.equal(titlePrefaces[1], '');
     await send({ cmd: 'SetActiveWorkspace', id: rules.id });
     await settle();
     await browserUi({ hide_inactive: false, show_in_title: false });
