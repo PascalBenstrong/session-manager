@@ -237,6 +237,14 @@ fn row(
                 if !e.discarded && icon_button(ui, "💤", "Hibernate (unload) this tab").clicked() {
                     acts.send(Command::Hibernate { target: HibernateTarget::Entries(vec![r]), force: true });
                 }
+                let media = &cx.state.media;
+                let stopped = media.stopped.contains(&tab_id);
+                if stopped || media.playing.iter().any(|p| p.tab_id == tab_id) {
+                    let (icon, tip) = if stopped { ("▶", "Resume the stream") } else { ("⏸", "Stop the stream: pause it and download nothing until you resume it") };
+                    if icon_button(ui, icon, tip).clicked() {
+                        acts.send(Command::StopStream { tab: tab_id, stop: !stopped });
+                    }
+                }
                 if icon_button(ui, "🧹", "Clear this site's cookies & data").clicked() {
                     clean(acts, Some(tab_id), &host, DataTypes::default(), reload_after_clean);
                 }

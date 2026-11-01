@@ -34,6 +34,8 @@ pub enum Command {
     /// Focus (or open) the most recently used tab of a session.
     FocusLastTab { session: Id },
     RemoveEntries { entries: Vec<EntryRef>, close_tabs: bool },
+    /// Close the entries' tabs, keeping them as saved tabs in their session and workspace.
+    CloseEntries { entries: Vec<EntryRef> },
     TagEntries { entries: Vec<EntryRef>, tag: String, add: bool },
     SetGroup { entries: Vec<EntryRef>, group: Option<String> },
     MoveEntries { entries: Vec<EntryRef>, target: Id },
@@ -76,6 +78,10 @@ pub enum Command {
     AutoPlaceEntries { entries: Option<Vec<EntryRef>> },
     /// Unload tabs to free memory. `force` includes pinned tabs and tabs playing media.
     Hibernate { target: HibernateTarget, force: bool },
+    /// Stop a tab's streams (pause them and hold back their media data), or resume them.
+    StopStream { tab: TabId, stop: bool },
+    /// Stop the streams playing in tabs that aren't the active tab of their window.
+    StopBackgroundStreams,
     /// Switch to a workspace (`None`: no current workspace, show every tab): focus its
     /// most recently used tab and, if enabled, hide the other workspaces' tabs.
     SetActiveWorkspace { id: Option<Id> },

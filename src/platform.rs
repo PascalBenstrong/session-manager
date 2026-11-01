@@ -40,6 +40,12 @@ extern "C" {
     fn js_discard_tabs(ids: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = mediaCommand)]
     fn js_media_command(tab_id: f64, cmd: &str, audio: bool) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = streamCommand)]
+    fn js_stream_command(tab_id: f64, cmd: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = setStreamHolds)]
+    fn js_set_stream_holds(tab_ids: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = setStreamConfig)]
+    fn js_set_stream_config(config: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = queryTabGroups)]
     fn js_query_tab_groups() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = groupInto)]
@@ -528,6 +534,22 @@ pub fn capture_replace_head(take: u32, bytes: &[u8], old_len: usize) -> Result<u
 /// `audio` includes audio-only media. Tabs without the content script are ignored.
 pub async fn media_command(tab_id: TabId, cmd: &str, audio: bool) {
     let _ = call(js_media_command(tab_id as f64, cmd, audio)).await;
+}
+
+/// Sends `"stop"` / `"resume"` to the media content script of every frame of a tab.
+pub async fn stream_command(tab_id: TabId, cmd: &str) {
+    let _ = call(js_stream_command(tab_id as f64, cmd)).await;
+}
+
+/// Holds back the media data (stream manifests and segments, media files) of these tabs,
+/// and lets that of any other tab through again.
+pub async fn set_stream_holds(tab_ids: &[TabId]) -> Result<()> {
+    call(js_set_stream_holds(to_js(tab_ids))).await.map(drop)
+}
+
+/// Stores the stream settings for the media content script.
+pub async fn set_stream_config(config: &serde_json::Value) -> Result<()> {
+    call(js_set_stream_config(to_js(config))).await.map(drop)
 }
 
 // ---- cookies / site data ----

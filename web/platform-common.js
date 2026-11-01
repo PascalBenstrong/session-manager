@@ -56,6 +56,27 @@ export function stripDebuggerBytes(bytes) {
 }
 
 /**
+ * Stopped streams: what counts as media data, held back while a tab's streams are stopped.
+ * URLs of stream manifests and segments and of media files (an RE2 / JS regular
+ * expression), and the content types of media responses (for URLs that don't say).
+ */
+export const STREAM_URL = String.raw`\.(m3u8|mpd|ts|m4s|m4v|m4a|mp4|aac|webm|mkv|mp3|ogg|oga|ogv|flac|cmfv|cmfa)([?#]|$)|/videoplayback|/(seg|segment|chunk|frag|fragment)[-_]?[0-9]`;
+export const STREAM_TYPES = ['video/*', 'audio/*', 'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'application/dash+xml', 'video/mp2t', 'application/vnd.yt-ump'];
+export const STREAM_TYPE = /^(video|audio)\/|mpegurl|dash\+xml|mp2t|vnd\.yt-ump/i;
+/** Request types that carry media data (players fetch streams with fetch / XHR). */
+export const STREAM_REQUEST_TYPES = ['media', 'xmlhttprequest', 'other'];
+
+/** declarativeNetRequest session rules blocking the media data of `tabIds` (Chromium). */
+export function streamBlockRules(tabIds) {
+  if (!tabIds.length) return [];
+  const base = { priority: 1, action: { type: 'block' } };
+  return [
+    { id: 1, ...base, condition: { tabIds, resourceTypes: STREAM_REQUEST_TYPES, regexFilter: STREAM_URL, isUrlFilterCaseSensitive: false } },
+    { id: 2, ...base, condition: { tabIds, resourceTypes: STREAM_REQUEST_TYPES, responseHeaders: [{ header: 'content-type', values: STREAM_TYPES }] } },
+  ];
+}
+
+/**
  * Runs in every frame of an inspected page (scripting.executeScript): the URLs of its
  * videos, audio, frames, embeds and scripts, and of media requests in its network log.
  */
@@ -806,6 +827,40 @@ export function installPlatform(api, overrides = {}) {
       }
     },
 
+    // ---- stopped streams ----
+
+    /** Asks the media content script in every frame of a tab to "stop" or "resume" streams. */
+    async streamCommand(tabId, cmd) {
+      try {
+        await api.tabs.sendMessage(tabId, { smStreamCmd: cmd });
+      } catch {
+        // No content script in this tab.
+      }
+    },
+
+    /**
+     * Holds back the media data of these tabs, and lets that of the others through.
+     * Chromium can't hold requests (without the debugger), so they are blocked: players see
+     * errors, and recover when resumed (the content script reloads the page if not).
+     */
+    async setStreamHolds(tabIds) {
+      const dnr = api.declarativeNetRequest;
+      if (!dnr || !dnr.updateSessionRules) throw new Error('this browser cannot hold back requests');
+      const removeRuleIds = (await dnr.getSessionRules()).map((r) => r.id).filter((id) => id === 1 || id === 2);
+      const addRules = streamBlockRules(tabIds);
+      try {
+        await dnr.updateSessionRules({ removeRuleIds, addRules });
+      } catch (e) {
+        // Older Chromium: no response header conditions. URLs only.
+        await dnr.updateSessionRules({ removeRuleIds, addRules: addRules.filter((r) => !r.condition.responseHeaders) });
+      }
+    },
+
+    /** What the media content script needs to know (read from storage there). */
+    async setStreamConfig(config) {
+      await api.storage.local.set({ smStreamConfig: config });
+    },
+
     // ---- cookies / site data ----
     async getAllCookies() {
       const stores = await api.cookies.getAllCookieStores();
@@ -1048,6 +1103,12 @@ export function installPlatform(api, overrides = {}) {
             video: !!m.video,
             pip: !!m.pip,
           }));
+          return false;
+        }
+        // The media content script about stopped streams (web/media.js).
+        if (msg && typeof msg.smStream === 'string' && sender && sender.tab) {
+          const what = msg.smStream;
+          fireInOrder(() => ({ type: 'stream', tabId: sender.tab.id, frameId: sender.frameId ?? 0, what }));
           return false;
         }
         // A docked inspector (Firefox) asks the background to do what it can't.

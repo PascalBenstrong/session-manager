@@ -43,15 +43,44 @@ pub struct MediaSettings {
     pub resume_on_activate: bool,
     /// A video in picture-in-picture counts as visible and keeps playing.
     pub allow_pip: bool,
+    /// While a stream is stopped, loop a low-resolution copy of its last frames over the
+    /// paused video (kept in the page's memory, no data).
+    pub stop_replay: bool,
+    /// Height of the replay copy, in pixels.
+    pub replay_height: u32,
+    /// How many of the last frames are replayed.
+    pub replay_frames: u32,
 }
 
 impl Default for MediaSettings {
     fn default() -> Self {
-        Self { policy: MediaPolicy::Off, max_background: 1, include_audio: false, resume_on_activate: true, allow_pip: true }
+        Self {
+            policy: MediaPolicy::Off,
+            max_background: 1,
+            include_audio: false,
+            resume_on_activate: true,
+            allow_pip: true,
+            stop_replay: false,
+            replay_height: 240,
+            replay_frames: 30,
+        }
     }
 }
 
+/// Choices for [`MediaSettings::replay_height`] and the range of `replay_frames`.
+pub const REPLAY_HEIGHTS: [u32; 4] = [96, 144, 240, 360];
+pub const REPLAY_FRAMES: std::ops::RangeInclusive<u32> = 1..=120;
+
 impl MediaSettings {
+    /// What the media content script needs to know (stored for it, see `web/media.js`).
+    pub fn stream_config(&self) -> serde_json::Value {
+        serde_json::json!({
+            "replay": self.stop_replay,
+            "replayHeight": self.replay_height.clamp(48, 720),
+            "replayFrames": self.replay_frames.clamp(*REPLAY_FRAMES.start(), *REPLAY_FRAMES.end()),
+        })
+    }
+
     pub fn enabled(&self) -> bool {
         self.policy != MediaPolicy::Off
     }
@@ -95,6 +124,9 @@ pub struct MediaState {
     pub playing: Vec<Playback>,
     /// Tabs whose media we paused (resumed when they become active).
     pub paused: BTreeSet<TabId>,
+    /// Tabs whose streams the user stopped: paused, and their media data held back until
+    /// they are resumed.
+    pub stopped: BTreeSet<TabId>,
 }
 
 /// Tabs to pause / resume.
@@ -142,7 +174,26 @@ impl MediaState {
     pub fn forget_tab(&mut self, tab_id: TabId) -> bool {
         let before = self.playing.len();
         self.playing.retain(|p| p.tab_id != tab_id);
-        self.paused.remove(&tab_id) | (self.playing.len() != before)
+        self.paused.remove(&tab_id) | self.stopped.remove(&tab_id) | (self.playing.len() != before)
+    }
+
+    /// Stops (`true`) or resumes a tab's streams. Returns true if that changed anything.
+    pub fn set_stopped(&mut self, tab_id: TabId, stop: bool) -> bool {
+        if stop {
+            // Ours now, not the media limit's to resume.
+            self.paused.remove(&tab_id);
+            self.stopped.insert(tab_id)
+        } else {
+            self.stopped.remove(&tab_id)
+        }
+    }
+
+    /// Tabs playing (or stopped) that aren't the active tab of their window: what "stop
+    /// background streams" stops.
+    pub fn background_streams(&self, tabs: &[BrowserTab]) -> Vec<TabId> {
+        let active: BTreeSet<TabId> = tabs.iter().filter(|t| t.active).map(|t| t.id).collect();
+        let tabs: BTreeSet<TabId> = self.playing.iter().map(|p| p.tab_id).filter(|t| !active.contains(t) && !self.stopped.contains(t)).collect();
+        tabs.into_iter().collect()
     }
 
     pub fn replace_tab(&mut self, added: TabId, removed: TabId) {
@@ -152,16 +203,20 @@ impl MediaState {
         if self.paused.remove(&removed) {
             self.paused.insert(added);
         }
+        if self.stopped.remove(&removed) {
+            self.stopped.insert(added);
+        }
     }
 
     /// Drops tabs that are no longer open.
     pub fn retain_open(&mut self, open: &BTreeSet<TabId>) {
         self.playing.retain(|p| open.contains(&p.tab_id));
         self.paused.retain(|t| open.contains(t));
+        self.stopped.retain(|t| open.contains(t));
     }
 
     pub fn is_empty(&self) -> bool {
-        self.playing.is_empty() && self.paused.is_empty()
+        self.playing.is_empty() && self.paused.is_empty() && self.stopped.is_empty()
     }
 
     /// Tabs playing media that counts for `settings`.
@@ -199,8 +254,9 @@ impl MediaState {
         // Most recently used first; keep those up to the limit.
         background.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         plan.pause = background.into_iter().skip(settings.allowed_background()).map(|(id, _)| id).collect();
+        plan.pause.retain(|t| !self.stopped.contains(t));
         if settings.resume_on_activate {
-            plan.resume = self.paused.iter().copied().filter(is_active).collect();
+            plan.resume = self.paused.iter().copied().filter(|t| is_active(t) && !self.stopped.contains(t)).collect();
         }
         plan
     }
@@ -229,6 +285,31 @@ mod tests {
 
     fn settings(policy: MediaPolicy, max: u32) -> MediaSettings {
         MediaSettings { policy, max_background: max, ..Default::default() }
+    }
+
+    #[test]
+    fn stopped_streams_stay_stopped() {
+        let mut m = MediaState::default();
+        m.report(1, 0, VIDEO, 1.0);
+        m.report(1, 3, VIDEO, 1.0);
+        m.report(2, 0, VIDEO, 2.0);
+        m.report(3, 0, VIDEO, 3.0);
+        let tabs = [tab(1, false, 5.0), tab(2, true, 6.0), tab(3, false, 4.0)];
+        assert_eq!(m.background_streams(&tabs), vec![1, 3], "one entry per tab, not the active one");
+        // The media limit paused tab 1; the user then stops it.
+        m.paused.insert(1);
+        assert!(m.set_stopped(1, true));
+        assert!(!m.set_stopped(1, true));
+        assert!(!m.paused.contains(&1));
+        assert_eq!(m.background_streams(&tabs), vec![3]);
+        // Activating it doesn't resume it, and the limit doesn't pause it again.
+        let tabs = [tab(1, true, 9.0), tab(2, false, 6.0), tab(3, false, 4.0)];
+        let plan = m.plan(&settings(MediaPolicy::ActiveTabOnly, 0), &tabs);
+        assert!(!plan.resume.contains(&1) && !plan.pause.contains(&1));
+        m.replace_tab(11, 1);
+        assert!(m.stopped.contains(&11));
+        assert!(m.set_stopped(11, false));
+        assert!(m.stopped.is_empty());
     }
 
     #[test]

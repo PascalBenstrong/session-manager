@@ -23,6 +23,8 @@ pub struct SidebarView {
     query: String,
     /// Also list the active session's saved (closed) tabs.
     show_saved: bool,
+    /// Tabs playing media other than this window's tab in use (for the footer).
+    background_streams: usize,
 }
 
 impl SidebarView {
@@ -64,6 +66,14 @@ impl SidebarView {
             };
             if ui.button("＋ New tab").on_hover_text(tip).clicked() {
                 acts.send(Command::NewTabInWorkspace { workspace: None });
+            }
+            if self.background_streams > 0
+                && ui
+                    .button(format!("⏸ {}", self.background_streams))
+                    .on_hover_text("Stop the streams playing in background tabs: they pause and download nothing until you resume them")
+                    .clicked()
+            {
+                acts.send(Command::StopBackgroundStreams);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.checkbox(&mut self.show_saved, RichText::new("Saved").color(p.muted))
@@ -107,6 +117,14 @@ impl SidebarView {
             .max_by(|a, b| a.1.last_accessed.total_cmp(&b.1.last_accessed))
             .map(|(r, _)| *r);
         let filtering = !self.query.trim().is_empty();
+        let in_use = state
+            .sessions
+            .iter()
+            .flat_map(|s| &s.entries)
+            .filter(|e| e.is_open() && window.is_none_or(|w| e.window_id == Some(w)))
+            .max_by(|a, b| a.last_accessed.total_cmp(&b.last_accessed))
+            .and_then(|e| e.tab_id);
+        self.background_streams = playing.iter().filter(|t| Some(**t) != in_use && !state.media.stopped.contains(t)).count();
 
         // Only the current workspace is listed (with none current, the tabs outside
         // workspaces); a search looks through every workspace.
@@ -265,8 +283,21 @@ fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool,
     let host = e.host();
     let av = avatar_sized(&mut row, &host, !e.is_open() || e.discarded, 18.0);
     status_dot(&row, av, tab_state_color(&row, e));
+    let stopped = e.tab_id.is_some_and(|t| cx.state.media.stopped.contains(&t));
     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if hovered {
+            if let Some(tab) = e.tab_id
+                && (playing || stopped)
+            {
+                let (icon, tip) = if stopped {
+                    ("▶", "Resume the stream (its data is held back meanwhile)")
+                } else {
+                    ("⏸", "Stop the stream: pause it and download nothing until you resume it")
+                };
+                if icon_button(ui, icon, tip).clicked() {
+                    acts.send(Command::StopStream { tab, stop: !stopped });
+                }
+            }
             if e.is_open() {
                 if icon_button(ui, "🗙", "Close the tab (it's removed from the session and its workspace)").clicked() {
                     acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: true });
@@ -280,12 +311,17 @@ fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool,
                 acts.send(Command::AssignWorkspace { entries: vec![r], workspace: None });
             }
             if e.is_open() {
+                if icon_button(ui, "💾", "Close the tab, keep it saved in the session and its workspace").clicked() {
+                    acts.send(Command::CloseEntries { entries: vec![r] });
+                }
                 if !e.discarded && !active && icon_button(ui, "💤", "Hibernate this tab").clicked() {
                     acts.send(Command::Hibernate { target: HibernateTarget::Entries(vec![r]), force: true });
                 }
             } else if icon_button(ui, "⤓", "Open in background without loading").clicked() {
                 acts.send(Command::OpenEntry { entry: r, discarded: true });
             }
+        } else if stopped {
+            ui.label(RichText::new("⏸").small().color(p.muted)).on_hover_text("Stream stopped: no data until you resume it");
         } else if playing {
             ui.label(RichText::new("🔊").small().color(p.success));
         }
@@ -343,6 +379,23 @@ fn row_menu(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: 
         && ui.button(format!("◌ Take out of {}", ws.name)).clicked()
     {
         acts.send(Command::AssignWorkspace { entries: vec![r], workspace: None });
+        ui.close();
+    }
+    if let Some(tab) = e.tab_id {
+        let stopped = cx.state.media.stopped.contains(&tab);
+        if stopped && ui.button("▶ Resume stream").clicked() {
+            acts.send(Command::StopStream { tab, stop: false });
+            ui.close();
+        } else if !stopped
+            && cx.state.media.playing.iter().any(|p| p.tab_id == tab)
+            && ui.button("⏸ Stop stream").on_hover_text("Pause it and download nothing until you resume it").clicked()
+        {
+            acts.send(Command::StopStream { tab, stop: true });
+            ui.close();
+        }
+    }
+    if e.is_open() && ui.button("💾 Close, keep saved").on_hover_text("Close the tab; it stays in the session and its workspace").clicked() {
+        acts.send(Command::CloseEntries { entries: vec![r] });
         ui.close();
     }
     if e.is_open() && !e.discarded && !active && ui.button("💤 Hibernate").clicked() {

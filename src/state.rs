@@ -176,11 +176,7 @@ impl AppState {
         let media = self.media.forget_tab(tab_id) | self.pending_workspace.remove(&tab_id).is_some();
         let Some(r) = self.locate_tab(tab_id) else { return media };
         if window_closing && self.settings.keep_tabs_on_window_close {
-            let e = self.entry_mut(r).expect("located");
-            e.tab_id = None;
-            e.window_id = None;
-            e.discarded = false;
-            e.browser_group = None;
+            keep_closed(self.entry_mut(r).expect("located"));
         } else if let Some(s) = self.session_mut(r.session) {
             s.entries.retain(|e| e.id != r.entry);
         }
@@ -360,6 +356,21 @@ impl AppState {
             self.ignored_tab_ids.extend(open.iter().copied());
         }
         open
+    }
+
+    /// Closes entries' tabs but keeps the entries, as saved (closed) tabs in their session
+    /// and workspace. Returns the tab ids to close; their removal is then not news.
+    pub fn close_entries(&mut self, refs: &[EntryRef]) -> Vec<TabId> {
+        let mut tabs = Vec::new();
+        for r in refs {
+            if let Some(e) = self.entry_mut(*r)
+                && let Some(t) = e.tab_id
+            {
+                keep_closed(e);
+                tabs.push(t);
+            }
+        }
+        tabs
     }
 
     pub fn tag_entries(&mut self, refs: &[EntryRef], tag: &str, add: bool) -> usize {
@@ -610,6 +621,14 @@ pub fn entry_from_tab(id: Id, tab: &BrowserTab, now: f64) -> TabEntry {
     }
 }
 
+/// The tab of an entry is gone, but the entry stays as a saved (closed) tab.
+fn keep_closed(e: &mut TabEntry) {
+    e.tab_id = None;
+    e.window_id = None;
+    e.discarded = false;
+    e.browser_group = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +668,24 @@ mod tests {
         assert_eq!(s.remove_entries(&[r], true), vec![1]);
         assert!(!s.on_tab_upsert(&tab(1, "https://a.com/2"), 2.0));
         assert!(s.active().entries.is_empty());
+    }
+
+    #[test]
+    fn close_keeps_entries_in_session_and_workspace() {
+        let mut s = AppState::default();
+        s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
+        s.on_tab_upsert(&tab(2, "https://b.com"), 1.0);
+        let r = s.locate_tab(1).unwrap();
+        s.entry_mut(r).unwrap().workspace = Some(7);
+        assert_eq!(s.close_entries(&[r]), vec![1]);
+        // The browser then reports the tab closed: the entry stays, saved.
+        s.on_tab_removed(1, false);
+        let e = s.entry_mut(r).unwrap();
+        assert!(!e.is_open() && e.window_id.is_none());
+        assert_eq!((e.url.as_str(), e.workspace), ("https://a.com", Some(7)));
+        assert_eq!(s.active().entries.len(), 2);
+        // Already closed: nothing to close.
+        assert!(s.close_entries(&[r]).is_empty());
     }
 
     #[test]

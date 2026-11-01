@@ -45,6 +45,12 @@ thread_local! {
     /// A tab strip sync is running / another one was asked for meanwhile.
     static STRIP_RUNNING: Cell<bool> = const { Cell::new(false) };
     static STRIP_AGAIN: Cell<bool> = const { Cell::new(false) };
+    /// The current workspace of each window when inactive groups were last collapsed.
+    static GROUPS_COLLAPSED_FOR: RefCell<std::collections::BTreeMap<TabId, Option<Id>>> = RefCell::new(Default::default());
+    /// Tabs whose media data the browser holds back, as last given to it.
+    static STREAM_HOLDS: RefCell<Option<Vec<TabId>>> = const { RefCell::new(None) };
+    /// When a tab was last reloaded because its stream didn't recover.
+    static STREAM_RELOADED: RefCell<std::collections::HashMap<TabId, f64>> = RefCell::new(Default::default());
     /// Window title prefaces we set, by window.
     static TITLES: RefCell<std::collections::HashMap<TabId, String>> = RefCell::new(Default::default());
     /// Tabs opened by a page, until their first page loads: tab -> (opener, opened at).
@@ -116,6 +122,8 @@ pub async fn start() -> Result<(), JsValue> {
     handler.forget();
     schedule_strip_sync();
     sync_guards().await;
+    sync_stream_holds().await;
+    sync_stream_config().await;
     Ok(())
 }
 
@@ -219,6 +227,11 @@ enum Event {
     /// The media content script reports playback in a frame.
     #[serde(rename_all = "camelCase")]
     MediaState { tab_id: TabId, frame_id: i64, playing: bool, video: bool, pip: bool },
+    /// The media content script about stopping streams: `toggle` (its button on a video was
+    /// clicked), `fresh` (a new page loaded in the tab), `stuck` (playback didn't recover
+    /// after resuming).
+    #[serde(rename_all = "camelCase")]
+    Stream { tab_id: TabId, frame_id: i64, what: String },
     /// An optional permission was granted or revoked.
     PermissionsChanged,
     /// A keyboard shortcut handled here (`open-inspector`).
@@ -287,6 +300,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             if with_state(|s| s.on_tab_removed(tab_id, window_closing)) {
                 persist().await;
             }
+            sync_stream_holds().await;
         }
         Event::TabActivated { tab_id } => {
             if with_state(|s| s.on_tab_activated(tab_id, now)) {
@@ -307,16 +321,42 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             }
         }
         Event::MediaState { tab_id, frame_id, playing, video, pip } => {
+            // Tracked also without the media limit: the sidebar shows it, and stops streams.
             let report = MediaReport { playing, video, pip };
-            if with_state(|s| s.settings.media.enabled() && s.media.report(tab_id, frame_id, report, now)) {
+            if with_state(|s| s.media.report(tab_id, frame_id, report, now)) {
                 persist().await;
                 enforce_media().await;
             }
         }
+        Event::Stream { tab_id, frame_id, what } => match what.as_str() {
+            "toggle" => {
+                let stop = !with_state(|s| s.media.stopped.contains(&tab_id));
+                stop_stream(tab_id, stop).await;
+            }
+            // The page reloaded or navigated: its new player starts with the data flowing.
+            "fresh" if frame_id == 0 => {
+                if with_state(|s| s.media.set_stopped(tab_id, false)) {
+                    persist().await;
+                    sync_stream_holds().await;
+                }
+            }
+            "stuck" if !with_state(|s| s.media.stopped.contains(&tab_id)) => {
+                let again = STREAM_RELOADED.with(|r| r.borrow().get(&tab_id).is_some_and(|at| now - at < STREAM_RELOAD_PAUSE_MS));
+                if !again {
+                    STREAM_RELOADED.with(|r| r.borrow_mut().insert(tab_id, now));
+                    log(&format!("tab {tab_id}: playback didn't recover after resuming; reloading"));
+                    if let Err(e) = pf::reload_tab(tab_id).await {
+                        log(&format!("could not reload tab {tab_id}: {e}"));
+                    }
+                }
+            }
+            _ => {}
+        },
         Event::TabReplaced { added, removed } => {
             if with_state(|s| s.on_tab_replaced(added, removed)) {
                 persist().await;
             }
+            sync_stream_holds().await;
         }
         Event::CookieSet { cookie } => on_cookie_set(cookie).await,
         Event::Alarm { name } if name == SNAPSHOT_ALARM => {
@@ -560,6 +600,12 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             }
             ok(format!("Removed {} tab(s) from session", entries.len()))
         }
+        Command::CloseEntries { entries } => {
+            let tabs = with_state(|s| s.close_entries(&entries));
+            persist().await;
+            pf::remove_tabs(&tabs).await?;
+            ok(format!("Closed {} tab(s), kept in the session", tabs.len()))
+        }
         Command::TagEntries { entries, tag, add } => {
             let n = with_state(|s| s.tag_entries(&entries, &tag, add));
             persist().await;
@@ -611,7 +657,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             }
             with_state(|s| {
                 if !settings.media.enabled() {
-                    s.media = Default::default();
+                    s.media.paused.clear();
                 }
                 s.settings = settings;
             });
@@ -619,6 +665,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             sync_alarms().await;
             schedule_auto_organize();
             enforce_media().await;
+            sync_stream_config().await;
             sync_guards().await;
             ok("Settings saved")
         }
@@ -659,6 +706,18 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok(format!("Workspace rules moved {n} tab(s)"))
         }
         Command::Hibernate { target, force } => hibernate_tabs(&target, force).await,
+        Command::StopStream { tab, stop } => {
+            stop_stream(tab, stop).await;
+            ok(if stop { "Stream stopped: no more data until you resume it" } else { "Stream resumed" })
+        }
+        Command::StopBackgroundStreams => {
+            let tabs = pf::query_tabs().await?;
+            let ids = with_state(|s| s.media.background_streams(&tabs));
+            for id in &ids {
+                stop_stream(*id, true).await;
+            }
+            ok(format!("Stopped {} background stream(s)", ids.len()))
+        }
         Command::SetActiveWorkspace { id } => {
             with_state(|s| s.set_active_workspace(id))?;
             persist().await;
@@ -988,6 +1047,41 @@ async fn hibernate_tabs(target: &HibernateTarget, force: bool) -> Result<Respons
     ok(info)
 }
 
+// ---------------------------------------------------------------- stopped streams
+
+const STREAM_RELOAD_PAUSE_MS: f64 = 60_000.0;
+
+/// Stops (pauses, and holds back the media data of) or resumes a tab's streams.
+async fn stop_stream(tab: TabId, stop: bool) {
+    if !with_state(|s| s.media.set_stopped(tab, stop)) {
+        return;
+    }
+    persist().await;
+    // Data stops before the player is paused, and flows again before it plays.
+    sync_stream_holds().await;
+    pf::stream_command(tab, if stop { "stop" } else { "resume" }).await;
+}
+
+/// Gives the browser the tabs whose media data is held back (when they changed).
+async fn sync_stream_holds() {
+    let tabs: Vec<TabId> = with_state(|s| s.media.stopped.iter().copied().collect());
+    if STREAM_HOLDS.with(|h| h.borrow().as_ref() == Some(&tabs)) {
+        return;
+    }
+    match pf::set_stream_holds(&tabs).await {
+        Ok(()) => STREAM_HOLDS.with(|h| *h.borrow_mut() = Some(tabs)),
+        Err(e) => log(&format!("could not hold back stream data: {e}")),
+    }
+}
+
+/// Stores what the media content scripts need to know (the replay settings).
+async fn sync_stream_config() {
+    let config = with_state(|s| s.settings.media.stream_config());
+    if let Err(e) = pf::set_stream_config(&config).await {
+        log(&format!("could not store the stream settings: {e}"));
+    }
+}
+
 /// Pauses background media beyond the limit, and resumes media we paused in tabs that
 /// became active again.
 async fn enforce_media() {
@@ -1086,9 +1180,10 @@ async fn sync_tab_strip() -> Result<(), String> {
 
     if ui.tab_groups && caps.tab_groups {
         let groups = pf::query_tab_groups().await?;
+        let last = GROUPS_COLLAPSED_FOR.with(|c| c.borrow().clone());
         let plan = STATE.with(|s| {
             let s = s.borrow();
-            tab_strip::plan_groups(&s.workspaces, &tabs, &groups, |t| workspace_of(&s, t), ui.collapse_inactive)
+            tab_strip::plan_groups(&s.workspaces, &tabs, &groups, |t| workspace_of(&s, t), ui.collapse_inactive.then_some(&last))
         });
         for g in &plan.groups {
             let id = match g.group {
@@ -1101,6 +1196,8 @@ async fn sync_tab_strip() -> Result<(), String> {
             }
         }
         pf::ungroup_tabs(&plan.ungroup).await?;
+        let current = if ui.collapse_inactive { plan.current } else { Default::default() };
+        GROUPS_COLLAPSED_FOR.with(|c| *c.borrow_mut() = current);
     }
 
     if caps.title_preface {

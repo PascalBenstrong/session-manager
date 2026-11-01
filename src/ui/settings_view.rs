@@ -5,7 +5,7 @@ use eframe::egui::{self, RichText};
 use super::theme;
 use super::widgets::section_card;
 use super::{Actions, ViewCtx};
-use crate::media::MediaPolicy;
+use crate::media::{MediaPolicy, REPLAY_FRAMES, REPLAY_HEIGHTS};
 use crate::platform as pf;
 use crate::protocol::Command;
 use crate::tab_strip::{FIREFOX_EXTENSION_ID, USER_CHROME_PREF, sidebar_command_id, user_chrome_css};
@@ -184,6 +184,46 @@ pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
                         "Applies to pages loaded after the extension was installed or updated (reload older tabs). \
                          The active tab of every window may play; when more background tabs play than allowed, \
                          the ones you used least recently are paused.",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
+            },
+        );
+
+        section_card(
+            ui,
+            "Stopped streams",
+            "⏸ Stop stream (on a playing video, or next to its tab in the sidebar) pauses it and holds back its data until you resume it.",
+            |ui| {
+                let m = &mut s.media;
+                changed |= setting(
+                    ui,
+                    &mut m.stop_replay,
+                    "Replay the last frames while stopped",
+                    "Loops a low-resolution copy of the video's last frames over it, kept in the page's memory (no data). \
+                     It's only a picture: the site's player stays paused.",
+                );
+                ui.add_enabled_ui(m.stop_replay, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Resolution");
+                        egui::ComboBox::from_id_salt("replay-height").selected_text(format!("{}p", m.replay_height)).width(70.0).show_ui(ui, |ui| {
+                            for h in REPLAY_HEIGHTS {
+                                changed |= ui.selectable_value(&mut m.replay_height, h, format!("{h}p")).changed();
+                            }
+                        });
+                        ui.add_space(12.0);
+                        ui.label("Frames");
+                        changed |= ui.add(egui::DragValue::new(&mut m.replay_frames).range(REPLAY_FRAMES)).changed();
+                        // ~0.4 MB per frame at 240p; videos keep their last frames while they play.
+                        let mb = m.replay_frames as f64 * (m.replay_height as f64).powi(2) * 16.0 / 9.0 * 4.0 / 1e6;
+                        ui.label(RichText::new(format!("≈ {mb:.0} MB of memory per playing video")).small().color(p.muted));
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "Firefox holds the stream's requests back, so the player just waits. Chrome can only block them: \
+                         players see an error, and the page is reloaded if playback doesn't recover when you resume.",
                     )
                     .small()
                     .color(p.muted),

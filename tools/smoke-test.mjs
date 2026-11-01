@@ -13,7 +13,7 @@ const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', browser
 
 const {
   api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, titlePrefaces, contentScripts, dnr,
-  createdWindows, requestListeners, filters, ev, clone,
+  createdWindows, requestListeners, headerListeners, dnrSession, filters, ev, clone,
 } = createMockBrowser();
 globalThis.browser = api;
 globalThis.chrome = api;
@@ -472,6 +472,13 @@ await step('a workspace’s saved tabs open unloaded, in the background, in thei
   r = await send({ cmd: 'OpenEntries', entries: refs, discarded: true });
   assert.match(r.info, /already open/);
   assert.equal([...tabs.values()].filter((t) => urls.includes(t.url)).length, 2, 'no second copies');
+  // Closing them (not removing): the tabs go, the entries stay saved in the workspace.
+  r = await send({ cmd: 'CloseEntries', entries: refs });
+  assert.match(r.info, /Closed 2 tab\(s\), kept in the session/);
+  await tick();
+  assert.equal([...tabs.values()].filter((t) => urls.includes(t.url)).length, 0, 'the tabs are closed');
+  assert.equal(entries().length, 2);
+  assert.ok(entries().every((e) => e.tab_id == null && e.workspace === ws.id), 'saved, closed, still in the workspace');
 });
 
 await step('every save gets a newer revision (pages keep the newest state they get)', async () => {
@@ -541,13 +548,78 @@ await step('media limit: background video is paused, resumed when its tab is act
     tabMessages.map((m) => [m.tabId, m.msg.smMediaCmd]).sort(),
     [[bg.id, 'resume'], [fg.id, 'pause']].sort(),
   );
-  // turning the limit off forgets everything
+  // turning the limit off forgets what it paused (playback stays tracked, for the sidebar)
   await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, media: { ...settings.media, policy: 'Off' } } });
-  assert.deepEqual(stored().media, { playing: [], paused: [] });
+  assert.deepEqual(stored().media.paused, []);
   tabMessages.length = 0;
   media(bg, true);
   await tick();
   assert.deepEqual(tabMessages, []);
+});
+
+await step('stopped streams: paused, their media data held back until resumed', async () => {
+  for (const t of tabs.values()) t.active = false;
+  const live = await api.tabs.create({ url: 'https://live.example/channel', active: true });
+  const other = await api.tabs.create({ url: 'https://live2.example/channel' });
+  const from = (tab, msg) => ev.message.fire(msg, { tab: { id: tab.id }, frameId: 0 }, () => {});
+  from(live, { smMedia: { playing: true, video: true, pip: false } });
+  from(other, { smMedia: { playing: true, video: true, pip: false } });
+  await tick();
+  const segment = (tab, url = 'https://cdn.example/live/seg-104.ts?t=1', type = 'xmlhttprequest') =>
+    requestListeners.map((l) => l.f({ tabId: tab.id, url, type })).find((r) => r !== undefined);
+  tabMessages.length = 0;
+  let r = await send({ cmd: 'StopStream', tab: live.id, stop: true });
+  assert.match(r.info, /Stream stopped/);
+  assert.deepEqual(stored().media.stopped, [live.id]);
+  assert.deepEqual(tabMessages, [{ tabId: live.id, msg: { smStreamCmd: 'stop' } }]);
+  let held = null;
+  if (browserName === 'firefox') {
+    // Its media requests wait; other requests, and other tabs, go on.
+    held = segment(live);
+    assert.ok(held instanceof Promise, 'a segment of the stopped tab is held');
+    assert.ok(segment(live, 'https://rr3.googlevideo.example/videoplayback?id=1') instanceof Promise);
+    assert.equal(segment(live, 'https://live.example/api/chat'), undefined);
+    assert.equal(segment(other), undefined);
+    const byType = headerListeners[0].f({ tabId: live.id, url: 'https://cdn.example/x', responseHeaders: [{ name: 'Content-Type', value: 'video/mp2t' }] });
+    assert.ok(byType instanceof Promise, 'held once its headers say it is media');
+    assert.equal(headerListeners[0].f({ tabId: live.id, url: 'https://cdn.example/y', responseHeaders: [{ name: 'content-type', value: 'application/json' }] }), undefined);
+  } else {
+    const rules = dnrSession();
+    assert.equal(rules.length, 2);
+    assert.ok(rules.every((x) => x.action.type === 'block' && x.condition.tabIds.length === 1 && x.condition.tabIds[0] === live.id));
+    const re = new RegExp(rules[0].condition.regexFilter, 'i');
+    assert.ok(re.test('https://cdn.example/live/seg-104.ts?t=1') && re.test('https://a.example/index.m3u8') && !re.test('https://a.example/app.js'));
+  }
+  // Resuming lets the data through again (held requests continue).
+  tabMessages.length = 0;
+  r = await send({ cmd: 'StopStream', tab: live.id, stop: false });
+  assert.deepEqual(stored().media.stopped, []);
+  assert.deepEqual(tabMessages, [{ tabId: live.id, msg: { smStreamCmd: 'resume' } }]);
+  if (held) assert.deepEqual(await held, {});
+  assert.equal(browserName === 'firefox' ? headerListeners.length : dnrSession().length, 0, 'nothing held any more');
+  // The button on the video toggles; a new page in the tab starts with the data flowing.
+  from(live, { smStream: 'toggle' });
+  await tick();
+  assert.deepEqual(stored().media.stopped, [live.id]);
+  from(live, { smStream: 'fresh' });
+  await tick();
+  assert.deepEqual(stored().media.stopped, []);
+  // A player that doesn't recover after resuming: its page is reloaded (once a minute at most).
+  reloaded.length = 0;
+  from(live, { smStream: 'stuck' });
+  from(live, { smStream: 'stuck' });
+  await tick();
+  assert.deepEqual(reloaded, [live.id]);
+  // Stop background streams: the tab in use keeps playing.
+  r = await send({ cmd: 'StopBackgroundStreams' });
+  assert.ok(stored().media.stopped.includes(other.id) && !stored().media.stopped.includes(live.id));
+  assert.match(r.info, /Stopped \d+ background stream/);
+  for (const tab of stored().media.stopped) await send({ cmd: 'StopStream', tab, stop: false });
+  assert.equal(requestListeners.length + headerListeners.length + dnrSession().length, 0, 'nothing held any more');
+  // The replay settings are stored for the content script.
+  const st = stored().settings;
+  await send({ cmd: 'UpdateSettings', settings: { ...st, media: { ...st.media, stop_replay: true, replay_height: 144, replay_frames: 12 } } });
+  assert.deepEqual(storage.smStreamConfig, { replay: true, replayHeight: 144, replayFrames: 12 });
 });
 
 const settle = () => new Promise((r) => setTimeout(r, 800)); // the tab strip sync is debounced
@@ -568,6 +640,14 @@ await step('workspaces as native tab groups, both ways', async () => {
   const members = stored().sessions.flatMap((s) => s.entries).filter((e) => e.workspace === rules.id && e.tab_id);
   assert.ok(members.length >= 2 && members.every((e) => tabs.get(e.tab_id).groupId === group().id), 'all its tabs are in it');
   assert.ok(group().collapsed, 'collapsed: the active tab is in another workspace');
+  // The user expands it to look inside: changes of other tabs don't collapse it again.
+  group().collapsed = false;
+  const other = [...tabs.values()].find((t) => t.active);
+  other.title = 'A new title';
+  ev.updated.fire(other.id, { title: other.title }, clone(other));
+  await settle();
+  assert.ok(!group().collapsed, 'a group the user expanded stays expanded');
+  group().collapsed = true;
   // A tab the user drags into the group joins the workspace...
   const plain = await api.tabs.create({ url: 'https://plain2.example/' });
   await settle();

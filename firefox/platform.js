@@ -1,5 +1,5 @@
 // Firefox implementation of `smPlatform` (overrides on top of platform-common.js).
-import { installPlatform, readThrottleRules, stripDebuggerBytes, tabOut, throttleRuleFor } from './platform-common.js';
+import { installPlatform, readThrottleRules, STREAM_REQUEST_TYPES, STREAM_TYPE, STREAM_URL, stripDebuggerBytes, tabOut, throttleRuleFor } from './platform-common.js';
 
 const api = globalThis.browser;
 const LAZY_SCHEMES = /^(https?|ftp):/i;
@@ -51,7 +51,52 @@ async function loadThrottle() {
   throttling = throttleRules.length > 0;
 }
 
+// Stopped streams: the media requests of held tabs wait (a blocking listener answers
+// later) until the tab's streams are resumed. A request that waits isn't an error to the
+// player, just a slow one; and nothing is downloaded meanwhile. Requests whose URL doesn't
+// look like media are held once their headers say they are.
+const STREAM_URL_RE = new RegExp(STREAM_URL, 'i');
+let heldTabs = new Set();
+const waiting = new Map(); // tab -> resolvers of its held requests
+function holdRequest(tabId) {
+  return new Promise((resolve) => {
+    if (!waiting.has(tabId)) waiting.set(tabId, []);
+    waiting.get(tabId).push(resolve);
+  });
+}
+function holdByUrl(details) {
+  if (!heldTabs.has(details.tabId)) return undefined;
+  if (details.type !== 'media' && !STREAM_URL_RE.test(details.url)) return undefined;
+  return holdRequest(details.tabId);
+}
+function holdByType(details) {
+  if (!heldTabs.has(details.tabId)) return undefined;
+  const type = details.responseHeaders?.find((h) => h.name.toLowerCase() === 'content-type')?.value || '';
+  return STREAM_TYPE.test(type) ? holdRequest(details.tabId) : undefined;
+}
+function setHeld(tabIds) {
+  heldTabs = new Set(tabIds);
+  for (const [tabId, list] of waiting) {
+    if (heldTabs.has(tabId)) continue;
+    waiting.delete(tabId);
+    for (const resolve of list) resolve({});
+  }
+  const listening = api.webRequest.onBeforeRequest.hasListener(holdByUrl);
+  const filter = { urls: ['<all_urls>'], types: STREAM_REQUEST_TYPES };
+  if (heldTabs.size && !listening) {
+    api.webRequest.onBeforeRequest.addListener(holdByUrl, filter, ['blocking']);
+    api.webRequest.onHeadersReceived.addListener(holdByType, filter, ['blocking', 'responseHeaders']);
+  } else if (!heldTabs.size && listening) {
+    api.webRequest.onBeforeRequest.removeListener(holdByUrl);
+    api.webRequest.onHeadersReceived.removeListener(holdByType);
+  }
+}
+
 installPlatform(api, {
+  async setStreamHolds(tabIds) {
+    setHeld(tabIds);
+  },
+
   installThrottle() {
     loadThrottle().catch((e) => console.warn('[session-manager] throttle', e));
     api.storage.onChanged.addListener((changes, area) => {

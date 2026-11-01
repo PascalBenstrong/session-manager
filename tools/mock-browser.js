@@ -23,6 +23,8 @@ export function createMockBrowser() {
   const requestListeners = [];
   const filters = new Map();
   let dnrRules = [];
+  let dnrSessionRules = [];
+  const headerListeners = [];
   const ev = {
     created: listeners(), updated: listeners(), removed: listeners(), activated: listeners(),
     cookie: listeners(), alarm: listeners(), message: listeners(), storage: listeners(), installed: listeners(),
@@ -137,6 +139,12 @@ export function createMockBrowser() {
       onBeforeRequest: {
         addListener: (f, filter, extra) => requestListeners.push({ f, filter, extra }),
         removeListener: (f) => requestListeners.splice(requestListeners.findIndex((l) => l.f === f), 1),
+        hasListener: (f) => requestListeners.some((l) => l.f === f),
+      },
+      onHeadersReceived: {
+        addListener: (f, filter, extra) => headerListeners.push({ f, filter, extra }),
+        removeListener: (f) => headerListeners.splice(headerListeners.findIndex((l) => l.f === f), 1),
+        hasListener: (f) => headerListeners.some((l) => l.f === f),
       },
       filterResponseData(requestId) {
         const filter = { written: [], closed: false, write(d) { this.written.push(d); }, close() { this.closed = true; } };
@@ -148,6 +156,10 @@ export function createMockBrowser() {
       async getDynamicRules() { return clone(dnrRules); },
       async updateDynamicRules({ removeRuleIds, addRules }) {
         dnrRules = dnrRules.filter((r) => !removeRuleIds.includes(r.id)).concat(clone(addRules));
+      },
+      async getSessionRules() { return clone(dnrSessionRules); },
+      async updateSessionRules({ removeRuleIds = [], addRules = [] }) {
+        dnrSessionRules = dnrSessionRules.filter((r) => !removeRuleIds.includes(r.id)).concat(clone(addRules));
       },
     },
     permissions: {
@@ -210,6 +222,6 @@ export function createMockBrowser() {
   };
   return {
     api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, granted, titlePrefaces, contentScripts,
-    dnr: () => dnrRules, createdWindows, requestListeners, filters, ev, clone,
+    dnr: () => dnrRules, dnrSession: () => dnrSessionRules, headerListeners, createdWindows, requestListeners, filters, ev, clone,
   };
 }

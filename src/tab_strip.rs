@@ -42,6 +42,9 @@ pub struct GroupPlan {
     pub groups: Vec<GroupSync>,
     /// Tabs in a workspace's group that don't belong to that workspace.
     pub ungroup: Vec<TabId>,
+    /// The current workspace of each window (that of its active tab), to pass back as
+    /// `collapsed_for` next time.
+    pub current: BTreeMap<TabId, Option<Id>>,
 }
 
 impl GroupPlan {
@@ -52,14 +55,18 @@ impl GroupPlan {
 
 /// Plans native tab groups so that, in every window, each workspace's tabs sit in one
 /// group titled with the workspace's icon and name, in its color. Pinned tabs can't be
-/// grouped. Tabs without a workspace keep the groups the user gave them. With
-/// `collapse_inactive`, only the group of the active tab's workspace stays expanded.
+/// grouped. Tabs without a workspace keep the groups the user gave them.
+///
+/// To collapse inactive groups, `collapsed_for` holds the current workspace of each
+/// window when groups were last collapsed (`plan.current` of the previous plan). Only the
+/// group of the active tab's workspace is expanded then, but only when that changes (or
+/// a group is new or gets tabs): in between, groups the user expands or collapses stay so.
 pub fn plan_groups(
     workspaces: &[Workspace],
     tabs: &[BrowserTab],
     groups: &[NativeGroup],
     workspace_of: impl Fn(&BrowserTab) -> Option<Id>,
-    collapse_inactive: bool,
+    collapsed_for: Option<&BTreeMap<TabId, Option<Id>>>,
 ) -> GroupPlan {
     let labels: HashMap<String, Id> = workspaces.iter().map(|w| (w.label(), w.id)).collect();
     let mut windows: BTreeMap<TabId, Vec<&BrowserTab>> = BTreeMap::new();
@@ -69,6 +76,8 @@ pub fn plan_groups(
     let mut plan = GroupPlan::default();
     for (window_id, wtabs) in windows {
         let current = wtabs.iter().find(|t| t.active).and_then(|t| workspace_of(t));
+        plan.current.insert(window_id, current);
+        let switched = collapsed_for.is_some_and(|last| last.get(&window_id) != Some(&current));
         let wgroups: Vec<&NativeGroup> = groups.iter().filter(|g| g.window_id == window_id).collect();
         let mut used: HashSet<i64> = HashSet::new();
         let mut regrouped: HashSet<TabId> = HashSet::new();
@@ -92,7 +101,8 @@ pub fn plan_groups(
             used.extend(group);
             let tab_ids: Vec<TabId> = members.iter().filter(|t| group.is_none() || t.group_id != group).map(|t| t.id).collect();
             regrouped.extend(tab_ids.iter().copied());
-            let collapsed = collapse_inactive.then(|| current != Some(ws.id));
+            let collapse = collapsed_for.is_some() && (switched || existing.is_none() || !tab_ids.is_empty());
+            let collapsed = collapse.then(|| current != Some(ws.id));
             let color = ws.color.native();
             let update = existing.is_none_or(|g| g.title != label || g.color != color || collapsed.is_some_and(|c| c != g.collapsed));
             if !tab_ids.is_empty() || update {
@@ -222,7 +232,7 @@ mod tests {
         let mut tabs = vec![tab(1, 1, None), tab(2, 1, Some(7)), tab(3, 1, None), tab(4, 1, Some(7)), tab(5, 2, None)];
         tabs[0].active = true;
         let groups = vec![NativeGroup { id: 7, window_id: 1, title: "💻 Dev".into(), color: "green".into(), collapsed: false }];
-        let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), true);
+        let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), Some(&BTreeMap::new()));
         // Dev: reuse group 7, add tab 1, already expanded and green -> no update.
         assert_eq!(plan.groups[0], GroupSync {
             window_id: 1,
@@ -242,6 +252,38 @@ mod tests {
     }
 
     #[test]
+    fn groups_collapse_when_the_workspace_changes_not_in_between() {
+        let ws = workspaces();
+        let map = [(1, 10), (2, 20)];
+        let mut tabs = vec![tab(1, 1, Some(7)), tab(2, 1, Some(8))];
+        tabs[0].active = true;
+        let mut groups = vec![
+            NativeGroup { id: 7, window_id: 1, title: "💻 Dev".into(), color: "green".into(), collapsed: false },
+            NativeGroup { id: 8, window_id: 1, title: "📚 Read".into(), color: "purple".into(), collapsed: false },
+        ];
+        // First sync: Read (inactive) collapses.
+        let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), Some(&BTreeMap::new()));
+        let changes: Vec<_> = plan.groups.iter().map(|g| (g.group, g.collapsed, g.update)).collect();
+        assert_eq!(changes, vec![(Some(8), Some(true), true)]);
+        let mut last = plan.current;
+        // The user expands Read again while still in Dev: later syncs leave it expanded.
+        let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), Some(&last));
+        assert!(plan.groups.is_empty(), "{plan:?}");
+        // The user collapses Dev: also left so.
+        groups[0].collapsed = true;
+        assert!(plan_groups(&ws, &tabs, &groups, ws_of(&map), Some(&last)).groups.is_empty());
+        // Switching to a tab of Read: Read expands, Dev collapses.
+        groups[0].collapsed = false;
+        tabs[0].active = false;
+        tabs[1].active = true;
+        let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), Some(&last));
+        let changes: Vec<_> = plan.groups.iter().map(|g| (g.group, g.collapsed, g.update)).collect();
+        assert_eq!(changes, vec![(Some(7), Some(true), true)], "Read is already expanded");
+        last = plan.current;
+        assert_eq!(last.get(&1), Some(&Some(20)));
+    }
+
+    #[test]
     fn stable_once_synced_and_follows_renames() {
         let mut ws = workspaces();
         let map = [(1, 10), (2, 10)];
@@ -250,14 +292,14 @@ mod tests {
             NativeGroup { id: 7, window_id: 1, title: "💻 Dev".into(), color: "green".into(), collapsed: false },
             NativeGroup { id: 8, window_id: 1, title: "Mine".into(), color: "red".into(), collapsed: false },
         ];
-        assert!(plan_groups(&ws, &tabs, &groups, ws_of(&map), false).is_empty(), "nothing to do");
+        assert!(plan_groups(&ws, &tabs, &groups, ws_of(&map), None).is_empty(), "nothing to do");
         // renamed workspace: the same group gets the new title; the user's group is untouched
         ws[0].name = "Code".into();
-        let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), false);
+        let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), None);
         assert_eq!(plan.groups.len(), 1);
         assert_eq!((plan.groups[0].group, plan.groups[0].title.as_str(), plan.groups[0].update), (Some(7), "💻 Code", true));
         groups[0].title = "💻 Code".into();
-        assert!(plan_groups(&ws, &tabs, &groups, ws_of(&map), false).is_empty());
+        assert!(plan_groups(&ws, &tabs, &groups, ws_of(&map), None).is_empty());
     }
 
     #[test]
