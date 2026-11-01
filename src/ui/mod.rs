@@ -23,6 +23,7 @@ mod theme;
 mod whats_new_view;
 mod widgets;
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -32,6 +33,7 @@ use eframe::egui::{self, Margin, RichText, ThemePreference};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::dedupe::{DedupeOptions, DuplicateGroup, Scope, find_duplicates};
 use crate::model::{AppState, EntryRef, Id, Session, Snapshot, TabId};
 use crate::platform as pf;
 use crate::protocol::{Capabilities, Command, Response, SNAPSHOTS_KEY, STATE_KEY};
@@ -179,6 +181,36 @@ impl Actions {
     pub fn notice(&mut self, text: impl Into<String>) {
         self.notice = Some(text.into());
     }
+}
+
+thread_local! {
+    /// Bumped whenever another state is shown (its revision can stay the same: replies to
+    /// commands carry changes not saved yet). Keys what is computed from the state.
+    static STATE_GENERATION: Cell<u64> = const { Cell::new(0) };
+    /// Duplicates found in the state shown, by scope and options (see [`duplicates`]).
+    static DUPLICATES: RefCell<(u64, Vec<((Scope, DedupeOptions), Rc<Vec<DuplicateGroup>>)>)> = const { RefCell::new((0, Vec::new())) };
+}
+
+/// The generation of the state shown (see `STATE_GENERATION`).
+pub(crate) fn state_generation() -> u64 {
+    STATE_GENERATION.with(Cell::get)
+}
+
+/// [`find_duplicates`] in the state shown, found once per state (views ask every frame).
+pub(crate) fn duplicates(state: &AppState, scope: Scope, o: &DedupeOptions) -> Rc<Vec<DuplicateGroup>> {
+    let generation = state_generation();
+    DUPLICATES.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.0 != generation {
+            *d = (generation, Vec::new());
+        }
+        if let Some((_, groups)) = d.1.iter().find(|(k, _)| *k == (scope, *o)) {
+            return groups.clone();
+        }
+        let groups = Rc::new(find_duplicates(state, scope, o));
+        d.1.push(((scope, *o), groups.clone()));
+        groups
+    })
 }
 
 /// Read-only context handed to views.
@@ -455,6 +487,7 @@ impl App {
     fn accept_state(&mut self, s: AppState) {
         if self.state.as_ref().is_none_or(|cur| s.revision >= cur.revision) {
             self.state = Some(Rc::new(s));
+            STATE_GENERATION.with(|g| g.set(g.get() + 1));
         }
     }
 
@@ -680,10 +713,7 @@ impl App {
                 ui.close();
             }
             ui.separator();
-            let dups: usize = crate::dedupe::find_duplicates(state, crate::dedupe::Scope::Session(session.id), &state.settings.dedupe)
-                .iter()
-                .map(|g| g.remove.len())
-                .sum();
+            let dups: usize = duplicates(state, Scope::Session(session.id), &state.settings.dedupe).iter().map(|g| g.remove.len()).sum();
             if ui
                 .add_enabled(dups > 0, egui::Button::new(format!("⧉ Remove duplicates ({dups})")))
                 .on_hover_text("Keep one copy of each page and close the extra tabs")
@@ -691,7 +721,7 @@ impl App {
             {
                 self.confirm(
                     format!("Remove {dups} duplicate tab(s) from \"{}\" and close them? One copy of each page is kept.", session.name),
-                    Command::RemoveDuplicates { scope: crate::dedupe::Scope::Session(session.id), close_tabs: true },
+                    Command::RemoveDuplicates { scope: Scope::Session(session.id), close_tabs: true },
                 );
                 ui.close();
             }

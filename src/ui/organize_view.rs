@@ -7,7 +7,7 @@ use super::widgets::{
     ChipKind, chip, empty_state, icon_button, parse_list, pattern_editor, pattern_error, primary_button, section_card, text_input,
 };
 use super::{Actions, ViewCtx};
-use crate::dedupe::{Scope, find_duplicates};
+use crate::dedupe::Scope;
 use crate::model::AutoRule;
 use crate::organize::OrganizeKey;
 use crate::protocol::Command;
@@ -215,7 +215,7 @@ impl OrganizeView {
                     ui.checkbox(&mut self.dedupe_leave_open, "Leave duplicate tabs open (only remove them from the session)");
                 });
                 let scope = if self.dedupe_all_sessions { Scope::All } else { Scope::Session(cx.viewed) };
-                let groups = find_duplicates(cx.state, scope, &opts);
+                let groups = super::duplicates(cx.state, scope, &opts);
                 let extra: usize = groups.iter().map(|g| g.remove.len()).sum();
                 ui.add_space(4.0);
                 if groups.is_empty() {

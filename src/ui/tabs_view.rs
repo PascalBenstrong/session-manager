@@ -12,7 +12,7 @@ use super::widgets::{
     icon_button_colored, parse_list, pill, primary_button, status_dot, tab_state_color, text_input, workspace_chip, ws_color,
 };
 use super::{Actions, ViewCtx};
-use crate::dedupe::{Scope, find_duplicates};
+use crate::dedupe::Scope;
 use crate::hibernate::HibernateTarget;
 use crate::model::{EntryRef, Id, TabEntry, TabGrouping, TabId};
 use crate::organize::group_entries;
@@ -956,7 +956,7 @@ impl TabsView {
     fn duplicates_badge(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         let p = theme::palette(ui);
         let scope = if self.all_sessions { Scope::All } else { Scope::Session(cx.viewed) };
-        let extra: usize = find_duplicates(cx.state, scope, &cx.state.settings.dedupe).iter().map(|g| g.remove.len()).sum();
+        let extra: usize = super::duplicates(cx.state, scope, &cx.state.settings.dedupe).iter().map(|g| g.remove.len()).sum();
         if extra == 0 {
             return;
         }
