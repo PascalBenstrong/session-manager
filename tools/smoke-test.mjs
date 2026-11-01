@@ -30,13 +30,16 @@ const glue = await import(pathToFileURL(join(dist, 'pkg', 'session_manager.js'))
 await glue.default({ module_or_path: readFileSync(join(dist, 'pkg', 'session_manager_bg.wasm')) });
 await glue.start_background();
 
-const tick = () => new Promise((r) => setTimeout(r, 20));
+// Frequent changes (navigation, titles, playback) are saved together within a second: wait for that.
+const tick = () => new Promise((r) => setTimeout(r, 1100));
 const send = async (cmd) => {
   const r = JSON.parse(await pf.sendMessage(JSON.stringify(cmd)));
   assert.ok(r.ok, `${cmd.cmd} failed: ${r.error}`);
   return r;
 };
 const stored = () => JSON.parse(storage.sm_state);
+/** Snapshots are saved apart from the state (sm_snapshots: session id -> snapshots). */
+const snapshotsOf = (sid) => JSON.parse(storage.sm_snapshots || '{}')[sid] || [];
 /** Frequent changes (playback, titles, many tabs at once) are saved within a second. */
 const saved = () => new Promise((r) => setTimeout(r, 1100));
 let passed = 0;
@@ -199,9 +202,10 @@ await step('snapshots: save, replace (with open), merge, new session', async () 
   const urlsOf = (id) => stored().sessions.find((s) => s.id === id).entries.map((e) => e.url).sort();
   const before = urlsOf(sid);
   await send({ cmd: 'CreateSnapshot', session: sid, name: 'v1' });
-  const snap = stored().sessions.find((s) => s.id === sid).snapshots.at(-1);
+  const snap = snapshotsOf(sid).at(-1);
   assert.equal(snap.name, 'v1');
   assert.ok(snap.entries.every((e) => e.tab_id == null), 'snapshots hold no live tabs');
+  assert.ok(stored().sessions.every((s) => !s.snapshots || s.snapshots.length === 0), 'the saved state leaves the snapshots out');
 
   // change the session: close one tab, open another
   const victim = stored().sessions.find((s) => s.id === sid).entries.find((e) => e.tab_id != null);
@@ -217,7 +221,7 @@ await step('snapshots: save, replace (with open), merge, new session', async () 
   assert.deepEqual(urlsOf(sid), before);
   assert.equal(tabs.size, tabsBefore + 1, 'the missing tab was reopened');
   assert.ok([...tabs.values()].some((t) => t.url === victim.url && t.discarded), 'reopened unloaded');
-  const snaps = stored().sessions.find((s) => s.id === sid).snapshots;
+  const snaps = snapshotsOf(sid);
   assert.ok(snaps.at(-1).auto && snaps.at(-1).entries.some((e) => e.url === 'https://after-snapshot.example/'), 'previous list kept');
 
   // merge brings back nothing new now; new-session copies it
@@ -227,7 +231,7 @@ await step('snapshots: save, replace (with open), merge, new session', async () 
   const copy = n.state.sessions.find((s) => s.name.endsWith('(v1)'));
   assert.deepEqual(copy.entries.map((e) => e.url).sort(), before);
   await send({ cmd: 'DeleteSnapshot', session: sid, snapshot: snap.id });
-  assert.ok(!stored().sessions.find((s) => s.id === sid).snapshots.some((x) => x.id === snap.id));
+  assert.ok(!snapshotsOf(sid).some((x) => x.id === snap.id));
 });
 
 await step('import URL list into a new session and open it; import a session file', async () => {
@@ -255,7 +259,7 @@ await step('automatic snapshots run from an alarm', async () => {
   const settings = { ...stored().settings, auto_snapshot_minutes: 30 };
   await send({ cmd: 'UpdateSettings', settings });
   assert.equal(alarms.get('sm-snapshot').periodInMinutes, 30);
-  const total = () => stored().sessions.reduce((n, s) => n + s.snapshots.length, 0);
+  const total = () => Object.values(JSON.parse(storage.sm_snapshots || '{}')).reduce((n, list) => n + list.length, 0);
   const n0 = total();
   ev.alarm.fire({ name: 'sm-snapshot' });
   await tick();
@@ -564,9 +568,13 @@ await step('stopped streams: paused, their media data held back until resumed', 
   const live = await api.tabs.create({ url: 'https://live.example/channel', active: true });
   const other = await api.tabs.create({ url: 'https://live2.example/channel' });
   const from = (tab, msg) => ev.message.fire(msg, { tab: { id: tab.id }, frameId: 0 }, () => {});
-  from(live, { smMedia: { playing: true, video: true, pip: false } });
-  from(other, { smMedia: { playing: true, video: true, pip: false } });
-  await tick();
+  from(live, { smMedia: { playing: true, video: true, pip: false, live: true } });
+  from(other, { smMedia: { playing: true, video: true, pip: false, live: true } });
+  // A normal video (not live) plays too: stopping background streams leaves it alone.
+  const movie = await api.tabs.create({ url: 'https://movies.example/watch' });
+  from(movie, { smMedia: { playing: true, video: true, pip: false, live: false } });
+  await saved();
+  assert.deepEqual(stored().media.playing.filter((p) => p.live).map((p) => p.tab_id).sort(), [live.id, other.id].sort());
   const segment = (tab, url = 'https://cdn.example/live/seg-104.ts?t=1', type = 'xmlhttprequest') =>
     requestListeners.map((l) => l.f({ tabId: tab.id, url, type })).find((r) => r !== undefined);
   tabMessages.length = 0;
@@ -615,6 +623,7 @@ await step('stopped streams: paused, their media data held back until resumed', 
   // Stop background streams: the tab in use keeps playing.
   r = await send({ cmd: 'StopBackgroundStreams' });
   assert.ok(stored().media.stopped.includes(other.id) && !stored().media.stopped.includes(live.id));
+  assert.ok(!stored().media.stopped.includes(movie.id), 'a normal video is not a stream to stop');
   assert.match(r.info, /Stopped \d+ background stream/);
   for (const tab of stored().media.stopped) await send({ cmd: 'StopStream', tab, stop: false });
   assert.equal(requestListeners.length + headerListeners.length + dnrSession().length, 0, 'nothing held any more');

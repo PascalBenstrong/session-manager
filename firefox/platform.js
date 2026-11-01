@@ -54,42 +54,34 @@ async function loadThrottle() {
 // Stopped streams: the media requests of held tabs wait (a blocking listener answers
 // later) until the tab's streams are resumed. A request that waits isn't an error to the
 // player, just a slow one; and nothing is downloaded meanwhile. Requests whose URL doesn't
-// look like media are held once their headers say they are.
+// look like media are held once their headers say they are. The listeners are registered
+// for each held tab only (a filter by tab): no other tab's requests ever wait for us.
 const STREAM_URL_RE = new RegExp(STREAM_URL, 'i');
-let heldTabs = new Set();
-const waiting = new Map(); // tab -> resolvers of its held requests
-function holdRequest(tabId) {
-  return new Promise((resolve) => {
-    if (!waiting.has(tabId)) waiting.set(tabId, []);
-    waiting.get(tabId).push(resolve);
-  });
-}
-function holdByUrl(details) {
-  if (!heldTabs.has(details.tabId)) return undefined;
-  if (details.type !== 'media' && !STREAM_URL_RE.test(details.url)) return undefined;
-  return holdRequest(details.tabId);
-}
-function holdByType(details) {
-  if (!heldTabs.has(details.tabId)) return undefined;
-  const type = details.responseHeaders?.find((h) => h.name.toLowerCase() === 'content-type')?.value || '';
-  return STREAM_TYPE.test(type) ? holdRequest(details.tabId) : undefined;
+const held = new Map(); // tab -> { byUrl, byType, waiting: resolvers of its held requests }
+function hold(tabId) {
+  const h = { waiting: [] };
+  const wait = () => new Promise((resolve) => h.waiting.push(resolve));
+  h.byUrl = (d) => (d.tabId === tabId && (d.type === 'media' || STREAM_URL_RE.test(d.url)) ? wait() : undefined);
+  h.byType = (d) => {
+    if (d.tabId !== tabId) return undefined;
+    const type = d.responseHeaders?.find((x) => x.name.toLowerCase() === 'content-type')?.value || '';
+    return STREAM_TYPE.test(type) ? wait() : undefined;
+  };
+  const filter = { urls: ['<all_urls>'], types: STREAM_REQUEST_TYPES, tabId };
+  api.webRequest.onBeforeRequest.addListener(h.byUrl, filter, ['blocking']);
+  api.webRequest.onHeadersReceived.addListener(h.byType, filter, ['blocking', 'responseHeaders']);
+  return h;
 }
 function setHeld(tabIds) {
-  heldTabs = new Set(tabIds);
-  for (const [tabId, list] of waiting) {
-    if (heldTabs.has(tabId)) continue;
-    waiting.delete(tabId);
-    for (const resolve of list) resolve({});
+  const want = new Set(tabIds);
+  for (const [tabId, h] of held) {
+    if (want.has(tabId)) continue;
+    held.delete(tabId);
+    api.webRequest.onBeforeRequest.removeListener(h.byUrl);
+    api.webRequest.onHeadersReceived.removeListener(h.byType);
+    for (const resolve of h.waiting) resolve({});
   }
-  const listening = api.webRequest.onBeforeRequest.hasListener(holdByUrl);
-  const filter = { urls: ['<all_urls>'], types: STREAM_REQUEST_TYPES };
-  if (heldTabs.size && !listening) {
-    api.webRequest.onBeforeRequest.addListener(holdByUrl, filter, ['blocking']);
-    api.webRequest.onHeadersReceived.addListener(holdByType, filter, ['blocking', 'responseHeaders']);
-  } else if (!heldTabs.size && listening) {
-    api.webRequest.onBeforeRequest.removeListener(holdByUrl);
-    api.webRequest.onHeadersReceived.removeListener(holdByType);
-  }
+  for (const tabId of want) if (!held.has(tabId)) held.set(tabId, hold(tabId));
 }
 
 installPlatform(api, {

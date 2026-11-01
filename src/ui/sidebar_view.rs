@@ -71,7 +71,9 @@ impl SidebarView {
                 && cx.state.settings.media.stream_controls
                 && ui
                     .button(format!("⏸ {}", self.background_streams))
-                    .on_hover_text("Stop the streams playing in background tabs: they pause and download nothing until you resume them")
+                    .on_hover_text(
+                        "Stop the live streams playing in background tabs: they pause and download nothing until you resume them",
+                    )
                     .clicked()
             {
                 acts.send(Command::StopBackgroundStreams);
@@ -122,7 +124,8 @@ impl SidebarView {
             .filter(|e| e.is_open() && window.is_none_or(|w| e.window_id == Some(w)))
             .max_by(|a, b| a.last_accessed.total_cmp(&b.last_accessed))
             .and_then(|e| e.tab_id);
-        self.background_streams = playing.iter().filter(|t| Some(**t) != in_use && !state.media.stopped.contains(t)).count();
+        self.background_streams =
+            state.media.live_tabs().iter().filter(|t| Some(**t) != in_use && !state.media.stopped.contains(t)).count();
 
         // Only the current workspace is listed (with none current, the tabs outside
         // workspaces); a search looks through every workspace.
@@ -285,7 +288,7 @@ fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool,
     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if hovered {
             if let Some(tab) = e.tab_id
-                && (playing || stopped)
+                && (stopped || cx.state.media.playing.iter().any(|p| p.tab_id == tab && p.live))
                 && cx.state.settings.media.stream_controls
             {
                 let (icon, tip) = if stopped {
@@ -390,7 +393,7 @@ fn row_menu(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: 
             acts.send(Command::StopStream { tab, stop: false });
             ui.close();
         } else if !stopped
-            && cx.state.media.playing.iter().any(|p| p.tab_id == tab)
+            && cx.state.media.playing.iter().any(|p| p.tab_id == tab && p.live)
             && ui.button("⏸ Stop stream").on_hover_text("Pause it and download nothing until you resume it").clicked()
         {
             acts.send(Command::StopStream { tab, stop: true });

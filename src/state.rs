@@ -39,6 +39,13 @@ pub fn trackable(u: &str, ignore_internal: bool) -> bool {
 impl AppState {
     /// Fix up invariants after loading from storage.
     pub fn normalize(&mut self) {
+        // Favicons aren't kept any more (they were never shown); drop the ones saved before.
+        for s in &mut self.sessions {
+            let snaps = s.snapshots.iter_mut().flat_map(|x| x.entries.iter_mut());
+            for e in s.entries.iter_mut().chain(snaps) {
+                e.fav_icon_url = None;
+            }
+        }
         if self.sessions.is_empty() {
             *self = AppState { settings: self.settings.clone(), ..AppState::default() };
         }
@@ -121,9 +128,6 @@ impl AppState {
             }
             if !tab.title.is_empty() {
                 e.title = tab.title.clone();
-            }
-            if tab.fav_icon_url.is_some() {
-                e.fav_icon_url = tab.fav_icon_url.clone();
             }
             e.pinned = tab.pinned;
             e.discarded = tab.discarded;
@@ -605,7 +609,8 @@ pub fn entry_from_tab(id: Id, tab: &BrowserTab, now: f64) -> TabEntry {
         id,
         url: tab.url.clone(),
         title: tab.title.clone(),
-        fav_icon_url: tab.fav_icon_url.clone(),
+        // Not kept: never shown, and often a large data: URL in every save.
+        fav_icon_url: None,
         tags: BTreeSet::new(),
         group: None,
         pinned: tab.pinned,

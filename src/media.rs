@@ -115,6 +115,8 @@ pub struct Playback {
     pub video: bool,
     /// The video is shown picture-in-picture.
     pub pip: bool,
+    /// A live stream plays (only live streams can be stopped).
+    pub live: bool,
     /// When the playback started (ms since epoch).
     pub since: f64,
 }
@@ -126,6 +128,7 @@ pub struct MediaReport {
     pub playing: bool,
     pub video: bool,
     pub pip: bool,
+    pub live: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -164,12 +167,13 @@ impl MediaState {
         match (pos, r.playing) {
             (Some(i), true) => {
                 let p = &mut self.playing[i];
-                changed |= p.video != r.video || p.pip != r.pip;
+                changed |= p.video != r.video || p.pip != r.pip || p.live != r.live;
                 p.video = r.video;
                 p.pip = r.pip;
+                p.live = r.live;
             }
             (None, true) => {
-                self.playing.push(Playback { tab_id, frame_id, video: r.video, pip: r.pip, since: now });
+                self.playing.push(Playback { tab_id, frame_id, video: r.video, pip: r.pip, live: r.live, since: now });
                 changed = true;
             }
             (Some(i), false) => {
@@ -202,9 +206,13 @@ impl MediaState {
     /// background streams" stops.
     pub fn background_streams(&self, tabs: &[BrowserTab]) -> Vec<TabId> {
         let active: BTreeSet<TabId> = tabs.iter().filter(|t| t.active).map(|t| t.id).collect();
-        let tabs: BTreeSet<TabId> =
-            self.playing.iter().map(|p| p.tab_id).filter(|t| !active.contains(t) && !self.stopped.contains(t)).collect();
+        let tabs: BTreeSet<TabId> = self.live_tabs().into_iter().filter(|t| !active.contains(t) && !self.stopped.contains(t)).collect();
         tabs.into_iter().collect()
+    }
+
+    /// Tabs playing a live stream (what the stream controls apply to).
+    pub fn live_tabs(&self) -> BTreeSet<TabId> {
+        self.playing.iter().filter(|p| p.live).map(|p| p.tab_id).collect()
     }
 
     pub fn replace_tab(&mut self, added: TabId, removed: TabId) {
@@ -292,7 +300,8 @@ mod tests {
         BrowserTab { id, window_id: 1, active, last_accessed, ..Default::default() }
     }
 
-    const VIDEO: MediaReport = MediaReport { playing: true, video: true, pip: false };
+    const VIDEO: MediaReport = MediaReport { playing: true, video: true, pip: false, live: false };
+    const LIVE: MediaReport = MediaReport { live: true, ..VIDEO };
 
     fn settings(policy: MediaPolicy, max: u32) -> MediaSettings {
         MediaSettings { policy, max_background: max, ..Default::default() }
@@ -301,12 +310,14 @@ mod tests {
     #[test]
     fn stopped_streams_stay_stopped() {
         let mut m = MediaState::default();
-        m.report(1, 0, VIDEO, 1.0);
-        m.report(1, 3, VIDEO, 1.0);
+        m.report(1, 0, LIVE, 1.0);
+        m.report(1, 3, LIVE, 1.0);
         m.report(2, 0, VIDEO, 2.0);
-        m.report(3, 0, VIDEO, 3.0);
-        let tabs = [tab(1, false, 5.0), tab(2, true, 6.0), tab(3, false, 4.0)];
-        assert_eq!(m.background_streams(&tabs), vec![1, 3], "one entry per tab, not the active one");
+        m.report(3, 0, LIVE, 3.0);
+        // A normal video: not a stream to stop.
+        m.report(4, 0, VIDEO, 3.0);
+        let tabs = [tab(1, false, 5.0), tab(2, true, 6.0), tab(3, false, 4.0), tab(4, false, 4.0)];
+        assert_eq!(m.background_streams(&tabs), vec![1, 3], "one entry per live tab, not the active one");
         // The media limit paused tab 1; the user then stops it.
         m.paused.insert(1);
         assert!(m.set_stopped(1, true));
@@ -360,8 +371,8 @@ mod tests {
     #[test]
     fn audio_pip_and_frames() {
         let mut m = MediaState::default();
-        m.report(1, 0, MediaReport { playing: true, video: false, pip: false }, 1.0);
-        m.report(2, 3, MediaReport { playing: true, video: true, pip: true }, 1.0);
+        m.report(1, 0, MediaReport { playing: true, video: false, pip: false, live: false }, 1.0);
+        m.report(2, 3, MediaReport { playing: true, video: true, pip: true, live: false }, 1.0);
         let tabs = [tab(1, false, 1.0), tab(2, false, 1.0), tab(3, true, 1.0)];
         let s = settings(MediaPolicy::ActiveTabOnly, 0);
         assert!(m.plan(&s, &tabs).pause.is_empty(), "audio is not limited, pip keeps playing");

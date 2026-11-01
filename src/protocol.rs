@@ -14,6 +14,9 @@ use crate::workspace::Workspace;
 
 /// Storage key holding the serialized [`AppState`].
 pub const STATE_KEY: &str = "sm_state";
+/// The sessions' snapshots (session id -> snapshots), kept apart from the state: they are
+/// large and rarely change, so ordinary saves (and the state sent to pages) leave them out.
+pub const SNAPSHOTS_KEY: &str = "sm_snapshots";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "cmd")]

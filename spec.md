@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.11.2. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.11.3. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -46,7 +46,7 @@ Version: 0.11.2. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Optionally allow media to play only in the active tab (of each window), or in at most N background tabs besides the active ones. When there are more, the least recently used background tabs are paused.
 - Media paused this way resumes when its tab becomes active (configurable).
 - Only video counts by default; audio can be included. Picture-in-picture video can keep playing.
-- Stopped streams: a tab's streams can be stopped (a button over playing videos, the sidebar, the popup) and resumed. Stopping pauses its media and holds back its media data (by URL: stream manifests, segments, media files; or by response content type). Firefox: blocking webRequest listeners answer when resumed. Chrome: declarativeNetRequest session rules block them. On resume, live streams seek to the live edge, and a page whose playback doesn't recover is reloaded (at most once a minute). A new page in the tab starts with its data flowing. Optionally, a low-resolution loop of the video's last frames (resolution, frame count; copied at most 10 times a second, from the biggest playing video of a frame, while its tab is shown) shows over the stopped video.
+- Stopped streams (live streams only: an infinite duration, or a duration or seekable range that keeps moving forward while playing; pausing one with the player's own button, right after user input, stops it too): a tab's streams can be stopped (a button over playing videos, the sidebar, the popup) and resumed. Stopping pauses its media and holds back its media data (by URL: stream manifests, segments, media files; or by response content type). Firefox: blocking webRequest listeners, filtered to the stopped tab, answer when resumed. Chrome: declarativeNetRequest session rules block them. On resume, live streams seek to the live edge, and a page whose playback doesn't recover is reloaded (at most once a minute). A new page in the tab starts with its data flowing. Optionally, a low-resolution loop of the video's last frames (resolution, frame count; copied at most 10 times a second, from the biggest playing video of a frame, while its tab is shown) shows over the stopped video.
 
 ## Page guards
 - Guards run inside pages (the page's own world, at document start, in every frame) before the pages' own scripts. Each can be turned on or off, and a list of sites (with subdomains) is left alone.
@@ -154,5 +154,5 @@ Version: 0.11.2. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Page guards and the inspector don't work on browser-internal pages and extension stores. Guards apply to pages loaded after they are turned on.
 - The inspector reads the top frame's DOM; other frames contribute to Media & frames.
 - The media limit and the stream controls rely on a content script, registered only while one of them is on; it only runs in pages loaded after that, and not in browser-internal pages. Muted videos smaller than 640×360 (hover previews) are ignored.
-- Settings → Performance: switches for the stream controls, the replay, the media limit, the page guards (all off at once) and tab groups. Frequent changes (playback, titles, tab switches, many tabs opened or restored at once, a closing window) are saved together, at most once a second; UI pages parse only the newest state.
+- Settings → Performance: switches for the stream controls, the replay, the media limit, the page guards (all off at once) and tab groups. Frequent changes (playback, titles, tab switches, many tabs opened or restored at once, a closing window) are saved together, at most once a second; UI pages parse only the newest state. Snapshots are stored apart (sm_snapshots), written only when they change, and left out of the state sent to pages; tab favicons aren't stored.
 - Browsers refuse to hibernate the active tab. Chromium may give a hibernated tab a new id; the extension follows the change.

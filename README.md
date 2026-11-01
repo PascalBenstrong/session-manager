@@ -162,7 +162,7 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
 **Performance** (Settings → *Performance*): switches for the features that work in every page or on every tab change: stream controls, replay of stopped streams, media limit, page guards (all off at once), workspaces as tab groups.
 
 **Stopped streams** (to save data)
-- ⏸ *Stop stream* on a playing video (shown on hover), next to its tab in the sidebar and the popup, or in the tab's menu: its videos pause and its media data (stream manifests and segments, media files) is held back until you resume it. ⏸ in the sidebar's footer stops every background tab's streams.
+- Live streams only (normal videos are left alone). ⏸ *Stop stream* on a playing live video (shown on hover), or the player's own pause button, next to its tab in the sidebar and the popup, or in the tab's menu: its videos pause and its media data (stream manifests and segments, media files) is held back until you resume it. ⏸ in the sidebar's footer stops every background tab's streams.
 - Firefox holds the requests (the player just waits); Chrome blocks them (session rules), and reloads the page if the player doesn't recover on resume. Live streams resume at their live edge. The page can't play a stopped video by itself; the player's own play button resumes it.
 - Optional replay (Settings → *Stopped streams*): a low-resolution loop of the video's last frames over it while stopped, from memory.
 

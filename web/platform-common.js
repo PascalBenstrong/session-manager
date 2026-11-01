@@ -61,8 +61,12 @@ export function stripDebuggerBytes(bytes) {
  * expression), and the content types of media responses (for URLs that don't say).
  */
 export const STREAM_URL = String.raw`\.(m3u8|mpd|ts|m4s|m4v|m4a|mp4|aac|webm|mkv|mp3|ogg|oga|ogv|flac|cmfv|cmfa)([?#]|$)|/videoplayback|/(seg|segment|chunk|frag|fragment)[-_]?[0-9]`;
-export const STREAM_TYPES = ['video/*', 'audio/*', 'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'application/dash+xml', 'video/mp2t', 'application/vnd.yt-ump'];
-export const STREAM_TYPE = /^(video|audio)\/|mpegurl|dash\+xml|mp2t|vnd\.yt-ump/i;
+// Segments are often served as plain binary (octet-stream) with no file extension.
+export const STREAM_TYPES = [
+  'video/*', 'audio/*', 'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'application/dash+xml', 'video/mp2t',
+  'application/vnd.yt-ump', 'application/octet-stream', 'binary/octet-stream',
+];
+export const STREAM_TYPE = /^(video|audio)\/|mpegurl|dash\+xml|mp2t|vnd\.yt-ump|octet-stream/i;
 /** Request types that carry media data (players fetch streams with fetch / XHR). */
 export const STREAM_REQUEST_TYPES = ['media', 'xmlhttprequest', 'other'];
 
@@ -1102,6 +1106,7 @@ export function installPlatform(api, overrides = {}) {
             playing: !!m.playing,
             video: !!m.video,
             pip: !!m.pip,
+            live: !!m.live,
           }));
           return false;
         }

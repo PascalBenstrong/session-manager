@@ -14,10 +14,10 @@ use crate::dedupe::Scope;
 use crate::guards::{self, BlockRule, GuardSettings, PopupEvent};
 use crate::hibernate::{self, HibernateTarget};
 use crate::media::MediaReport;
-use crate::model::{AppState, BrowserTab, EntryRef, Id, TabId};
+use crate::model::{AppState, BrowserTab, EntryRef, Id, Snapshot, TabId};
 use crate::organize::{self, OrganizeKey};
 use crate::platform::{self as pf, CreateTab};
-use crate::protocol::{Capabilities, Command, Response, STATE_KEY};
+use crate::protocol::{Capabilities, Command, Response, SNAPSHOTS_KEY, STATE_KEY};
 use crate::state::{RestoreMode, trackable};
 use crate::tab_strip;
 
@@ -42,6 +42,8 @@ thread_local! {
     /// When this background instance started.
     static STARTED_AT: Cell<f64> = const { Cell::new(0.0) };
     static STRIP_GENERATION: Cell<u32> = const { Cell::new(0) };
+    /// The snapshots as last saved (see snapshots_fingerprint).
+    static SNAPSHOTS_SAVED: RefCell<Option<Vec<(Id, Id, String, usize)>>> = const { RefCell::new(None) };
     /// A save is scheduled (see schedule_persist).
     static PERSIST_PENDING: Cell<bool> = const { Cell::new(false) };
     /// A tab strip sync is running / another one was asked for meanwhile.
@@ -84,8 +86,26 @@ fn with_state<R>(f: impl FnOnce(&mut AppState) -> R) -> R {
     STATE.with(|s| f(&mut s.borrow_mut()))
 }
 
+/// A copy of the state for pages, without the sessions' snapshots (pages read those from
+/// SNAPSHOTS_KEY).
 fn snapshot() -> AppState {
-    STATE.with(|s| s.borrow().clone())
+    STATE.with(|s| without_snapshots(&mut s.borrow_mut(), |s| s.clone()))
+}
+
+/// Runs `f` on the state with its snapshots taken out (and puts them back).
+fn without_snapshots<T>(s: &mut AppState, f: impl FnOnce(&AppState) -> T) -> T {
+    let taken: Vec<Vec<Snapshot>> = s.sessions.iter_mut().map(|x| std::mem::take(&mut x.snapshots)).collect();
+    let out = f(s);
+    for (x, snaps) in s.sessions.iter_mut().zip(taken) {
+        x.snapshots = snaps;
+    }
+    out
+}
+
+/// What identifies the snapshots as saved (they don't change once taken, only get added,
+/// renamed or removed).
+fn snapshots_fingerprint(s: &AppState) -> Vec<(Id, Id, String, usize)> {
+    s.sessions.iter().flat_map(|x| x.snapshots.iter().map(move |n| (x.id, n.id, n.name.clone(), n.entries.len()))).collect()
 }
 
 fn log(msg: &str) {
@@ -108,6 +128,17 @@ pub async fn start() -> Result<(), JsValue> {
             AppState::default()
         }
     };
+    // Snapshots are kept apart (older versions kept them in the state: those stay).
+    if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
+        match serde_json::from_str::<std::collections::BTreeMap<Id, Vec<Snapshot>>>(&json) {
+            Ok(mut all) => {
+                for s in state.sessions.iter_mut().filter(|s| s.snapshots.is_empty()) {
+                    s.snapshots = all.remove(&s.id).unwrap_or_default();
+                }
+            }
+            Err(e) => log(&format!("stored snapshots unreadable: {e}")),
+        }
+    }
     state.normalize();
     match pf::query_tabs().await {
         Ok(tabs) => state.reconcile(&tabs, pf::now()),
@@ -204,8 +235,21 @@ async fn persist() {
             n
         });
         s.revision = next;
-        serde_json::to_string(&*s)
+        // Snapshots are saved apart, and only when they changed.
+        let fingerprint = snapshots_fingerprint(&s);
+        let snapshots = (SNAPSHOTS_SAVED.with(|f| f.borrow().as_ref() != Some(&fingerprint))).then(|| {
+            let all: std::collections::BTreeMap<Id, &Vec<Snapshot>> = s.sessions.iter().map(|x| (x.id, &x.snapshots)).collect();
+            (serde_json::to_string(&all), fingerprint)
+        });
+        (without_snapshots(&mut s, |s| serde_json::to_string(s)), snapshots)
     });
+    let (json, snapshots) = json;
+    if let Some((Ok(all), fingerprint)) = snapshots {
+        match pf::storage_set(SNAPSHOTS_KEY, &all).await {
+            Ok(()) => SNAPSHOTS_SAVED.with(|f| *f.borrow_mut() = Some(fingerprint)),
+            Err(e) => log(&format!("could not save snapshots: {e}")),
+        }
+    }
     match json {
         Ok(json) => {
             if let Err(e) = pf::storage_set(STATE_KEY, &json).await {
@@ -251,6 +295,8 @@ enum Event {
         playing: bool,
         video: bool,
         pip: bool,
+        #[serde(default)]
+        live: bool,
     },
     /// The media content script about stopping streams: `toggle` (its button on a video was
     /// clicked), `fresh` (a new page loaded in the tab), `stuck` (playback didn't recover
@@ -338,10 +384,10 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 (changed, changed && workspace(s) != before)
             });
             if changed {
-                if url_changed || moved {
+                if moved {
                     persist().await;
                 } else {
-                    // Titles, icons, loading: frequent, saved together.
+                    // Navigation, titles, loading: frequent, saved together.
                     schedule_persist();
                 }
                 if url_changed {
@@ -387,9 +433,9 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 log(&format!("could not open the inspector: {e}"));
             }
         }
-        Event::MediaState { tab_id, frame_id, playing, video, pip } => {
+        Event::MediaState { tab_id, frame_id, playing, video, pip, live } => {
             // Tracked also without the media limit: the sidebar shows it, and stops streams.
-            let report = MediaReport { playing, video, pip };
+            let report = MediaReport { playing, video, pip, live };
             if with_state(|s| s.media.report(tab_id, frame_id, report, now)) {
                 // Playback changes often (previews, ads): saved at most once a second.
                 schedule_persist();
@@ -397,6 +443,8 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             }
         }
         Event::Stream { tab_id, frame_id, what } => match what.as_str() {
+            // The user paused a live stream with the player's own button: its data stops too.
+            "pause-live" if with_state(|s| s.settings.media.stream_controls) => stop_stream(tab_id, true).await,
             "toggle" if with_state(|s| s.settings.media.stream_controls) => {
                 let stop = !with_state(|s| s.media.stopped.contains(&tab_id));
                 stop_stream(tab_id, stop).await;

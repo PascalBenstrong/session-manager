@@ -23,6 +23,7 @@ mod whats_new_view;
 mod widgets;
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,9 +31,9 @@ use eframe::egui::{self, Margin, RichText, ThemePreference};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::model::{AppState, EntryRef, Id, Session, TabId};
+use crate::model::{AppState, EntryRef, Id, Session, Snapshot, TabId};
 use crate::platform as pf;
-use crate::protocol::{Capabilities, Command, Response, STATE_KEY};
+use crate::protocol::{Capabilities, Command, Response, SNAPSHOTS_KEY, STATE_KEY};
 use widgets::{badge, icon_button, nav_item, primary_button, segmented, text_input};
 
 /// Width from which the sidebar layout is used.
@@ -64,6 +65,8 @@ struct Inbox {
     /// The newest state the background saved, not read yet: only the newest is parsed (once
     /// per frame), however many arrive meanwhile. Kept as the JS string until then.
     pushed_state: Option<JsValue>,
+    /// The newest snapshots saved (SNAPSHOTS_KEY), not read yet; same as `pushed_state`.
+    pushed_snapshots: Option<JsValue>,
     /// The window of a sidebar page.
     window_id: Option<TabId>,
     /// Messages for the toast: (text, error).
@@ -182,6 +185,19 @@ pub(crate) struct ViewCtx<'a> {
     pub state: &'a AppState,
     pub caps: &'a Capabilities,
     pub viewed: Id,
+    /// The sessions' snapshots (not in `state`: they are kept apart, see SNAPSHOTS_KEY).
+    pub snapshots: &'a BTreeMap<Id, Vec<Snapshot>>,
+}
+
+impl ViewCtx<'_> {
+    pub fn snapshots_of(&self, session: Id) -> &[Snapshot] {
+        self.snapshots.get(&session).map_or(&[], Vec::as_slice)
+    }
+
+    /// A copy of a session with its snapshots (to export it).
+    pub fn with_snapshots(&self, session: &Session) -> Session {
+        Session { snapshots: self.snapshots_of(session.id).to_vec(), ..session.clone() }
+    }
 }
 
 pub struct App {
@@ -202,6 +218,7 @@ pub struct App {
     inbox: Rc<RefCell<Inbox>>,
     pending: u32,
     state: Option<AppState>,
+    snapshots: BTreeMap<Id, Vec<Snapshot>>,
     caps: Capabilities,
     status: Option<Status>,
     view: View,
@@ -242,6 +259,30 @@ impl App {
             pf::on_state_changed(STATE_KEY, cb.as_ref().unchecked_ref());
             cb.forget();
         }
+        {
+            // Snapshots: read once, then followed like the state.
+            let pushed = inbox.clone();
+            let ctx = cc.egui_ctx.clone();
+            let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
+                if v.is_string() {
+                    pushed.borrow_mut().pushed_snapshots = Some(v);
+                    ctx.request_repaint();
+                }
+            });
+            pf::on_state_changed(SNAPSHOTS_KEY, cb.as_ref().unchecked_ref());
+            cb.forget();
+            let inbox = inbox.clone();
+            let ctx = cc.egui_ctx.clone();
+            spawn_local(async move {
+                if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
+                    let mut inbox = inbox.borrow_mut();
+                    if inbox.pushed_snapshots.is_none() {
+                        inbox.pushed_snapshots = Some(JsValue::from_str(&json));
+                    }
+                    ctx.request_repaint();
+                }
+            });
+        }
         if sidebar {
             let inbox = inbox.clone();
             let ctx = cc.egui_ctx.clone();
@@ -265,6 +306,7 @@ impl App {
             inbox,
             pending: 0,
             state: None,
+            snapshots: BTreeMap::new(),
             caps: Capabilities::default(),
             status: None,
             view: View::Tabs,
@@ -361,6 +403,11 @@ impl App {
             let mut inbox = self.inbox.borrow_mut();
             if let Some(w) = inbox.window_id.take() {
                 self.window_id = Some(w);
+            }
+            if let Some(json) = inbox.pushed_snapshots.take().and_then(|v| v.as_string())
+                && let Ok(all) = serde_json::from_str::<BTreeMap<Id, Vec<Snapshot>>>(&json)
+            {
+                self.snapshots = all;
             }
             (std::mem::take(&mut inbox.responses), inbox.pushed_state.take(), std::mem::take(&mut inbox.notices))
         };
@@ -782,7 +829,7 @@ impl App {
         });
         let mut acts = Actions::default();
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(10))).show(ui, |ui| {
-            let cx = ViewCtx { state, caps: &self.caps, viewed: session.id };
+            let cx = ViewCtx { state, caps: &self.caps, viewed: session.id, snapshots: &self.snapshots };
             self.mini.show(ui, &cx, &mut acts);
         });
         acts
@@ -840,7 +887,8 @@ impl App {
         let p = theme::palette(ui);
         let mut acts = Actions::default();
         let caps = self.caps.clone();
-        let cx = ViewCtx { state, caps: &caps, viewed: state.active_session };
+        let none = BTreeMap::new(); // the sidebar shows no snapshots
+        let cx = ViewCtx { state, caps: &caps, viewed: state.active_session, snapshots: &none };
         egui::Panel::top("header").frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(10, 8))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("◧").size(18.0).color(p.accent));
@@ -931,7 +979,7 @@ impl App {
         let mut acts = Actions::default();
         let margin = if wide { Margin { left: 24, right: 24, top: 6, bottom: 16 } } else { Margin::same(12) };
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin)).show(ui, |ui| {
-            let cx = ViewCtx { state: &state, caps: &self.caps, viewed: session.id };
+            let cx = ViewCtx { state: &state, caps: &self.caps, viewed: session.id, snapshots: &self.snapshots };
             match self.view {
                 View::Tabs => self.tabs.show(ui, &cx, &mut acts),
                 View::Organize => self.organize.show(ui, &cx, &mut acts),

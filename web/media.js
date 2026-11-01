@@ -1,15 +1,16 @@
 // Content script (every frame): reports media playback to the background, pauses /
 // resumes media when the background asks (the background media limit, see src/media.rs),
-// and stops / resumes streams: a button over playing videos asks the background to hold
-// back the tab's media data, and the videos are paused meanwhile (optionally with a
-// low-resolution loop of their last frames over them). It only talks to this extension.
+// and stops / resumes live streams: a button over playing live videos asks the background
+// to hold back the tab's media data, and they are paused meanwhile (optionally with a
+// low-resolution loop of their last frames over them). Normal videos are left alone.
+// It only talks to this extension.
 (() => {
   const api = globalThis.browser ?? globalThis.chrome;
   if (!api || !api.runtime || !api.runtime.id || globalThis.__smMedia) return;
   globalThis.__smMedia = true;
 
   const pausedByUs = new Set();
-  let last = JSON.stringify({ playing: false, video: false, pip: false });
+  let last = JSON.stringify({ playing: false, video: false, pip: false, live: false });
 
   const elements = () => document.querySelectorAll('video, audio');
   const isPlaying = (m) => !m.paused && !m.ended;
@@ -28,6 +29,39 @@
   document.addEventListener('playing', (e) => isVideo(e.target) && playingVideos.add(e.target), true);
   for (const type of ['pause', 'ended', 'emptied']) document.addEventListener(type, (e) => playingVideos.delete(e.target), true);
 
+  // Live streams. Some say so (an infinite duration); players built on Media Source give a
+  // finite one instead, which then grows while it plays (a stream that can be rewound), or
+  // whose seekable window moves forward (only the last minutes). Normal videos keep a fixed
+  // duration and seekable range. Checked from timeupdate, every few seconds while playing.
+  const LIVE_CHECK_MS = 4000;
+  const live = new WeakMap(); // media -> { at, duration, start, end, live }
+  const isLive = (m) => m.duration === Infinity || !!live.get(m)?.live;
+  const range = (m) => {
+    const r = m.seekable;
+    return r && r.length ? [r.start(0), r.end(r.length - 1)] : [0, 0];
+  };
+  document.addEventListener(
+    'timeupdate',
+    (e) => {
+      const m = e.target;
+      if (!(m instanceof HTMLMediaElement) || m.paused) return;
+      const now = performance.now();
+      const seen = live.get(m);
+      if (seen && (seen.live || now - seen.at < LIVE_CHECK_MS)) return;
+      try {
+        const [start, end] = range(m);
+        if (seen) {
+          // Moving at least half as fast as real time: a live edge.
+          const min = ((now - seen.at) / 1000) * 0.5;
+          const grows = Number.isFinite(m.duration) && Number.isFinite(seen.duration) && m.duration - seen.duration > min;
+          seen.live = grows || start - seen.start > min || end - seen.end > min;
+          if (seen.live) schedule();
+        }
+        live.set(m, { at: now, duration: m.duration, start, end, live: !!seen?.live });
+      } catch {}
+    },
+    true,
+  );
   function message(msg) {
     try {
       const p = api.runtime.sendMessage(msg);
@@ -41,7 +75,7 @@
 
   function report() {
     const playing = [...elements()].filter((m) => isPlaying(m) && !isPreview(m));
-    const state = { playing: playing.length > 0, video: playing.some(isVideo), pip: !!document.pictureInPictureElement };
+    const state = { playing: playing.length > 0, video: playing.some(isVideo), pip: !!document.pictureInPictureElement, live: playing.some(isLive) };
     const key = JSON.stringify(state);
     if (key === last) return;
     last = key;
@@ -61,7 +95,7 @@
   document.addEventListener('play', (e) => pausedByUs.delete(e.target), true);
   addEventListener('pagehide', () => {
     if (JSON.parse(last).playing) {
-      last = JSON.stringify({ playing: false, video: false, pip: false });
+      last = JSON.stringify({ playing: false, video: false, pip: false, live: false });
       send(JSON.parse(last));
     }
   });
@@ -88,7 +122,7 @@
   function toLiveEdge(m) {
     try {
       const end = m.seekable.length ? m.seekable.end(m.seekable.length - 1) : NaN;
-      if (m.duration === Infinity && end - m.currentTime > LIVE_BEHIND) m.currentTime = end - 3;
+      if (isLive(m) && end - m.currentTime > LIVE_BEHIND) m.currentTime = end - 3;
     } catch {}
   }
   function watch(m) {
@@ -104,10 +138,12 @@
     stopped = true;
     stoppedAt = performance.now();
     for (const m of elements()) {
-      if (!isPlaying(m) || isPreview(m)) continue;
-      m.pause();
+      if (isPreview(m) || !isLive(m)) continue;
+      if (isPlaying(m)) m.pause();
+      else if (m !== pausedByUser) continue;
       stoppedByUs.add(m);
     }
+    pausedByUser = null;
     const shown = mainVideo([...stoppedByUs]);
     if (shown && config.replay) showReplay(shown);
     updateControl();
@@ -126,11 +162,30 @@
     updateControl();
   }
 
+  // Pausing a live stream with the player's own button stops it too (its data would keep
+  // coming otherwise): if it's still paused a moment later. Only the user's pause counts
+  // (right after a click or key press), not one the page makes (an ad break).
+  const USER_PAUSE_MS = 1500;
+  let pausedByUser = null;
+  document.addEventListener(
+    'pause',
+    (e) => {
+      const m = e.target;
+      if (stopped || !config.streamControls || !(m instanceof HTMLMediaElement) || !isLive(m) || isPreview(m)) return;
+      if (performance.now() - lastInput > 1000) return;
+      pausedByUser = m;
+      setTimeout(() => {
+        if (!stopped && pausedByUser === m && m.paused && m.isConnected) signal('pause-live');
+      }, USER_PAUSE_MS);
+    },
+    true,
+  );
+
   // While stopped, the page (or its player) may try to play again: only the user can.
   document.addEventListener(
     'play',
     (e) => {
-      if (!stopped || !(e.target instanceof HTMLMediaElement)) return;
+      if (!stopped || !(e.target instanceof HTMLMediaElement) || !isLive(e.target)) return;
       if (lastInput > stoppedAt && performance.now() - lastInput < 3000) {
         stoppedByUs.add(e.target);
         signal('toggle'); // the user pressed the player's own play button: resume
@@ -172,7 +227,7 @@
   const MIN_H = 112;
   const rectOf = (el) => el.getBoundingClientRect();
   const bigEnough = (r) => r.width >= MIN_W && r.height >= MIN_H;
-  const candidate = (v) => stoppedByUs.has(v) || (isPlaying(v) && bigEnough(rectOf(v)) && !isPreview(v));
+  const candidate = (v) => stoppedByUs.has(v) || (isPlaying(v) && isLive(v) && bigEnough(rectOf(v)) && !isPreview(v));
   // The biggest of these videos.
   const mainVideo = (list) =>
     list.filter(isVideo).sort((a, b) => rectOf(b).width * rectOf(b).height - rectOf(a).width * rectOf(a).height)[0] || null;
@@ -338,7 +393,7 @@
       if (ring.gen !== generation || !config.replay || rings.get(v) !== ring) return freeRing(ring);
       try {
         const due = !ring.busy && now - ring.last >= REPLAY_GAP_MS && !document.hidden;
-        if (due && v.videoWidth && v.videoHeight && !isPreview(v) && (playingVideos.size < 2 || mainVideo([...playingVideos]) === v)) {
+        if (due && v.videoWidth && v.videoHeight && isLive(v) && !isPreview(v) && (playingVideos.size < 2 || mainVideo([...playingVideos]) === v)) {
           ring.last = now;
           ring.busy = true;
           const h = Math.min(config.replayHeight, v.videoHeight);

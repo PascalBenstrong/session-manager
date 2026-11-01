@@ -2,6 +2,17 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.11.3] - 2026-11-01
+
+### Changed
+- *Stop stream* is only for live streams now: normal videos get no button and aren't stopped (they still count as playing media, e.g. for the media limit). A video counts as live when it says so, or when its length or seekable range keeps moving forward while it plays.
+- Pausing a live stream with the player's own pause button also stops its data; its play button resumes it.
+
+### Fixed
+- The browser could freeze when opening or switching tabs: every change saved all sessions with their snapshots and the tabs' icons. Snapshots are now saved apart, only when they change, and tab icons (never shown) aren't kept; page loads are saved together with other frequent changes.
+- Pages could load slowly in Firefox while a stream was stopped: the requests of every tab waited for the extension. Only the stopped tab's requests are looked at now.
+- Stopping a stream didn't stop its data on sites that serve the stream's pieces as plain binary files.
+
 ## [0.11.2] - 2026-11-01
 
 ### New

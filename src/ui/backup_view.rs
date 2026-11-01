@@ -142,12 +142,13 @@ impl BackupView {
             ui.checkbox(&mut self.open_restored, "Open restored tabs right away (unloaded)");
             ui.add_space(6.0);
 
-            if session.snapshots.is_empty() {
+            let snapshots = cx.snapshots_of(session.id);
+            if snapshots.is_empty() {
                 empty_state(ui, "📸", "No snapshots yet", "Save one above, or turn on automatic snapshots.");
                 return;
             }
             let current = session.urls();
-            for snap in session.snapshots.iter().rev() {
+            for snap in snapshots.iter().rev() {
                 let urls = snap.urls();
                 let added = urls.difference(&current).count();
                 let removed = current.difference(&urls).count();
@@ -228,11 +229,12 @@ impl BackupView {
         section_card(ui, "Save to disk", "Download sessions as a file you can import again later, here or in another browser.", |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.add(primary_button(ui, format!("⬇  \"{}\" (.json)", session.name))).clicked() {
-                    let json = transfer::export_sessions([session], self.include_snapshots, pf::now());
+                    let json = transfer::export_sessions([&cx.with_snapshots(session)], self.include_snapshots, pf::now());
                     save(&format!("session-{}-{}.json", slug(&session.name), today()), &json, "application/json");
                 }
                 if ui.button(format!("⬇  All {} sessions (.json)", cx.state.sessions.len())).clicked() {
-                    let json = transfer::export_sessions(&cx.state.sessions, self.include_snapshots, pf::now());
+                    let all: Vec<Session> = cx.state.sessions.iter().map(|s| cx.with_snapshots(s)).collect();
+                    let json = transfer::export_sessions(&all, self.include_snapshots, pf::now());
                     save(&format!("sessions-{}.json", today()), &json, "application/json");
                 }
                 if ui.button("⬇  URL list (.txt)").on_hover_text("Comma separated, one per line").clicked() {
