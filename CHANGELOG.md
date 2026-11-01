@@ -2,6 +2,13 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.11.4] - 2026-11-01
+
+### Changed
+- Searching many tabs no longer slows down the manager and the sidebar: the search runs on a background thread, and only when what you typed or your tabs change.
+- Large imports (files or pastes over 64 KB) are read on a background thread, so the page stays responsive; "Reading…" shows meanwhile.
+- Finished WebM recordings get their length written in on a background thread.
+
 ## [0.11.3] - 2026-11-01
 
 ### Changed

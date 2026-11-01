@@ -25,6 +25,7 @@ pub mod tab_strip;
 pub mod transfer;
 pub mod url;
 pub mod webm;
+pub mod worker;
 pub mod workspace;
 
 #[cfg(target_arch = "wasm32")]
@@ -54,5 +55,21 @@ mod wasm {
     pub async fn start_ui(canvas_id: String, mode: String) -> Result<(), JsValue> {
         console_error_panic_hook::set_once();
         crate::ui::start(&canvas_id, &mode).await
+    }
+
+    thread_local! {
+        static WORKER: std::cell::RefCell<crate::worker::Worker> = Default::default();
+    }
+
+    /// Entry point for `worker.js`: runs one job (see [`crate::worker`]). Resolves to a
+    /// string or a `Uint8Array`; throws if the job didn't run.
+    #[wasm_bindgen]
+    pub fn worker_run(op: &str, text: &str, bytes: Vec<u8>) -> Result<JsValue, JsValue> {
+        console_error_panic_hook::set_once();
+        match WORKER.with_borrow_mut(|w| w.run(op, text, bytes)) {
+            Ok(crate::worker::Output::Text(s)) => Ok(JsValue::from_str(&s)),
+            Ok(crate::worker::Output::Bytes(b)) => Ok(js_sys::Uint8Array::from(&b[..]).into()),
+            Err(e) => Err(JsValue::from_str(&e)),
+        }
     }
 }

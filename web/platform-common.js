@@ -309,7 +309,94 @@ const PROXIED = [
   'collectCaptureMedia', 'captureFlash', 'openCapture', 'sessionList',
 ];
 
+/** How long the worker stays up without jobs: it holds its own copy of the wasm memory. */
+const WORKER_IDLE_MS = 60_000;
+
+/**
+ * A page's worker thread (web/worker.js), started on first use and stopped when idle.
+ * Where workers can't run (the background service worker, tests), jobs just reject.
+ */
+function workerClient() {
+  let w = null;
+  let up = false;
+  let broken = false; // failed to start: don't keep trying
+  let nextId = 1;
+  let idle = 0;
+  const pending = new Map();
+
+  function stop(reason) {
+    w?.terminate();
+    w = null;
+    up = false;
+    for (const { reject } of pending.values()) reject(new Error(reason));
+    pending.clear();
+  }
+
+  function start() {
+    if (w || broken) return w;
+    if (typeof Worker !== 'function' || typeof document === 'undefined') {
+      broken = true;
+      return null;
+    }
+    try {
+      w = new Worker('worker.js', { type: 'module' });
+    } catch (e) {
+      broken = true;
+      console.warn('[session-manager] no worker thread, working on the page', e);
+      return null;
+    }
+    w.onmessage = ({ data }) => {
+      if (data.ready) up = true;
+      if (data.failed) {
+        broken = true;
+        console.warn('[session-manager] worker failed to start, working on the page:', data.failed);
+        stop('the worker failed to start');
+        return;
+      }
+      const job = pending.get(data.id);
+      if (!job) return;
+      pending.delete(data.id);
+      if ('error' in data) job.reject(new Error(data.error));
+      else job.resolve(data.out);
+    };
+    w.onerror = (e) => {
+      e.preventDefault?.();
+      // Crashed (or never loaded): later jobs start a new one, unless it never came up.
+      if (!up) broken = true;
+      stop(`the worker stopped: ${e.message || 'error'}`);
+    };
+    return w;
+  }
+
+  function touch() {
+    clearTimeout(idle);
+    idle = setTimeout(() => {
+      if (pending.size === 0) stop('idle');
+      else touch();
+    }, WORKER_IDLE_MS);
+  }
+
+  return {
+    ready() {
+      if (start()) touch();
+      return up;
+    },
+    run(op, text, bytes) {
+      if (!start()) return Promise.reject(new Error('no worker thread'));
+      touch();
+      const id = nextId++;
+      // `bytes` may be a view into the wasm memory: send a copy, and hand its buffer over.
+      const copy = bytes && bytes.length ? bytes.slice() : null;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        w.postMessage({ id, op, text: text ?? '', bytes: copy }, copy ? [copy.buffer] : []);
+      });
+    },
+  };
+}
+
 export function installPlatform(api, overrides = {}) {
+  const worker = workerClient();
   // Events that arrive before the wasm module is ready are queued, so a background
   // service worker woken up by an event doesn't lose it.
   const queue = [];
@@ -995,6 +1082,20 @@ export function installPlatform(api, overrides = {}) {
 
     sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, ms));
+    },
+
+    /**
+     * Runs a job (see src/worker.rs) on the page's worker thread, starting it if needed.
+     * Resolves to a string or a Uint8Array; rejects if the job didn't run (no worker here,
+     * it failed to start or crashed), and then the caller runs it itself.
+     */
+    work(op, text, bytes) {
+      return worker.run(op, text, bytes);
+    },
+
+    /** Whether the worker is up; starts it if it isn't (so later jobs can use it). */
+    workerReady() {
+      return worker.ready();
     },
 
     // ---- background only ----

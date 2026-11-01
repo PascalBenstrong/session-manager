@@ -49,7 +49,7 @@ fn unlink(e: &mut TabEntry) {
     e.window_id = None;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Imported {
     Sessions(Vec<Session>),
     Urls(UrlList),
@@ -57,7 +57,7 @@ pub enum Imported {
     Table(Table),
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct UrlList {
     pub urls: Vec<String>,
     /// Pieces that did not look like URLs.
@@ -65,7 +65,7 @@ pub struct UrlList {
 }
 
 /// A CSV / TSV file with a header row, for choosing which column holds the URLs.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct Table {
     pub headers: Vec<String>,
     /// Data rows, padded to the width of the header.

@@ -914,5 +914,23 @@ await step('install/update sets the NEW badge; viewing release notes clears it',
   assert.equal(api.action.badge, '', 'browser updates do not flag release notes');
 });
 
+await step('worker jobs: search on the state sent, imports, WebM errors', async () => {
+  // What web/worker.js runs (the worker loads this same wasm module).
+  const run = (op, text, bytes = new Uint8Array()) => glue.worker_run(op, text, bytes);
+  const state = stored();
+  const req = (query) => JSON.stringify({ query, opts: {}, duplicates: 'All', now: 0, revision: state.revision });
+  assert.throws(() => run('search', req('x')), /not the page's state/, 'no state sent yet');
+  assert.equal(run('state', JSON.stringify(state)), '');
+  const all = state.sessions.flatMap((s) => s.entries).filter((e) => e.url.startsWith('http'));
+  const host = new URL(all[0].url).host;
+  const { Ok: ids } = JSON.parse(run('search', req(`host:${host}`)));
+  assert.deepEqual(ids.sort(), all.filter((e) => new URL(e.url).host.includes(host)).map((e) => e.id).sort());
+  assert.ok('Err' in JSON.parse(run('search', req('is:nonsense'))), 'a bad query is an answer, not a failed job');
+  const imported = JSON.parse(run('import', 'https://a.example/, https://b.example/'));
+  assert.deepEqual(imported.Ok.Urls.urls, ['https://a.example/', 'https://b.example/']);
+  assert.equal(typeof run('webm-duration', '1000', new Uint8Array([1, 2, 3])), 'string', 'not a WebM: the error, as text');
+  assert.throws(() => run('nope', ''), /unknown worker job/);
+});
+
 console.log(`\n${passed} checks passed (${browserName})`);
 process.exit(0);

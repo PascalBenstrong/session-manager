@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.11.3. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.11.4. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -154,5 +154,5 @@ Version: 0.11.3. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Page guards and the inspector don't work on browser-internal pages and extension stores. Guards apply to pages loaded after they are turned on.
 - The inspector reads the top frame's DOM; other frames contribute to Media & frames.
 - The media limit and the stream controls rely on a content script, registered only while one of them is on; it only runs in pages loaded after that, and not in browser-internal pages. Muted videos smaller than 640×360 (hover previews) are ignored.
-- Settings → Performance: switches for the stream controls, the replay, the media limit, the page guards (all off at once) and tab groups. Frequent changes (playback, titles, tab switches, many tabs opened or restored at once, a closing window) are saved together, at most once a second; UI pages parse only the newest state. Snapshots are stored apart (sm_snapshots), written only when they change, and left out of the state sent to pages; tab favicons aren't stored.
+- Settings → Performance: switches for the stream controls, the replay, the media limit, the page guards (all off at once) and tab groups. Frequent changes (playback, titles, tab switches, many tabs opened or restored at once, a closing window) are saved together, at most once a second; UI pages parse only the newest state. Snapshots are stored apart (sm_snapshots), written only when they change, and left out of the state sent to pages; tab favicons aren't stored. UI pages search tabs, read large imports (over 64 KB) and write recordings' durations on a worker thread (the same wasm, started on first use, stopped after a minute without work), falling back to the page while it starts or where it can't run; searches run only when the query or the state changes. The popup searches on the page.
 - Browsers refuse to hibernate the active tab. Chromium may give a hibernated tab a new id; the extension follows the change.

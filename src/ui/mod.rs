@@ -14,6 +14,7 @@ mod guards_view;
 mod inspector_view;
 mod mini_view;
 mod network_view;
+mod offload;
 mod organize_view;
 mod settings_view;
 mod sidebar_view;

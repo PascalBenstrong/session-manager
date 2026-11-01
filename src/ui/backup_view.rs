@@ -7,6 +7,7 @@ use std::rc::Rc;
 use eframe::egui::{self, RichText};
 use wasm_bindgen_futures::spawn_local;
 
+use super::offload;
 use super::theme;
 use super::widgets::{badge, empty_state, format_time, icon_button, primary_button, section_card, text_input};
 use super::{Actions, ViewCtx};
@@ -20,6 +21,12 @@ const IMPORT_ACCEPT: &str = ".json,.txt,.csv,.tsv,.url,text/plain,text/csv,text/
 
 /// Text loaded asynchronously (file picker / clipboard), picked up on the next frame.
 type Incoming = Rc<RefCell<Option<Result<(String, String), String>>>>;
+
+/// Imports up to this size are read right away; larger ones on the worker thread.
+const READ_HERE_MAX: usize = 64 * 1024;
+
+/// An import read on the worker thread: which text (by number), and what it holds.
+type Parsed = Rc<RefCell<Option<(u64, Result<Imported, String>)>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Target {
@@ -44,6 +51,10 @@ pub struct BackupView {
     csv_cache: Option<(String, usize, transfer::UrlList)>,
     parsed_for: String,
     parsed: Option<Result<Imported, String>>,
+    /// Numbers the texts sent to the worker: only the answer for the latest one is kept.
+    parse_seq: u64,
+    reading: bool,
+    parsed_in: Parsed,
     incoming: Incoming,
     error: Option<String>,
 }
@@ -63,6 +74,9 @@ impl Default for BackupView {
             csv_cache: None,
             parsed_for: String::new(),
             parsed: None,
+            parse_seq: 0,
+            reading: false,
+            parsed_in: Rc::new(RefCell::new(None)),
             incoming: Rc::new(RefCell::new(None)),
             error: None,
         }
@@ -307,11 +321,33 @@ impl BackupView {
 
                 if self.parsed_for != self.import_text {
                     self.parsed_for = self.import_text.clone();
-                    self.parsed = (!self.import_text.trim().is_empty()).then(|| transfer::parse_import(&self.import_text));
-                    self.csv_cache = None;
-                    if let Some(Ok(Imported::Table(table))) = &self.parsed {
-                        self.csv_column = table.best_column();
+                    self.parse_seq += 1;
+                    self.reading = false;
+                    if self.import_text.trim().is_empty() {
+                        self.set_parsed(None);
+                    } else if self.import_text.len() <= READ_HERE_MAX {
+                        self.set_parsed(Some(transfer::parse_import(&self.import_text)));
+                    } else {
+                        // Nothing to import until it's read (not the previous text's result).
+                        self.set_parsed(None);
+                        self.reading = true;
+                        let (seq, text, out, ctx) = (self.parse_seq, self.import_text.clone(), self.parsed_in.clone(), ui.ctx().clone());
+                        spawn_local(async move {
+                            let parsed = offload::parse_import(text).await;
+                            *out.borrow_mut() = Some((seq, parsed));
+                            ctx.request_repaint();
+                        });
                     }
+                }
+                let answered = self.parsed_in.borrow_mut().take();
+                if let Some((seq, parsed)) = answered
+                    && seq == self.parse_seq
+                {
+                    self.reading = false;
+                    self.set_parsed(Some(parsed));
+                }
+                if self.reading {
+                    ui.label(RichText::new("Reading…").small().color(p.muted));
                 }
                 let mut imported = false;
                 match &self.parsed {
@@ -405,6 +441,16 @@ fn urls_ui(
         return true;
     }
     false
+}
+
+impl BackupView {
+    fn set_parsed(&mut self, parsed: Option<Result<Imported, String>>) {
+        self.parsed = parsed;
+        self.csv_cache = None;
+        if let Some(Ok(Imported::Table(table))) = &self.parsed {
+            self.csv_column = table.best_column();
+        }
+    }
 }
 
 /// "url (12 URLs)", or "Column 2" when the header has no name.

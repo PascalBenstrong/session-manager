@@ -92,6 +92,13 @@ async function chromium() {
     return r;
   };
   const state = async () => (await command({ cmd: 'GetState' })).state;
+
+  // The page's worker thread (web/worker.js) starts under the extension's CSP and runs jobs.
+  await until('smPlatform on the extension page', () => extPage.eval("typeof smPlatform === 'object'")).catch(() => {});
+  const fromWorker = await extPage
+    .eval(`smPlatform.work('import', 'https://a.example/, https://b.example/').then((r) => JSON.parse(r).Ok.Urls.urls.join(' '))`)
+    .catch((e) => `error: ${e.message || e}`);
+  check('worker thread runs jobs on extension pages', fromWorker === 'https://a.example/ https://b.example/', fromWorker);
   const setGuards = async (guards) => {
     const s = (await state()).settings;
     await command({ cmd: 'UpdateSettings', settings: { ...s, guards: { ...s.guards, ...guards } } });
@@ -519,6 +526,13 @@ async function firefox() {
     return r;
   };
   const state = async () => (await command({ cmd: 'GetState' })).state;
+
+  // The page's worker thread (web/worker.js) starts under the extension's CSP and runs jobs.
+  await until('smPlatform on the extension page', () => ext.eval("typeof smPlatform === 'object'")).catch(() => {});
+  const fromWorker = await ext
+    .eval(`smPlatform.work('import', 'https://a.example/, https://b.example/').then((r) => JSON.parse(r).Ok.Urls.urls.join(' '))`)
+    .catch((e) => `error: ${e.message || e}`);
+  check('worker thread runs jobs on extension pages', fromWorker === 'https://a.example/ https://b.example/', fromWorker);
   const setGuards = async (guards) => {
     const s = (await state()).settings;
     await command({ cmd: 'UpdateSettings', settings: { ...s, guards: { ...s.guards, ...guards } } });

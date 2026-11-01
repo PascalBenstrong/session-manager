@@ -1,18 +1,18 @@
 //! Browser sidebar / side panel: a vertical tab bar for the sidebar's window, with tabs
 //! listed by workspace and a workspace switcher.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Layout, RichText, Sense, Stroke, UiBuilder};
 
+use super::offload::Search;
 use super::theme;
 use super::widgets::{DraggedTab, avatar_sized, badge, drag_ghost, icon_button, pill, status_dot, tab_state_color, ws_color};
 use super::{Actions, ViewCtx};
 use crate::hibernate::HibernateTarget;
 use crate::model::{EntryRef, Id, TabEntry, TabId};
-use crate::platform as pf;
 use crate::protocol::Command;
-use crate::search::{Query, SearchOptions};
+use crate::search::SearchOptions;
 use crate::workspace::{NO_WORKSPACE, Workspace};
 
 const ROW_HEIGHT: f32 = 30.0;
@@ -25,6 +25,7 @@ pub struct SidebarView {
     show_saved: bool,
     /// Tabs playing media other than this window's tab in use (for the footer).
     background_streams: usize,
+    search: Search,
 }
 
 impl SidebarView {
@@ -94,13 +95,11 @@ impl SidebarView {
                 .desired_width(ui.available_width())
                 .margin(egui::vec2(8.0, 5.0)),
         );
-        let names: HashMap<Id, String> = state.workspaces.iter().map(|w| (w.id, w.name.clone())).collect();
         let playing: HashSet<TabId> = state.media.playing.iter().map(|x| x.tab_id).collect();
-        let query = Query::parse(&self.query, &SearchOptions::default());
-        if let Err(e) = &query {
+        let (hits, error) = self.search.run(ui.ctx(), state, &self.query, &SearchOptions::default(), None);
+        if let Some(e) = &error {
             ui.label(RichText::new(e).small().color(p.danger));
         }
-        let query = query.unwrap_or_default().with_context(names, playing.clone(), pf::now());
 
         // This window's open tabs (any session), and optionally the active session's saved ones.
         let mut entries: Vec<(EntryRef, &TabEntry)> = Vec::new();
@@ -108,7 +107,7 @@ impl SidebarView {
             for e in &s.entries {
                 let here = e.is_open() && window.is_none_or(|w| e.window_id == Some(w));
                 let saved = self.show_saved && !e.is_open() && s.id == state.active_session;
-                if (here || saved) && query.matches(e) {
+                if (here || saved) && hits.contains(e.id) {
                     entries.push((EntryRef { session: s.id, entry: e.id }, e));
                 }
             }

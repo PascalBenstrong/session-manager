@@ -126,6 +126,11 @@ extern "C" {
     fn js_capture_head(take: f64, n: f64) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smCapture, js_name = replaceHead)]
     fn js_capture_replace_head(take: f64, bytes: &[u8], old_len: f64) -> std::result::Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = work)]
+    fn js_work(op: &str, text: &str, bytes: &[u8]) -> std::result::Result<Promise, JsValue>;
+    /// Whether the page's worker thread is up; starts it if it isn't.
+    #[wasm_bindgen(js_namespace = smPlatform, js_name = workerReady)]
+    pub fn worker_ready() -> bool;
     #[wasm_bindgen(js_namespace = smPlatform, js_name = locationParam)]
     pub fn location_param(name: &str) -> String;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = getAllCookies)]
@@ -528,6 +533,21 @@ pub async fn capture_head(take: u32, n: usize) -> Result<Vec<u8>> {
 /// Replaces the first `old_len` bytes of a take with `bytes`. Returns its new size.
 pub fn capture_replace_head(take: u32, bytes: &[u8], old_len: usize) -> Result<u64> {
     Ok(js_capture_replace_head(take as f64, bytes, old_len as f64).map_err(js_error)?.as_f64().unwrap_or(0.0) as u64)
+}
+
+/// What a worker job (see [`crate::worker`]) gave back.
+pub enum WorkOut {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+/// Runs a job on the page's worker thread. `Err`: it didn't run there (run it here).
+pub async fn work(op: &str, text: &str, bytes: &[u8]) -> Result<WorkOut> {
+    let v = call(js_work(op, text, bytes)).await?;
+    match v.as_string() {
+        Some(s) => Ok(WorkOut::Text(s)),
+        None => Ok(WorkOut::Bytes(js_sys::Uint8Array::new(&v).to_vec())),
+    }
 }
 
 /// Sends `"pause"` / `"resume"` to the media content script of every frame of a tab.

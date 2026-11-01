@@ -19,13 +19,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use super::Actions;
+use super::offload;
 use super::theme;
 use super::widgets::{danger_button, icon_button, primary_button, section_card, segmented, text_input};
 use crate::capture::{self, CaptureSettings, Format, Method, Quality, Tracks, ext_for_mime, file_name, format_bytes, format_duration};
 use crate::model::TabId;
 use crate::platform as pf;
 use crate::stream::{self, Master, MediaPlaylist, Mpd, Playlist, SourceKind, Track, TrackKind};
-use crate::webm;
 
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
@@ -659,7 +659,7 @@ impl CaptureWindow {
             self.run(
                 async move {
                     let head = pf::capture_head(id, n).await?;
-                    let fixed = webm::set_duration(&head, ms)?;
+                    let fixed = offload::set_duration(&head, ms).await?;
                     pf::capture_replace_head(id, &fixed, head.len())
                 },
                 move |r| Reply::Fixed(id, r),

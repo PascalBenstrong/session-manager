@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Key, Layout, Margin, Modifiers, RichText, Sense, Stroke, UiBuilder};
 
+use super::offload::Search;
 use super::theme;
 use super::widgets::{ChipKind, avatar, chip, empty_state, icon_button, status_dot, tab_state_color, ws_color};
 use super::{Actions, ViewCtx};
@@ -13,7 +14,7 @@ use crate::cleanup::DataTypes;
 use crate::hibernate::HibernateTarget;
 use crate::model::{EntryRef, Id, TabEntry, TabId};
 use crate::protocol::Command;
-use crate::search::{Query, SearchOptions};
+use crate::search::SearchOptions;
 
 const ROW_HEIGHT: f32 = 42.0;
 
@@ -24,22 +25,26 @@ pub struct MiniView {
     focused_once: bool,
     /// Reload a tab after clearing its site data, so the page reflects it.
     reload_after_clean: bool,
+    search: Search,
 }
 
 impl Default for MiniView {
     fn default() -> Self {
-        Self { query: String::new(), selected: 0, all_sessions: false, focused_once: false, reload_after_clean: true }
+        Self {
+            query: String::new(),
+            selected: 0,
+            all_sessions: false,
+            focused_once: false,
+            reload_after_clean: true,
+            search: Search::local(),
+        }
     }
 }
 
 impl MiniView {
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         let p = theme::palette(ui);
-        let query = Query::parse(&self.query, &SearchOptions::default());
-        let error = query.as_ref().err().cloned();
-        let names = cx.state.workspaces.iter().map(|w| (w.id, w.name.clone())).collect();
-        let playing = cx.state.media.playing.iter().map(|p| p.tab_id).collect();
-        let query = query.unwrap_or_default().with_context(names, playing, crate::platform::now());
+        let (hits, error) = self.search.run(ui.ctx(), cx.state, &self.query, &SearchOptions::default(), None);
 
         let mut owner: HashMap<Id, Id> = HashMap::new();
         let mut matched: Vec<&TabEntry> = Vec::new();
@@ -48,7 +53,7 @@ impl MiniView {
             for e in &s.entries {
                 total += 1;
                 owner.insert(e.id, s.id);
-                if query.matches(e) {
+                if hits.contains(e.id) {
                     matched.push(e);
                 }
             }

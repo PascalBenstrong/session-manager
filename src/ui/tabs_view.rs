@@ -5,13 +5,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Margin, RichText, Sense, Stroke, UiBuilder};
 
+use super::offload::Search;
 use super::theme::{self, RADIUS};
 use super::widgets::{
     ChipKind, DraggedTab, avatar_sized, badge, chip, color_swatch, danger_button, drag_ghost, empty_state, icon_button,
     icon_button_colored, parse_list, pill, primary_button, status_dot, tab_state_color, text_input, workspace_chip, ws_color,
 };
 use super::{Actions, ViewCtx};
-use crate::dedupe::{Scope, duplicate_ids, find_duplicates};
+use crate::dedupe::{Scope, find_duplicates};
 use crate::hibernate::HibernateTarget;
 use crate::model::{EntryRef, Id, TabEntry, TabGrouping, TabId};
 use crate::organize::group_entries;
@@ -124,6 +125,7 @@ impl RowCtx<'_> {
 pub struct TabsView {
     query: String,
     opts: SearchOptions,
+    search: Search,
     all_sessions: bool,
     show_filters: bool,
     bulk_tag: String,
@@ -164,14 +166,8 @@ impl TabsView {
         self.opts.workspaces.retain(|id| *id == NO_WORKSPACE || state.workspace(*id).is_some());
 
         let playing: HashSet<TabId> = state.media.playing.iter().map(|p| p.tab_id).collect();
-        let names: HashMap<Id, String> = state.workspaces.iter().map(|w| (w.id, w.name.clone())).collect();
-        let query = Query::parse(&self.query, &self.opts);
-        let query_error = query.as_ref().err().cloned();
-        let mut query = query.unwrap_or_default().with_context(names, playing.clone(), pf::now());
         let scope = if self.all_sessions { Scope::All } else { Scope::Session(cx.viewed) };
-        if query.wants_duplicates() {
-            query = query.with_duplicates(duplicate_ids(state, scope, &state.settings.dedupe));
-        }
+        let (hits, query_error) = self.search.run(ui.ctx(), state, &self.query, &self.opts, Some(scope));
 
         // Entry ids are globally unique, so map them back to their session.
         let mut owner: HashMap<Id, Id> = HashMap::new();
@@ -181,7 +177,7 @@ impl TabsView {
             for e in &s.entries {
                 total += 1;
                 owner.insert(e.id, s.id);
-                if query.matches(e) {
+                if hits.contains(e.id) {
                     matched.push(e);
                 }
             }

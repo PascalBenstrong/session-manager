@@ -20,7 +20,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Id, TabEntry, TabId};
+use crate::dedupe::{Scope, duplicate_ids};
+use crate::model::{AppState, Id, TabEntry, TabId};
 use crate::pattern::glob_to_regex;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -159,6 +160,33 @@ pub struct Query {
     now: f64,
 }
 
+/// A search over every entry of a state, as run by a page or by the worker (see
+/// [`crate::worker`]). The same request on the same revision gives the same result.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SearchRequest {
+    pub query: String,
+    pub opts: SearchOptions,
+    /// Where `is:duplicate` looks for duplicates; `None`: it matches nothing.
+    pub duplicates: Option<Scope>,
+    /// For `idle:` (0 when the query doesn't use it).
+    pub now: f64,
+    /// The revision of the state searched.
+    pub revision: u64,
+}
+
+/// The ids of the entries (of any session) that match.
+pub fn matching_ids(state: &AppState, req: &SearchRequest) -> Result<HashSet<Id>, String> {
+    let names = state.workspaces.iter().map(|w| (w.id, w.name.clone())).collect();
+    let playing = state.media.playing.iter().map(|p| p.tab_id).collect();
+    let mut query = Query::parse(&req.query, &req.opts)?.with_context(names, playing, req.now);
+    if let Some(scope) = req.duplicates
+        && query.wants_duplicates()
+    {
+        query = query.with_duplicates(duplicate_ids(state, scope, &state.settings.dedupe));
+    }
+    Ok(state.sessions.iter().flat_map(|s| &s.entries).filter(|e| query.matches(e)).map(|e| e.id).collect())
+}
+
 impl Query {
     pub fn parse(input: &str, opts: &SearchOptions) -> Result<Query, String> {
         let mut terms = Vec::new();
@@ -232,6 +260,11 @@ impl Query {
 
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty() && self.groups.is_empty() && self.workspaces.is_empty()
+    }
+
+    /// Whether the result depends on the current time (`idle:`).
+    pub fn uses_time(&self) -> bool {
+        self.terms.iter().any(|t| matches!(t.matcher, Matcher::Idle(_)))
     }
 
     pub fn matches(&self, e: &TabEntry) -> bool {
