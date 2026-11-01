@@ -33,10 +33,27 @@ enum Reply {
     Done(Result<(), String>),
 }
 
-/// A row of the list: a request, or the start of a page.
-enum Row<'a> {
+/// Bodies longer than this are shown cut (copying gives all of it).
+const BODY_SHOWN: usize = 50 * 1024;
+
+/// A row of the list: a request (its position in the log), or the start of a page.
+enum Row {
     Page(u64),
-    Entry(&'a NetEntry),
+    Entry(usize),
+}
+
+/// The rows listed, kept until the log or the filter changes.
+#[derive(Default)]
+struct Listed {
+    key: (u64, String, &'static str),
+    rows: Vec<Row>,
+}
+
+/// A body as shown (JSON indented, cut to [`BODY_SHOWN`]), kept while its entry is selected.
+struct ShownBody {
+    key: (u64, &'static str, usize),
+    formatted: String,
+    shown: String,
 }
 
 pub struct NetworkPane {
@@ -66,6 +83,8 @@ pub struct NetworkPane {
     error: Option<String>,
     /// Bumped on every change worth saving (see [`NetworkPane::snapshot`]).
     pub revision: u64,
+    listed: Listed,
+    bodies: Vec<ShownBody>,
 }
 
 impl NetworkPane {
@@ -93,6 +112,8 @@ impl NetworkPane {
             chrome,
             error: None,
             revision: 0,
+            listed: Listed::default(),
+            bodies: Vec::new(),
         };
         p.run(async { pf::get_throttle().await }, Reply::Throttle);
         p.run(async { pf::storage_get(SETTINGS_KEY).await.ok().flatten().and_then(|s| serde_json::from_str(&s).ok()) }, Reply::Settings);
@@ -308,6 +329,26 @@ impl NetworkPane {
         acts.notice(if n == 1 { "Replaying".to_string() } else { format!("Replaying {n} requests") });
     }
 
+    /// Updates the rows listed if the log or the filter changed.
+    fn refresh_listed(&mut self) {
+        let l = &self.listed;
+        if l.key.0 == self.log.revision && l.key.1 == self.query && l.key.2 == self.kind {
+            return;
+        }
+        let shown = self.log.filtered_indices(&self.query, self.kind);
+        let mut rows = Vec::with_capacity(shown.len() + 4);
+        let mut doc = None;
+        for i in shown {
+            let d = self.log.entries[i].doc();
+            if doc != Some(d) {
+                doc = Some(d);
+                rows.push(Row::Page(d));
+            }
+            rows.push(Row::Entry(i));
+        }
+        self.listed = Listed { key: (self.log.revision, self.query.clone(), self.kind), rows };
+    }
+
     fn can_replay(&self, e: &NetEntry) -> bool {
         if e.doc() == self.doc { e.replayable } else { e.resendable() }
     }
@@ -360,20 +401,39 @@ impl NetworkPane {
                 });
             });
             ui.horizontal_wrapped(|ui| {
-                let shown: Vec<NetEntry> =
-                    self.log.filtered(&self.query, self.kind).into_iter().filter(|e| e.replay_of == 0 && !e.resent).cloned().collect();
-                let todo: Vec<&NetEntry> = shown.iter().filter(|e| self.can_replay(e)).collect();
-                let label = match self.replaying {
-                    Some(n) => format!("Replaying {n}…"),
-                    None => format!("▶ Replay all ({})", todo.len()),
+                self.refresh_listed();
+                let log = std::mem::take(&mut self.log);
+                let todo: Vec<&NetEntry> = {
+                    let todo = || {
+                        self.listed
+                            .rows
+                            .iter()
+                            .filter_map(|r| match r {
+                                Row::Entry(i) => Some(&log.entries[*i]),
+                                Row::Page(_) => None,
+                            })
+                            .filter(|e| e.replay_of == 0 && !e.resent && self.can_replay(e))
+                    };
+                    let label = match self.replaying {
+                        Some(n) => format!("Replaying {n}…"),
+                        None => format!("▶ Replay all ({})", todo().count()),
+                    };
+                    let any = todo().next().is_some();
+                    if ui
+                        .add_enabled(any && self.replaying.is_none(), primary_button(ui, label))
+                        .on_hover_text("Replay the requests listed (not replays), in order, into the page")
+                        .clicked()
+                    {
+                        todo().collect()
+                    } else {
+                        Vec::new()
+                    }
                 };
-                if ui
-                    .add_enabled(!todo.is_empty() && self.replaying.is_none(), primary_button(ui, label))
-                    .on_hover_text("Replay the requests listed (not replays), in order, into the page")
-                    .clicked()
-                {
+                if !todo.is_empty() {
                     self.replay(&todo, acts);
                 }
+                drop(todo);
+                self.log = log;
                 if ui
                     .add(egui::DragValue::new(&mut self.settings.replay_gap).range(0..=60_000).speed(10.0).suffix(" ms"))
                     .on_hover_text("Pause between replayed requests")
@@ -408,16 +468,26 @@ impl NetworkPane {
             egui::Panel::bottom("net-throttle-bar").frame(frame).show(ui, |ui| self.throttle_ui(ui, acts, &site, page_url, tab, false));
         }
 
-        if let Some(e) = self.selected.and_then(|id| self.log.get(id)).cloned() {
+        // The log is taken out while drawing, to borrow its entries.
+        let log = std::mem::take(&mut self.log);
+        if let Some(e) = self.selected.and_then(|id| log.get(id)) {
             egui::Panel::right("net-details")
                 .resizable(true)
                 .default_size(460.0)
                 .frame(egui::Frame::new().fill(p.surface).inner_margin(Margin::same(10)))
-                .show(ui, |ui| self.details(ui, acts, &e, page_url, &site));
+                .show(ui, |ui| self.details(ui, acts, e, page_url, &site));
+        } else {
+            self.bodies.clear();
         }
+        self.log = log;
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(10, 4))).show(ui, |ui| {
-            self.list(ui, acts, page_url, &site);
+            self.refresh_listed();
+            let log = std::mem::take(&mut self.log);
+            let rows = std::mem::take(&mut self.listed.rows);
+            self.list(ui, acts, page_url, &site, &log, &rows);
+            self.listed.rows = rows;
+            self.log = log;
         });
     }
 
@@ -456,11 +526,12 @@ impl NetworkPane {
         });
     }
 
-    fn list(&mut self, ui: &mut egui::Ui, acts: &mut Actions, page_url: &str, site: &str) {
+    /// The requests listed (`log` and `rows` are taken out of `self` while drawing).
+    #[allow(clippy::too_many_arguments)]
+    fn list(&mut self, ui: &mut egui::Ui, acts: &mut Actions, page_url: &str, site: &str, log: &NetLog, rows: &[Row]) {
         let p = theme::palette(ui);
-        let shown: Vec<NetEntry> = self.log.filtered(&self.query, self.kind).into_iter().cloned().collect();
-        if shown.is_empty() {
-            let (title, hint) = if self.log.entries.is_empty() {
+        if rows.is_empty() {
+            let (title, hint) = if log.entries.is_empty() {
                 if self.recording {
                     ("Listening…", "Requests the page makes (fetch, XHR, WebSocket, beacons) show up here, also after it reloads.")
                 } else {
@@ -475,19 +546,16 @@ impl NetworkPane {
             empty_state(ui, "📡", title, hint);
             return;
         }
-        let mut rows = Vec::with_capacity(shown.len() + 4);
-        let mut doc = None;
-        for e in &shown {
-            if doc != Some(e.doc()) {
-                doc = Some(e.doc());
-                rows.push(Row::Page(e.doc()));
-            }
-            rows.push(Row::Entry(e));
-        }
         let row_h = 22.0;
         let mono = FontId::monospace(12.0);
         let small = FontId::proportional(12.0);
-        let first_start = shown.first().map_or(0.0, |e| e.start);
+        let first_start = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Entry(i) => Some(log.entries[*i].start),
+                Row::Page(_) => None,
+            })
+            .unwrap_or(0.0);
         let mut clicked = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show_rows(ui, row_h, rows.len(), |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -506,7 +574,7 @@ impl NetworkPane {
                         painter.galley(at, g, p.muted);
                         continue;
                     }
-                    Row::Entry(e) => *e,
+                    Row::Entry(i) => &log.entries[*i],
                 };
                 if self.selected == Some(e.id) {
                     painter.rect_filled(rect, 4.0, p.accent_soft());
@@ -688,12 +756,50 @@ impl NetworkPane {
             });
             ui.add_space(4.0);
             headers(ui, "Request headers", &e.req_headers, acts);
-            body(ui, if e.kind == "frame" { "Message" } else { "Request body" }, &e.req_body, &e.req_body_note, acts, true);
+            let title = if e.kind == "frame" { "Message" } else { "Request body" };
+            self.body(ui, e.id, title, &e.req_body, &e.req_body_note, acts, true);
             headers(ui, "Response headers", &e.res_headers, acts);
-            body(ui, "Response", &e.res_body, &e.res_body_note, acts, e.kind != "frame");
+            self.body(ui, e.id, "Response", &e.res_body, &e.res_body_note, acts, e.kind != "frame");
             if !e.stack.is_empty() {
                 egui::CollapsingHeader::new(RichText::new("Initiator (where the page made it)").strong()).show(ui, |ui| {
                     ui.add(egui::Label::new(RichText::new(&e.stack).monospace().small()).wrap().selectable(true));
+                });
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn body(&mut self, ui: &mut egui::Ui, id: u64, title: &'static str, text: &Option<String>, note: &str, acts: &mut Actions, open: bool) {
+        if text.is_none() && note.is_empty() {
+            return;
+        }
+        let p = theme::palette(ui);
+        egui::CollapsingHeader::new(RichText::new(title).strong()).id_salt(title).default_open(open).show(ui, |ui| {
+            if !note.is_empty() {
+                ui.label(RichText::new(note).small().color(p.muted));
+            }
+            if let Some(t) = text {
+                let key = (id, title, t.len());
+                let at = match self.bodies.iter().position(|b| b.key == key) {
+                    Some(at) => at,
+                    None => {
+                        self.bodies.retain(|b| b.key.0 == id && b.key.1 != title);
+                        self.bodies.push(shown_body(key, t));
+                        self.bodies.len() - 1
+                    }
+                };
+                let b = &self.bodies[at];
+                egui::Frame::new().fill(p.input).corner_radius(6).inner_margin(Margin::same(6)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let r = ui.add(egui::Label::new(RichText::new(&b.shown).monospace().small()).wrap().selectable(true));
+                    r.context_menu(|ui| {
+                        for (label, value) in [("Copy", t), ("Copy formatted", &b.formatted)] {
+                            if ui.button(label).clicked() {
+                                ui.ctx().copy_text(value.clone());
+                                acts.notice("Copied");
+                            }
+                        }
+                    });
                 });
             }
         });
@@ -925,26 +1031,20 @@ fn headers(ui: &mut egui::Ui, title: &str, list: &[(String, String)], acts: &mut
     });
 }
 
-fn body(ui: &mut egui::Ui, title: &str, text: &Option<String>, note: &str, acts: &mut Actions, open: bool) {
-    if text.is_none() && note.is_empty() {
-        return;
-    }
-    let p = theme::palette(ui);
-    egui::CollapsingHeader::new(RichText::new(title).strong()).id_salt(title).default_open(open).show(ui, |ui| {
-        if !note.is_empty() {
-            ui.label(RichText::new(note).small().color(p.muted));
+/// JSON is shown indented; long bodies are cut.
+fn shown_body(key: (u64, &'static str, usize), t: &str) -> ShownBody {
+    let formatted =
+        serde_json::from_str::<Value>(t).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_else(|| t.to_string());
+    let shown = if formatted.len() > BODY_SHOWN {
+        let mut cut = BODY_SHOWN;
+        while !formatted.is_char_boundary(cut) {
+            cut -= 1;
         }
-        if let Some(t) = text {
-            // JSON is shown indented.
-            let shown =
-                serde_json::from_str::<Value>(t).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_else(|| t.clone());
-            egui::Frame::new().fill(p.input).corner_radius(6).inner_margin(Margin::same(6)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let r = ui.add(egui::Label::new(RichText::new(&shown).monospace().small()).wrap().selectable(true));
-                copy_menu(&r, &[("Copy", t.clone()), ("Copy formatted", shown.clone())], acts);
-            });
-        }
-    });
+        format!("{}\n… ({} more: copy it to see all of it)", &formatted[..cut], human_size((formatted.len() - cut) as u64))
+    } else {
+        formatted.clone()
+    };
+    ShownBody { key, formatted, shown }
 }
 
 fn copy_menu(r: &egui::Response, items: &[(&str, String)], acts: &mut Actions) {

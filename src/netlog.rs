@@ -48,6 +48,9 @@ pub struct NetEntry {
     /// WebSocket messages: their socket.
     pub socket: u64,
     pub dir: String,
+    /// What a search looks in, lowercased (see [`NetLog::filtered`]).
+    #[serde(skip)]
+    search: String,
 }
 
 impl NetEntry {
@@ -131,11 +134,13 @@ pub struct NetLog {
     index: HashMap<u64, usize>,
     /// Replays finished (the recorder reports each "replay all").
     pub replays_done: usize,
+    /// Bumped on every change to the entries.
+    pub revision: u64,
 }
 
 impl NetLog {
     pub fn clear(&mut self) {
-        *self = NetLog::default();
+        *self = NetLog { revision: self.revision + 1, ..NetLog::default() };
     }
 
     pub fn get(&self, id: u64) -> Option<&NetEntry> {
@@ -159,6 +164,7 @@ impl NetLog {
 
     /// Adds new records and applies updates.
     pub fn apply(&mut self, records: Vec<Value>) {
+        self.revision += 1;
         for rec in records {
             let Value::Object(mut rec) = rec else { continue };
             let id = rec.get("id").and_then(Value::as_u64).unwrap_or(0);
@@ -181,7 +187,8 @@ impl NetLog {
                     rec
                 }
             };
-            let Ok(entry) = serde_json::from_value::<NetEntry>(Value::Object(merged)) else { continue };
+            let Ok(mut entry) = serde_json::from_value::<NetEntry>(Value::Object(merged)) else { continue };
+            entry.search = format!("{} {} {} {} {}", entry.url, entry.method, entry.kind, entry.status, entry.mime).to_lowercase();
             match self.index.get(&id) {
                 Some(i) => self.entries[*i] = entry,
                 None => {
@@ -236,22 +243,23 @@ impl NetLog {
     /// Entries matching a search (every word in the URL, method, kind, status or MIME type)
     /// and a kind filter ("" for all; "fetch" covers fetch and XHR; "ws" sockets and messages).
     pub fn filtered(&self, query: &str, kind: &str) -> Vec<&NetEntry> {
+        self.filtered_indices(query, kind).into_iter().map(|i| &self.entries[i]).collect()
+    }
+
+    /// [`NetLog::filtered`], as positions in `entries`.
+    pub fn filtered_indices(&self, query: &str, kind: &str) -> Vec<usize> {
         let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         self.entries
             .iter()
-            .filter(|e| match kind {
+            .enumerate()
+            .filter(|(_, e)| match kind {
                 "" => true,
                 "fetch" => e.kind == "fetch" || e.kind == "xhr",
                 "ws" => e.kind == "ws" || e.kind == "frame",
                 k => e.kind == k,
             })
-            .filter(|e| {
-                if words.is_empty() {
-                    return true;
-                }
-                let hay = format!("{} {} {} {} {}", e.url, e.method, e.kind, e.status, e.mime).to_lowercase();
-                words.iter().all(|w| hay.contains(w))
-            })
+            .filter(|(_, e)| words.iter().all(|w| e.search.contains(w)))
+            .map(|(i, _)| i)
             .collect()
     }
 }
