@@ -46,6 +46,8 @@ thread_local! {
     static SNAPSHOTS_SAVED: RefCell<Option<Vec<(Id, Id, String, usize)>>> = const { RefCell::new(None) };
     /// A save is scheduled (see schedule_persist).
     static PERSIST_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// A save asked for by [`persist_soon`] is coming.
+    static PERSIST_SOON: Cell<bool> = const { Cell::new(false) };
     /// A tab strip sync is running / another one was asked for meanwhile.
     static STRIP_RUNNING: Cell<bool> = const { Cell::new(false) };
     static STRIP_AGAIN: Cell<bool> = const { Cell::new(false) };
@@ -209,7 +211,7 @@ async fn check_opened_tab(tab: &BrowserTab, now: f64) -> bool {
         s.push_popup(PopupEvent { at: now, opener: opener_url, url: tab.url.clone(), closed_by: rule });
         rule
     });
-    persist().await;
+    persist_soon();
     if rule.is_none() {
         return false;
     }
@@ -230,6 +232,9 @@ async fn refresh_permissions() {
 }
 
 async fn persist() {
+    // What a pending delayed save would write is written now.
+    PERSIST_PENDING.with(|p| p.set(false));
+    PERSIST_SOON.with(|p| p.set(false));
     let json = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let next = REVISION.with(|r| {
@@ -367,7 +372,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 if tab.discarded || OPENING.with(|o| o.get()) > 0 || STARTUP_DEDUPE.with(|d| d.get()).is_some() {
                     schedule_persist();
                 } else {
-                    persist().await;
+                    persist_soon();
                 }
                 schedule_auto_organize();
                 schedule_strip_sync();
@@ -405,7 +410,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 if window_closing {
                     schedule_persist();
                 } else {
-                    persist().await;
+                    persist_soon();
                 }
             }
             sync_stream_holds().await;
@@ -447,7 +452,9 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         }
         Event::Stream { tab_id, frame_id, what } => match what.as_str() {
             // The user paused a live stream with the player's own button: its data stops too.
-            "pause-live" if with_state(|s| s.settings.media.stream_controls) => stop_stream(tab_id, true).await,
+            "pause-live" if with_state(|s| s.settings.media.stream_controls) => {
+                stop_stream(tab_id, true).await;
+            }
             "toggle" if with_state(|s| s.settings.media.stream_controls) => {
                 let stop = !with_state(|s| s.media.stopped.contains(&tab_id));
                 stop_stream(tab_id, stop).await;
@@ -791,6 +798,10 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
                     stop_stream(tab, false).await;
                 }
             }
+            // What the new settings paused or resumed is saved before the reply.
+            if PERSIST_SOON.with(|p| p.get()) {
+                persist().await;
+            }
             sync_stream_config().await;
             sync_guards().await;
             ok("Settings saved")
@@ -836,7 +847,9 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             if stop && !with_state(|s| s.settings.media.stream_controls) {
                 return Err("stream controls are off (Settings → Performance)".into());
             }
-            stop_stream(tab, stop).await;
+            if stop_stream(tab, stop).await {
+                persist().await;
+            }
             ok(if stop { "Stream stopped: no more data until you resume it" } else { "Stream resumed" })
         }
         Command::StopBackgroundStreams => {
@@ -845,8 +858,12 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             }
             let tabs = pf::query_tabs().await?;
             let ids = with_state(|s| s.media.background_streams(&tabs));
+            let mut changed = false;
             for id in &ids {
-                stop_stream(*id, true).await;
+                changed |= stop_stream(*id, true).await;
+            }
+            if changed {
+                persist().await;
             }
             ok(format!("Stopped {} background stream(s)", ids.len()))
         }
@@ -1169,15 +1186,17 @@ async fn hibernate_tabs(target: &HibernateTarget, force: bool) -> Result<Respons
 
 const STREAM_RELOAD_PAUSE_MS: f64 = 60_000.0;
 
-/// Stops (pauses, and holds back the media data of) or resumes a tab's streams.
-async fn stop_stream(tab: TabId, stop: bool) {
+/// Stops (pauses, and holds back the media data of) or resumes a tab's streams. Returns
+/// true if that changed anything (saved soon; commands save right away).
+async fn stop_stream(tab: TabId, stop: bool) -> bool {
     if !with_state(|s| s.media.set_stopped(tab, stop)) {
-        return;
+        return false;
     }
-    persist().await;
+    persist_soon();
     // Data stops before the player is paused, and flows again before it plays.
     sync_stream_holds().await;
     pf::stream_command(tab, if stop { "stop" } else { "resume" }).await;
+    true
 }
 
 /// Gives the browser the tabs whose media data is held back (when they changed).
@@ -1223,12 +1242,11 @@ async fn enforce_media() {
         pf::media_command(*id, "resume", settings.include_audio).await;
     }
     with_state(|s| s.media.apply(&plan));
-    persist().await;
+    persist_soon();
 }
 
 // ---------------------------------------------------------------- tab strip
 
-/// Debounced [`sync_tab_strip`]; a run asked for while one runs follows it.
 /// Saves the state soon, once for all the changes made meanwhile (for frequent changes
 /// that don't need saving right away).
 fn schedule_persist() {
@@ -1237,10 +1255,28 @@ fn schedule_persist() {
     }
     spawn_local(async {
         pf::sleep(1000).await;
-        PERSIST_PENDING.with(|p| p.set(false));
-        persist().await;
+        // Saved meanwhile: nothing left to save.
+        if PERSIST_PENDING.with(|p| p.get()) {
+            persist().await;
+        }
     });
 }
+
+/// Saves the state right after the current burst of changes (closing many tabs at once
+/// saves once).
+fn persist_soon() {
+    if PERSIST_SOON.with(|p| p.replace(true)) {
+        return;
+    }
+    spawn_local(async {
+        pf::sleep(100).await;
+        if PERSIST_SOON.with(|p| p.get()) {
+            persist().await;
+        }
+    });
+}
+
+/// Debounced [`sync_tab_strip`]; a run asked for while one runs follows it.
 
 fn schedule_strip_sync() {
     if STRIP_RUNNING.with(|r| r.get()) {
