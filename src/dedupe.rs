@@ -142,6 +142,7 @@ impl AppState {
     pub fn remove_duplicates(&mut self, scope: Scope, o: &DedupeOptions) -> DedupeResult {
         let groups = find_duplicates(self, scope, o);
         let mut result = DedupeResult::default();
+        let mut gone: HashMap<Id, HashSet<Id>> = HashMap::new();
         for g in groups {
             let removed: Vec<TabEntry> = g.remove.iter().filter_map(|r| self.entry(*r).cloned()).collect();
             if let Some(keep) = self.entry_mut(g.keep) {
@@ -156,9 +157,13 @@ impl AppState {
             result.removed += removed.len();
             result.open_tabs.extend(removed.iter().filter_map(|e| e.tab_id));
             for r in &g.remove {
-                if let Some(s) = self.session_mut(r.session) {
-                    s.entries.retain(|e| e.id != r.entry);
-                }
+                gone.entry(r.session).or_default().insert(r.entry);
+            }
+        }
+        // Removed at the end, once per session (groups never share entries).
+        for (session, ids) in gone {
+            if let Some(s) = self.session_mut(session) {
+                s.entries.retain(|e| !ids.contains(&e.id));
             }
         }
         result
