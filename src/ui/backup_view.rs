@@ -2,6 +2,7 @@
 //! saved sessions or comma separated URL lists from a file, the clipboard or a paste.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use eframe::egui::{self, RichText};
@@ -11,7 +12,7 @@ use super::offload;
 use super::theme;
 use super::widgets::{badge, empty_state, format_time, icon_button, primary_button, section_card, text_input};
 use super::{Actions, ViewCtx};
-use crate::model::{Session, Snapshot};
+use crate::model::{Id, Session, Snapshot};
 use crate::platform as pf;
 use crate::protocol::Command;
 use crate::state::{ImportTarget, RestoreMode};
@@ -49,6 +50,9 @@ pub struct BackupView {
     /// The URLs of that column, kept until the text or the column changes (a large CSV
     /// would otherwise be read again on every frame).
     csv_cache: Option<(String, usize, transfer::UrlList)>,
+    /// Tabs added and removed since each snapshot (they don't change once taken), for
+    /// (session, state generation).
+    snapshot_diffs: Option<((Id, u64), HashMap<Id, (usize, usize)>)>,
     parsed_for: String,
     parsed: Option<Result<Imported, String>>,
     /// Numbers the texts sent to the worker: only the answer for the latest one is kept.
@@ -72,6 +76,7 @@ impl Default for BackupView {
             open_imported: false,
             csv_column: 0,
             csv_cache: None,
+            snapshot_diffs: None,
             parsed_for: String::new(),
             parsed: None,
             parse_seq: 0,
@@ -161,11 +166,18 @@ impl BackupView {
                 empty_state(ui, "📸", "No snapshots yet", "Save one above, or turn on automatic snapshots.");
                 return;
             }
-            let current = session.urls();
+            let key = (session.id, super::state_generation());
+            if self.snapshot_diffs.as_ref().is_none_or(|(k, _)| *k != key) {
+                self.snapshot_diffs = Some((key, HashMap::new()));
+            }
+            let mut current = None;
             for snap in snapshots.iter().rev() {
-                let urls = snap.urls();
-                let added = urls.difference(&current).count();
-                let removed = current.difference(&urls).count();
+                let diffs = &mut self.snapshot_diffs.as_mut().expect("set above").1;
+                let (added, removed) = *diffs.entry(snap.id).or_insert_with(|| {
+                    let current = current.get_or_insert_with(|| session.urls());
+                    let urls = snap.urls();
+                    (urls.difference(current).count(), current.difference(&urls).count())
+                });
                 egui::Frame::new()
                     .fill(p.surface_hover)
                     .corner_radius(theme::RADIUS)
