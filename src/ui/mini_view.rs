@@ -232,7 +232,7 @@ fn row(
                 }
                 let media = &cx.state.media;
                 let stopped = media.stopped.contains(&tab_id);
-                if stopped || media.playing.iter().any(|p| p.tab_id == tab_id) {
+                if cx.state.settings.media.stream_controls && (stopped || media.playing.iter().any(|p| p.tab_id == tab_id)) {
                     let (icon, tip) = if stopped {
                         ("▶", "Resume the stream")
                     } else {

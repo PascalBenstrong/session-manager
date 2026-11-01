@@ -239,6 +239,21 @@ pub struct ScriptRegistration {
 /// Prefix of the ids of the registrations we make (others are left alone).
 pub const REGISTRATION_PREFIX: &str = "sm-guard-";
 
+/// The media content script (`web/media.js`: playback for the media limit and the
+/// sidebar, stream controls), in the extension's own world. Registered only while a
+/// feature needs it, so pages pay nothing otherwise.
+pub fn media_registration() -> ScriptRegistration {
+    ScriptRegistration {
+        id: "sm-guard-media",
+        js: vec!["media.js"],
+        matches: vec!["<all_urls>".to_string()],
+        exclude_matches: Vec::new(),
+        all_frames: true,
+        run_at: "document_start",
+        world: "ISOLATED",
+    }
+}
+
 /// The page guard scripts to register, from the settings and rules.
 pub fn registrations(g: &GuardSettings, rules: &[BlockRule]) -> Vec<ScriptRegistration> {
     let exclude: Vec<String> = g.exceptions.iter().flat_map(|s| site_match_patterns(s)).collect();

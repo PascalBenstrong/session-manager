@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.11.1. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.11.2. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -153,5 +153,6 @@ Version: 0.11.1. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Chrome doesn't let extensions change scripts: `debugger` statements written in script files can only be removed in Firefox.
 - Page guards and the inspector don't work on browser-internal pages and extension stores. Guards apply to pages loaded after they are turned on.
 - The inspector reads the top frame's DOM; other frames contribute to Media & frames.
-- The media limit relies on a content script, which only runs in pages loaded after the extension was installed or updated, and not in browser-internal pages.
+- The media limit and the stream controls rely on a content script, registered only while one of them is on; it only runs in pages loaded after that, and not in browser-internal pages. Muted videos smaller than 640×360 (hover previews) are ignored.
+- Settings → Performance: switches for the stream controls, the replay, the media limit, the page guards (all off at once) and tab groups. Frequent changes (playback, titles, tab switches, many tabs opened or restored at once, a closing window) are saved together, at most once a second; UI pages parse only the newest state.
 - Browsers refuse to hibernate the active tab. Chromium may give a hibernated tab a new id; the extension follows the change.

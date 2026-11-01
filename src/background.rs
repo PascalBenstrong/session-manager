@@ -58,7 +58,7 @@ thread_local! {
     /// Tabs opened by a page, until their first page loads: tab -> (opener, opened at).
     static OPENED: RefCell<std::collections::HashMap<TabId, (TabId, f64)>> = RefCell::new(Default::default());
     /// Page guards as last given to the browser.
-    static GUARDS_SYNCED: RefCell<Option<(GuardSettings, Vec<BlockRule>)>> = const { RefCell::new(None) };
+    static GUARDS_SYNCED: RefCell<Option<(GuardSettings, Vec<BlockRule>, bool)>> = const { RefCell::new(None) };
 }
 
 /// How long after opening a tab a rule can still close it (it may load its page late).
@@ -132,12 +132,16 @@ pub async fn start() -> Result<(), JsValue> {
 /// Registers the page guard scripts and script blocking rules for the current settings
 /// (only when they changed since the last time).
 async fn sync_guards() {
-    let wanted = with_state(|s| (s.settings.guards.clone(), s.block_rules.clone()));
+    let wanted = with_state(|s| (s.settings.guards.clone(), s.block_rules.clone(), s.settings.media.needs_page_script()));
     if GUARDS_SYNCED.with(|g| g.borrow().as_ref() == Some(&wanted)) {
         return;
     }
-    let (g, rules) = &wanted;
-    if let Err(e) = pf::sync_content_scripts(&guards::registrations(g, rules)).await {
+    let (g, rules, media) = &wanted;
+    let mut regs = guards::registrations(g, rules);
+    if *media {
+        regs.push(guards::media_registration());
+    }
+    if let Err(e) = pf::sync_content_scripts(&regs).await {
         log(&format!("could not register page guards: {e}"));
     }
     if let Err(e) = pf::set_block_rules(&guards::dnr_rules(rules)).await {
@@ -302,7 +306,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 // adding a copy, and wait for the restore to finish before de-duplicating.
                 schedule_startup_dedupe();
                 if with_state(|s| s.link_by_url(&tab)) {
-                    persist().await;
+                    schedule_persist();
                     return Ok(JsValue::UNDEFINED);
                 }
             }
@@ -310,7 +314,12 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 return Ok(JsValue::UNDEFINED);
             }
             if with_state(|s| s.on_tab_upsert(&tab, now)) {
-                persist().await;
+                // Many tabs at once (opened unloaded, by us, or restored at startup): saved together.
+                if tab.discarded || OPENING.with(|o| o.get()) > 0 || STARTUP_DEDUPE.with(|d| d.get()).is_some() {
+                    schedule_persist();
+                } else {
+                    persist().await;
+                }
                 schedule_auto_organize();
                 schedule_strip_sync();
             }
@@ -343,7 +352,12 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         }
         Event::TabRemoved { tab_id, window_closing } => {
             if with_state(|s| s.on_tab_removed(tab_id, window_closing)) {
-                persist().await;
+                // A closing window removes all its tabs: saved together.
+                if window_closing {
+                    schedule_persist();
+                } else {
+                    persist().await;
+                }
             }
             sync_stream_holds().await;
         }
@@ -383,7 +397,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             }
         }
         Event::Stream { tab_id, frame_id, what } => match what.as_str() {
-            "toggle" => {
+            "toggle" if with_state(|s| s.settings.media.stream_controls) => {
                 let stop = !with_state(|s| s.media.stopped.contains(&tab_id));
                 stop_stream(tab_id, stop).await;
             }
@@ -713,6 +727,11 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             sync_alarms().await;
             schedule_auto_organize();
             enforce_media().await;
+            if !with_state(|s| s.settings.media.stream_controls) {
+                for tab in with_state(|s| s.media.stopped.iter().copied().collect::<Vec<_>>()) {
+                    stop_stream(tab, false).await;
+                }
+            }
             sync_stream_config().await;
             sync_guards().await;
             ok("Settings saved")
@@ -755,10 +774,16 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
         }
         Command::Hibernate { target, force } => hibernate_tabs(&target, force).await,
         Command::StopStream { tab, stop } => {
+            if stop && !with_state(|s| s.settings.media.stream_controls) {
+                return Err("stream controls are off (Settings → Performance)".into());
+            }
             stop_stream(tab, stop).await;
             ok(if stop { "Stream stopped: no more data until you resume it" } else { "Stream resumed" })
         }
         Command::StopBackgroundStreams => {
+            if !with_state(|s| s.settings.media.stream_controls) {
+                return Err("stream controls are off (Settings → Performance)".into());
+            }
             let tabs = pf::query_tabs().await?;
             let ids = with_state(|s| s.media.background_streams(&tabs));
             for id in &ids {

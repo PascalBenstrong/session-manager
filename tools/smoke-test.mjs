@@ -37,6 +37,8 @@ const send = async (cmd) => {
   return r;
 };
 const stored = () => JSON.parse(storage.sm_state);
+/** Frequent changes (playback, titles, many tabs at once) are saved within a second. */
+const saved = () => new Promise((r) => setTimeout(r, 1100));
 let passed = 0;
 const step = async (name, f) => { await f(); passed++; console.log(`ok - ${name}`); };
 
@@ -88,7 +90,7 @@ await step('switch active session without loading, then load it unloaded', async
   const t = [...tabs.values()].find((t) => t.url === 'https://work.example.org/');
   tabs.delete(t.id);
   ev.removed.fire(t.id, { isWindowClosing: true, windowId: 1 });
-  await tick();
+  await saved(); // a closing window's tabs are saved together
   const entry = stored().sessions.find((s) => s.id === work.id).entries[0];
   assert.equal(entry.tab_id, null);
   // Switch back to Default: no tabs opened
@@ -385,7 +387,7 @@ await step('auto-remove duplicates after the browser restarts and restores tabs'
   const a = await api.tabs.create({ url: 'https://restore.example/a' });
   const b = await api.tabs.create({ url: 'https://restore.example/b' });
   const a2 = await api.tabs.create({ url: 'https://restore.example/a' });
-  await tick();
+  await saved(); // restored tabs are saved together
   const entries = () => stored().sessions.find((s) => s.id === sid).entries;
   assert.equal(entries().length, 2, 'restored tabs linked to their saved entries');
   assert.deepEqual(entries().map((e) => e.tab_id), [a.id, b.id]);
@@ -460,7 +462,7 @@ await step('a workspace’s saved tabs open unloaded, in the background, in thei
     tabs.delete(t.id);
     ev.removed.fire(t.id, { isWindowClosing: true, windowId: 1 });
   }
-  await tick();
+  await saved();
   const entries = () => stored().sessions.flatMap((x) => x.entries).filter((e) => e.workspace === ws.id);
   assert.ok(entries().every((e) => e.tab_id == null), 'saved, closed');
   r = await send({ cmd: 'OpenEntries', entries: refs, discarded: true });
@@ -619,7 +621,24 @@ await step('stopped streams: paused, their media data held back until resumed', 
   // The replay settings are stored for the content script.
   const st = stored().settings;
   await send({ cmd: 'UpdateSettings', settings: { ...st, media: { ...st.media, stop_replay: true, replay_height: 144, replay_frames: 12 } } });
-  assert.deepEqual(storage.smStreamConfig, { replay: true, replayHeight: 144, replayFrames: 12 });
+  assert.deepEqual(storage.smStreamConfig, { streamControls: true, replay: true, replayHeight: 144, replayFrames: 12 });
+  // The media page script is registered while a feature needs it (not in the manifest).
+  const mediaScript = () => contentScripts.find((x) => x.id === 'sm-guard-media');
+  assert.deepEqual(mediaScript() && [mediaScript().js, mediaScript().world, mediaScript().allFrames], [['media.js'], 'ISOLATED', true]);
+  // Stream controls off (and no media limit): stopped streams resume, no script in pages.
+  await send({ cmd: 'StopStream', tab: live.id, stop: true });
+  tabMessages.length = 0;
+  const off = stored().settings;
+  await send({ cmd: 'UpdateSettings', settings: { ...off, media: { ...off.media, stream_controls: false, policy: 'Off' } } });
+  assert.deepEqual(stored().media.stopped, []);
+  assert.deepEqual(tabMessages, [{ tabId: live.id, msg: { smStreamCmd: 'resume' } }]);
+  assert.equal(mediaScript(), undefined, 'no media script without a feature that needs it');
+  assert.equal(storage.smStreamConfig.streamControls, false);
+  const refused = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'StopStream', tab: live.id, stop: true })));
+  assert.ok(!refused.ok && /stream controls are off/.test(refused.error));
+  const back = stored().settings;
+  await send({ cmd: 'UpdateSettings', settings: { ...back, media: { ...back.media, stream_controls: true } } });
+  assert.ok(mediaScript(), 'back on');
 });
 
 const settle = () => new Promise((r) => setTimeout(r, 800)); // the tab strip sync is debounced
@@ -731,9 +750,10 @@ const guards = async (changes) => {
 await step('page guards are registered in the page world, with exceptions', async () => {
   await guards({ popups: true, context_menu: true, text_selection: true, anti_debugger: true, devtools_stealth: true,
     silence_console: true, exceptions: ['docs.example.com'] });
-  const ids = contentScripts.map((s) => s.id).sort();
+  const guardScripts = () => contentScripts.filter((s) => s.id !== 'sm-guard-media');
+  const ids = guardScripts().map((s) => s.id).sort();
   assert.deepEqual(ids, ['sm-guard-context-menu', 'sm-guard-debugger', 'sm-guard-popups', 'sm-guard-stealth']);
-  for (const s of contentScripts) {
+  for (const s of guardScripts()) {
     assert.equal(s.world, 'MAIN');
     assert.equal(s.runAt, 'document_start');
     assert.ok(s.allFrames);
@@ -742,7 +762,7 @@ await step('page guards are registered in the page world, with exceptions', asyn
   }
   assert.deepEqual(contentScripts.find((s) => s.id === 'sm-guard-stealth').js, ['guards/devtools-stealth.js', 'guards/silence-console.js']);
   await guards({ popups: false, context_menu: false, anti_debugger: false, devtools_stealth: false });
-  assert.deepEqual(contentScripts, [], 'turned off: unregistered');
+  assert.deepEqual(guardScripts(), [], 'turned off: unregistered');
 });
 
 await step('custom rules: block scripts (declarativeNetRequest), all pop-ups on a site', async () => {
@@ -751,11 +771,12 @@ await step('custom rules: block scripts (declarativeNetRequest), all pop-ups on 
   assert.deepEqual(dnr(), [{ id: rule.id, priority: 1, action: { type: 'block' },
     condition: { resourceTypes: ['script'], urlFilter: '||ads.example.net^', initiatorDomains: ['news.example'] } }]);
   r = await send({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'AllPopupsOn', pattern: '', sites: ['bad.example'] } });
-  assert.deepEqual(contentScripts.map((s) => [s.id, s.matches]), [['sm-guard-popups-strict', ['*://bad.example/*', '*://*.bad.example/*']]]);
+  const guardScripts = () => contentScripts.filter((s) => s.id !== 'sm-guard-media');
+  assert.deepEqual(guardScripts().map((s) => [s.id, s.matches]), [['sm-guard-popups-strict', ['*://bad.example/*', '*://*.bad.example/*']]]);
   await send({ cmd: 'SaveBlockRule', rule: { ...rule, enabled: false } });
   assert.deepEqual(dnr(), [], 'disabled rules are removed');
   for (const x of stored().block_rules) await send({ cmd: 'DeleteBlockRule', id: x.id });
-  assert.deepEqual(contentScripts, []);
+  assert.deepEqual(guardScripts(), []);
   const bad = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'SaveBlockRule', rule: { id: 0, enabled: true, kind: 'Script', pattern: '/(/', sites: [] } })));
   assert.ok(!bad.ok && /regex/.test(bad.error));
 });

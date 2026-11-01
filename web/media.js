@@ -14,6 +14,15 @@
   const elements = () => document.querySelectorAll('video, audio');
   const isPlaying = (m) => !m.paused && !m.ended;
   const isVideo = (m) => m instanceof HTMLVideoElement;
+  // A hover preview (a thumbnail that plays): muted, and smaller than a player. Previews
+  // don't count as media playing, get no stream button and aren't replayed.
+  const PREVIEW_W = 640;
+  const PREVIEW_H = 360;
+  const isPreview = (m) => {
+    if (!isVideo(m) || !(m.muted || m.volume === 0)) return false;
+    const r = m.getBoundingClientRect();
+    return r.width < PREVIEW_W || r.height < PREVIEW_H;
+  };
   // Videos playing in this frame (kept from their events: nothing to look up otherwise).
   const playingVideos = new Set();
   document.addEventListener('playing', (e) => isVideo(e.target) && playingVideos.add(e.target), true);
@@ -31,7 +40,7 @@
   const signal = (what) => message({ smStream: what });
 
   function report() {
-    const playing = [...elements()].filter(isPlaying);
+    const playing = [...elements()].filter((m) => isPlaying(m) && !isPreview(m));
     const state = { playing: playing.length > 0, video: playing.some(isVideo), pip: !!document.pictureInPictureElement };
     const key = JSON.stringify(state);
     if (key === last) return;
@@ -59,7 +68,7 @@
 
   // ------------------------------------------------------------ stopped streams
 
-  let config = { replay: false, replayHeight: 240, replayFrames: 30 };
+  let config = { streamControls: true, replay: false, replayHeight: 240, replayFrames: 30 };
   let stopped = false;
   let stoppedAt = 0;
   const stoppedByUs = new Set(); // media we paused when stopping, resumed with the stream
@@ -95,7 +104,7 @@
     stopped = true;
     stoppedAt = performance.now();
     for (const m of elements()) {
-      if (!isPlaying(m)) continue;
+      if (!isPlaying(m) || isPreview(m)) continue;
       m.pause();
       stoppedByUs.add(m);
     }
@@ -150,7 +159,7 @@
         }
       }
       pausedByUs.clear();
-    } else if (msg.smStreamCmd === 'stop') {
+    } else if (msg.smStreamCmd === 'stop' && config.streamControls) {
       stopStreams();
     } else if (msg.smStreamCmd === 'resume') {
       resumeStreams();
@@ -163,7 +172,7 @@
   const MIN_H = 112;
   const rectOf = (el) => el.getBoundingClientRect();
   const bigEnough = (r) => r.width >= MIN_W && r.height >= MIN_H;
-  const candidate = (v) => (isPlaying(v) || stoppedByUs.has(v)) && bigEnough(rectOf(v));
+  const candidate = (v) => stoppedByUs.has(v) || (isPlaying(v) && bigEnough(rectOf(v)) && !isPreview(v));
   // The biggest of these videos.
   const mainVideo = (list) =>
     list.filter(isVideo).sort((a, b) => rectOf(b).width * rectOf(b).height - rectOf(a).width * rectOf(a).height)[0] || null;
@@ -252,13 +261,14 @@
 
   let pointer = null;
   let frame = 0;
+  const HOVER_CHECK_MS = 150;
   addEventListener(
     'pointermove',
     (e) => {
       // Nothing to do in pages (and frames) without a playing or stopped video.
-      if (!playingVideos.size && !stoppedByUs.size) return;
+      if (!config.streamControls || (!playingVideos.size && !stoppedByUs.size)) return;
       pointer = [e.clientX, e.clientY];
-      if (!frame) frame = requestAnimationFrame(hoverCheck);
+      if (!frame) frame = setTimeout(hoverCheck, HOVER_CHECK_MS);
     },
     { capture: true, passive: true },
   );
@@ -281,21 +291,31 @@
 
   // ---- replay: a low-resolution loop of the last frames while stopped
 
-  const rings = new WeakMap(); // video -> { frames: [{ canvas, t }], next }
-  let capturing = new Set();
+  const rings = new WeakMap(); // video -> { gen, frames: [{ bmp, t }], next, last, busy }
+  let generation = 0; // a new one forgets all frames (settings changed)
+  const freeRing = (ring) => {
+    for (const f of ring.frames) f.bmp && f.bmp.close && f.bmp.close();
+    ring.frames = [];
+  };
 
   function applyConfig(c) {
     const was = config.replay;
+    const old = config;
     config = { ...config, ...c };
-    if (!config.replay || !was) {
-      // Off: forget the frames. On: start with the videos playing now.
-      for (const v of capturing) rings.delete(v);
-      capturing = new Set();
-    }
-    if (config.replay) for (const v of document.querySelectorAll('video')) if (isPlaying(v)) capture(v);
+    if (!config.replay || !was || old.replayHeight !== config.replayHeight) generation++;
+    if (!config.streamControls) hide();
+    if (config.replay) for (const v of playingVideos) capture(v);
   }
   // A video that's done (emptied) lets its frames go.
-  document.addEventListener('emptied', (e) => capturing.delete(e.target) && rings.delete(e.target), true);
+  document.addEventListener(
+    'emptied',
+    (e) => {
+      const ring = rings.get(e.target);
+      if (ring) freeRing(ring);
+      rings.delete(e.target);
+    },
+    true,
+  );
   // Copies: at most 10 a second, of the biggest playing video of the frame, while shown.
   const REPLAY_GAP_MS = 100;
   try {
@@ -308,31 +328,42 @@
   document.addEventListener('playing', (e) => config.replay && isVideo(e.target) && capture(e.target), true);
 
   function capture(v) {
-    if (capturing.has(v) || !v.requestVideoFrameCallback) return;
-    capturing.add(v);
-    const ring = { frames: [], next: 0, last: 0 };
+    if (!v.requestVideoFrameCallback || typeof createImageBitmap !== 'function') return;
+    const existing = rings.get(v);
+    if (existing && existing.gen === generation) return;
+    if (existing) freeRing(existing);
+    const ring = { gen: generation, frames: [], next: 0, last: 0, busy: false };
     rings.set(v, ring);
     const grab = (now) => {
-      if (!capturing.has(v) || !config.replay) return capturing.delete(v);
+      if (ring.gen !== generation || !config.replay || rings.get(v) !== ring) return freeRing(ring);
       try {
-        const due = now - ring.last >= REPLAY_GAP_MS && !document.hidden;
-        if (due && v.videoWidth && v.videoHeight && bigEnough(rectOf(v)) && (playingVideos.size < 2 || mainVideo([...playingVideos]) === v)) {
+        const due = !ring.busy && now - ring.last >= REPLAY_GAP_MS && !document.hidden;
+        if (due && v.videoWidth && v.videoHeight && !isPreview(v) && (playingVideos.size < 2 || mainVideo([...playingVideos]) === v)) {
           ring.last = now;
+          ring.busy = true;
           const h = Math.min(config.replayHeight, v.videoHeight);
           const w = Math.max(1, Math.round((v.videoWidth * h) / v.videoHeight));
-          const n = config.replayFrames;
-          if (ring.frames.length > n) ring.frames.length = n;
-          let slot = ring.frames.length < n ? null : ring.frames[ring.next % n];
-          if (!slot) {
-            slot = { canvas: document.createElement('canvas'), t: 0 };
-            ring.frames.push(slot);
-          }
-          if (slot.canvas.width !== w || slot.canvas.height !== h) Object.assign(slot.canvas, { width: w, height: h });
-          slot.canvas.getContext('2d', { alpha: false }).drawImage(v, 0, 0, w, h);
-          slot.t = now;
-          ring.next = (ring.next + 1) % n;
+          // Scaled down by the browser, off the main thread.
+          createImageBitmap(v, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' }).then(
+            (bmp) => {
+              ring.busy = false;
+              if (ring.gen !== generation) return bmp.close();
+              const n = config.replayFrames;
+              while (ring.frames.length > n) ring.frames.pop().bmp.close();
+              if (ring.frames.length < n) ring.frames.push({ bmp, t: now });
+              else {
+                const slot = ring.frames[ring.next % n];
+                slot.bmp.close();
+                Object.assign(slot, { bmp, t: now });
+              }
+              ring.next = (ring.next + 1) % n;
+            },
+            () => (ring.busy = false),
+          );
         }
-      } catch {}
+      } catch {
+        ring.busy = false;
+      }
       v.requestVideoFrameCallback(grab);
     };
     v.requestVideoFrameCallback(grab);
@@ -360,7 +391,10 @@
       let i = 0;
       const draw = () => {
         if (!replayCanvas.classList.contains('on')) return;
-        const f = frames[i % n].canvas;
+        replayTimer = setTimeout(draw, document.hidden ? 1000 : step);
+        const f = frames[i % n].bmp;
+        i++;
+        if (!f || !f.width) return; // freed meanwhile
         // Fit inside, like the video does.
         const scale = Math.min(replayCanvas.width / f.width, replayCanvas.height / f.height);
         const w = f.width * scale;
@@ -368,8 +402,6 @@
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, replayCanvas.width, replayCanvas.height);
         ctx.drawImage(f, (replayCanvas.width - w) / 2, (replayCanvas.height - h) / 2, w, h);
-        i++;
-        replayTimer = setTimeout(draw, document.hidden ? 1000 : step);
       };
       draw();
     } catch {}

@@ -68,6 +68,7 @@ impl SidebarView {
                 acts.send(Command::NewTabInWorkspace { workspace: None });
             }
             if self.background_streams > 0
+                && cx.state.settings.media.stream_controls
                 && ui
                     .button(format!("⏸ {}", self.background_streams))
                     .on_hover_text("Stop the streams playing in background tabs: they pause and download nothing until you resume them")
@@ -285,6 +286,7 @@ fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool,
         if hovered {
             if let Some(tab) = e.tab_id
                 && (playing || stopped)
+                && cx.state.settings.media.stream_controls
             {
                 let (icon, tip) = if stopped {
                     ("▶", "Resume the stream (its data is held back meanwhile)")
@@ -380,7 +382,9 @@ fn row_menu(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: 
         acts.send(Command::AssignWorkspace { entries: vec![r], workspace: None });
         ui.close();
     }
-    if let Some(tab) = e.tab_id {
+    if let Some(tab) = e.tab_id
+        && cx.state.settings.media.stream_controls
+    {
         let stopped = cx.state.media.stopped.contains(&tab);
         if stopped && ui.button("▶ Resume stream").clicked() {
             acts.send(Command::StopStream { tab, stop: false });

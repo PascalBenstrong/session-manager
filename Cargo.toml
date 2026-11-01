@@ -1,6 +1,6 @@
 [package]
 name = "session-manager"
-version = "0.11.1"
+version = "0.11.2"
 edition = "2024"
 description = "Tab session manager and site-data cleaner browser extension (Rust + egui + WebAssembly)"
 license = "MIT"

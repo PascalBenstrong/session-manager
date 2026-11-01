@@ -2,6 +2,16 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.11.2] - 2026-11-01
+
+### New
+- Settings → *Performance*: turn off the features that work in every page or on every tab change: stream controls, the replay of stopped streams, the media limit, page guards and workspaces as tab groups. With the stream controls and the media limit off, no media script runs in pages at all.
+
+### Improved
+- Opening many unloaded tabs (a workspace's or a session's saved tabs) no longer slows the browser down or takes a lot of memory: their changes are saved together instead of tab by tab, and open sidebars and popups only read the newest state. The same goes for tabs restored at startup and the tabs of a closing window.
+- Video previews (thumbnails that play when you hover them) no longer slow pages down: they don't count as playing media, get no *Stop stream* button and aren't replayed. The button's hover check runs a few times a second instead of on every mouse move.
+- The replay of stopped streams scales its frames with the browser (off the page's main thread) and frees them right away.
+
 ## [0.11.1] - 2026-11-01
 
 ### Improved

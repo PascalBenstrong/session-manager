@@ -43,6 +43,9 @@ pub struct MediaSettings {
     pub resume_on_activate: bool,
     /// A video in picture-in-picture counts as visible and keeps playing.
     pub allow_pip: bool,
+    /// Stream controls: stop / resume a tab's streams (a button over playing videos, the
+    /// sidebar and the popup). With the media limit, it needs the media page script.
+    pub stream_controls: bool,
     /// While a stream is stopped, loop a low-resolution copy of its last frames over the
     /// paused video (kept in the page's memory, no data).
     pub stop_replay: bool,
@@ -60,6 +63,7 @@ impl Default for MediaSettings {
             include_audio: false,
             resume_on_activate: true,
             allow_pip: true,
+            stream_controls: true,
             stop_replay: false,
             replay_height: 240,
             replay_frames: 30,
@@ -75,10 +79,16 @@ impl MediaSettings {
     /// What the media content script needs to know (stored for it, see `web/media.js`).
     pub fn stream_config(&self) -> serde_json::Value {
         serde_json::json!({
-            "replay": self.stop_replay,
+            "streamControls": self.stream_controls,
+            "replay": self.stream_controls && self.stop_replay,
             "replayHeight": self.replay_height.clamp(48, 720),
             "replayFrames": self.replay_frames.clamp(*REPLAY_FRAMES.start(), *REPLAY_FRAMES.end()),
         })
+    }
+
+    /// Pages need the media script (`web/media.js`): for the limit or the stream controls.
+    pub fn needs_page_script(&self) -> bool {
+        self.enabled() || self.stream_controls
     }
 
     pub fn enabled(&self) -> bool {

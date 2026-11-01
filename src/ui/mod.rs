@@ -61,7 +61,9 @@ pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
 #[derive(Default)]
 struct Inbox {
     responses: Vec<Response>,
-    pushed_state: Option<AppState>,
+    /// The newest state the background saved, not read yet: only the newest is parsed (once
+    /// per frame), however many arrive meanwhile. Kept as the JS string until then.
+    pushed_state: Option<JsValue>,
     /// The window of a sidebar page.
     window_id: Option<TabId>,
     /// Messages for the toast: (text, error).
@@ -232,13 +234,8 @@ impl App {
             let inbox = inbox.clone();
             let ctx = cc.egui_ctx.clone();
             let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
-                if let Some(json) = v.as_string()
-                    && let Ok(state) = serde_json::from_str::<AppState>(&json)
-                {
-                    let mut inbox = inbox.borrow_mut();
-                    if inbox.pushed_state.as_ref().is_none_or(|p| state.revision >= p.revision) {
-                        inbox.pushed_state = Some(state);
-                    }
+                if v.is_string() {
+                    inbox.borrow_mut().pushed_state = Some(v);
                     ctx.request_repaint();
                 }
             });
@@ -370,7 +367,9 @@ impl App {
         for (text, error) in notices {
             self.set_status(text, error);
         }
-        if let Some(s) = pushed {
+        if let Some(json) = pushed.and_then(|v| v.as_string())
+            && let Ok(s) = serde_json::from_str::<AppState>(&json)
+        {
             self.accept_state(s);
         }
         for r in responses {

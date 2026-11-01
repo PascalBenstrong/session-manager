@@ -17,6 +17,74 @@ pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(4.0);
+        section_card(
+            ui,
+            "Performance",
+            "Features that work in every page or on every tab change. Turn off the ones you don't use to keep the browser light.",
+            |ui| {
+                let p = theme::palette(ui);
+                let m = &mut s.media;
+                changed |= setting(
+                    ui,
+                    &mut m.stream_controls,
+                    "Stream controls",
+                    "⏸ Stop stream on playing videos, in the sidebar and the popup, and the 🔊 of tabs playing media. \
+                     Runs a small script in every page.",
+                );
+                ui.add_enabled_ui(m.stream_controls, |ui| {
+                    changed |= setting(
+                        ui,
+                        &mut m.stop_replay,
+                        "Replay of stopped streams",
+                        "Keeps copies of the playing video's last frames (up to 10 a second) to loop them while it's stopped.",
+                    );
+                });
+                let mut limit = m.enabled();
+                if setting(ui, &mut limit, "Media limit", "Pauses videos in background tabs (choose how below, in Media playback).") {
+                    m.policy = if limit { MediaPolicy::ActiveTabOnly } else { MediaPolicy::Off };
+                    changed = true;
+                }
+                let g = &mut s.guards;
+                let mut guards = g.popups || g.click_hijack || g.context_menu || g.anti_debugger || g.devtools_stealth;
+                if setting(
+                    ui,
+                    &mut guards,
+                    "Page guards",
+                    "Scripts that run in every page before its own (pop-ups, play button ads, right-click, debugger traps, \
+                     developer tools). Off turns them all off; choose them one by one in Guards.",
+                ) {
+                    if guards {
+                        g.popups = true;
+                        g.click_hijack = true;
+                    } else {
+                        g.popups = false;
+                        g.click_hijack = false;
+                        g.context_menu = false;
+                        g.text_selection = false;
+                        g.anti_debugger = false;
+                        g.strip_debugger_scripts = false;
+                        g.devtools_stealth = false;
+                        g.silence_console = false;
+                    }
+                    changed = true;
+                }
+                if cx.caps.tab_groups {
+                    changed |= setting(
+                        ui,
+                        &mut s.browser_ui.tab_groups,
+                        "Workspaces as tab groups",
+                        "Keeps every workspace's tabs in a tab group, checked after tab changes.",
+                    );
+                }
+                let script = if s.media.needs_page_script() {
+                    "The media page script runs in pages (for the stream controls or the media limit)."
+                } else {
+                    "No media script runs in pages."
+                };
+                ui.label(RichText::new(script).small().color(p.muted));
+            },
+        );
+
         section_card(ui, "Tab tracking", "How open tabs are recorded in sessions.", |ui| {
             changed |= setting(
                 ui,
@@ -193,30 +261,35 @@ pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
             "⏸ Stop stream (on a playing video, or next to its tab in the sidebar) pauses it and holds back its data until you resume it.",
             |ui| {
                 let m = &mut s.media;
-                changed |= setting(
-                    ui,
-                    &mut m.stop_replay,
-                    "Replay the last frames while stopped",
-                    "Loops a low-resolution copy of the video's last frames over it, kept in the page's memory (no data). \
+                if !m.stream_controls {
+                    ui.label(RichText::new("Stream controls are off (Performance, above).").small().color(p.muted));
+                }
+                ui.add_enabled_ui(m.stream_controls, |ui| {
+                    changed |= setting(
+                        ui,
+                        &mut m.stop_replay,
+                        "Replay the last frames while stopped",
+                        "Loops a low-resolution copy of the video's last frames over it, kept in the page's memory (no data). \
                      It's only a picture: the site's player stays paused.",
-                );
-                ui.add_enabled_ui(m.stop_replay, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Resolution");
-                        egui::ComboBox::from_id_salt("replay-height").selected_text(format!("{}p", m.replay_height)).width(70.0).show_ui(
-                            ui,
-                            |ui| {
-                                for h in REPLAY_HEIGHTS {
-                                    changed |= ui.selectable_value(&mut m.replay_height, h, format!("{h}p")).changed();
-                                }
-                            },
-                        );
-                        ui.add_space(12.0);
-                        ui.label("Frames");
-                        changed |= ui.add(egui::DragValue::new(&mut m.replay_frames).range(REPLAY_FRAMES)).changed();
-                        // ~0.4 MB per frame at 240p; videos keep their last frames while they play.
-                        let mb = m.replay_frames as f64 * (m.replay_height as f64).powi(2) * 16.0 / 9.0 * 4.0 / 1e6;
-                        ui.label(RichText::new(format!("≈ {mb:.0} MB of memory per playing video")).small().color(p.muted));
+                    );
+                    ui.add_enabled_ui(m.stop_replay, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Resolution");
+                            egui::ComboBox::from_id_salt("replay-height")
+                                .selected_text(format!("{}p", m.replay_height))
+                                .width(70.0)
+                                .show_ui(ui, |ui| {
+                                    for h in REPLAY_HEIGHTS {
+                                        changed |= ui.selectable_value(&mut m.replay_height, h, format!("{h}p")).changed();
+                                    }
+                                });
+                            ui.add_space(12.0);
+                            ui.label("Frames");
+                            changed |= ui.add(egui::DragValue::new(&mut m.replay_frames).range(REPLAY_FRAMES)).changed();
+                            // ~0.4 MB per frame at 240p; videos keep their last frames while they play.
+                            let mb = m.replay_frames as f64 * (m.replay_height as f64).powi(2) * 16.0 / 9.0 * 4.0 / 1e6;
+                            ui.label(RichText::new(format!("≈ {mb:.0} MB of memory per playing video")).small().color(p.muted));
+                        });
                     });
                 });
                 ui.label(
