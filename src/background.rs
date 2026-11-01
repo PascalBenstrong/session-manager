@@ -60,6 +60,9 @@ thread_local! {
     /// Tabs opened by a page, until their first page loads: tab -> (opener, opened at).
     static OPENED: RefCell<std::collections::HashMap<TabId, (TabId, f64)>> = RefCell::new(Default::default());
     /// Page guards as last given to the browser.
+    /// The compiled matchers of the rules removing cookies as soon as they're set, with the
+    /// rules and open tab URLs they were built from (see [`on_cookie_set`]).
+    static COOKIE_MATCHERS: RefCell<(Vec<CleanupSpec>, Vec<String>, Vec<SpecMatcher>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
     static GUARDS_SYNCED: RefCell<Option<(GuardSettings, Vec<BlockRule>, bool)>> = const { RefCell::new(None) };
 }
 
@@ -532,14 +535,26 @@ async fn prevent_duplicate(tab: &BrowserTab, now: f64) -> bool {
 
 /// "Clean up whenever a new value is set": remove freshly set cookies matching a rule.
 async fn on_cookie_set(cookie: Cookie) {
-    let (rules, open_urls) = STATE.with(|s| {
+    let hit = STATE.with(|s| {
         let s = s.borrow();
-        let rules: Vec<CleanupSpec> =
-            s.cleanup_rules.iter().filter(|r| r.enabled && r.on_cookie_set && r.spec.data_types.cookies).map(|r| r.spec.clone()).collect();
-        let urls = open_urls(&s);
-        (rules, urls)
+        let rules = || s.cleanup_rules.iter().filter(|r| r.enabled && r.on_cookie_set && r.spec.data_types.cookies).map(|r| &r.spec);
+        if rules().next().is_none() {
+            return false;
+        }
+        // Open tabs only matter to rules targeting them.
+        let tabs = rules().any(|spec| spec.target == CleanupTarget::OpenTabs);
+        let urls = || s.sessions.iter().flat_map(|s| s.entries.iter()).filter(|e| tabs && e.is_open()).map(|e| &e.url);
+        COOKIE_MATCHERS.with(|c| {
+            let mut c = c.borrow_mut();
+            let (specs, open, matchers) = &mut *c;
+            if !specs.iter().eq(rules()) || !open.iter().eq(urls()) {
+                *specs = rules().cloned().collect();
+                *open = urls().cloned().collect();
+                *matchers = specs.iter().filter_map(|spec| SpecMatcher::new(spec, open).ok()).collect();
+            }
+            matchers.iter().any(|m| m.matches_cookie(&cookie))
+        })
     });
-    let hit = rules.iter().filter_map(|spec| SpecMatcher::new(spec, &open_urls).ok()).any(|m| m.matches_cookie(&cookie));
     if hit {
         let removal = cleanup::CookieRemoval {
             url: cookie.url(),
@@ -605,10 +620,6 @@ async fn remove_duplicates_in(sessions: &[Id], restored_since: Option<f64>) -> R
         pf::remove_tabs(&open_tabs).await?;
     }
     Ok(removed)
-}
-
-fn open_urls(s: &AppState) -> Vec<String> {
-    s.sessions.iter().flat_map(|s| s.entries.iter()).filter(|e| e.is_open()).map(|e| e.url.clone()).collect()
 }
 
 // ---------------------------------------------------------------- commands
