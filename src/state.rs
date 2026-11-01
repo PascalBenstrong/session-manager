@@ -61,9 +61,9 @@ impl AppState {
     }
 
     pub fn locate_tab(&self, tab_id: TabId) -> Option<EntryRef> {
-        self.sessions.iter().find_map(|s| {
-            s.entries.iter().find(|e| e.tab_id == Some(tab_id)).map(|e| EntryRef { session: s.id, entry: e.id })
-        })
+        self.sessions
+            .iter()
+            .find_map(|s| s.entries.iter().find(|e| e.tab_id == Some(tab_id)).map(|e| EntryRef { session: s.id, entry: e.id }))
     }
 
     pub fn entry(&self, r: EntryRef) -> Option<&TabEntry> {
@@ -287,9 +287,9 @@ impl AppState {
             .chain(self.sessions.iter().enumerate().filter(|(_, s)| s.id != active))
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
-        let found = order.into_iter().find_map(|si| {
-            self.sessions[si].entries.iter().position(|e| e.tab_id.is_none() && e.url == t.url).map(|ei| (si, ei))
-        });
+        let found = order
+            .into_iter()
+            .find_map(|si| self.sessions[si].entries.iter().position(|e| e.tab_id.is_none() && e.url == t.url).map(|ei| (si, ei)));
         let Some((si, ei)) = found else { return false };
         let e = &mut self.sessions[si].entries[ei];
         e.tab_id = Some(t.id);
@@ -595,8 +595,7 @@ impl AppState {
 
     /// Hosts of all session entries (cleanup candidates).
     pub fn known_hosts(&self) -> Vec<String> {
-        let set: BTreeSet<String> =
-            self.sessions.iter().flat_map(|s| s.entries.iter().map(|e| url::host(&e.url))).collect();
+        let set: BTreeSet<String> = self.sessions.iter().flat_map(|s| s.entries.iter().map(|e| url::host(&e.url))).collect();
         set.into_iter().collect()
     }
 }

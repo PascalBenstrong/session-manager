@@ -111,11 +111,8 @@ impl SidebarView {
             }
         }
         // The tab in use: the most recently activated open tab of this window.
-        let active_tab = entries
-            .iter()
-            .filter(|(_, e)| e.is_open())
-            .max_by(|a, b| a.1.last_accessed.total_cmp(&b.1.last_accessed))
-            .map(|(r, _)| *r);
+        let active_tab =
+            entries.iter().filter(|(_, e)| e.is_open()).max_by(|a, b| a.1.last_accessed.total_cmp(&b.1.last_accessed)).map(|(r, _)| *r);
         let filtering = !self.query.trim().is_empty();
         let in_use = state
             .sessions
@@ -193,17 +190,21 @@ impl SidebarView {
         }
         if ui.is_rect_visible(rect) {
             let hovered = ui.rect_contains_pointer(rect);
-            let fill = color.gamma_multiply(if hovered || drop_hover { 0.26 } else if current { 0.2 } else { 0.1 });
+            let fill = color.gamma_multiply(if hovered || drop_hover {
+                0.26
+            } else if current {
+                0.2
+            } else {
+                0.1
+            });
             let stroke = if drop_hover { Stroke::new(1.5, color) } else { Stroke::NONE };
             ui.painter().rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
             let bar = egui::Rect::from_min_size(rect.min + egui::vec2(0.0, 6.0), egui::vec2(3.0, rect.height() - 12.0));
             ui.painter().rect_filled(bar, 1.5, color);
-            let mut row = ui.new_child(
-                UiBuilder::new().max_rect(rect.shrink2(egui::vec2(6.0, 0.0))).layout(Layout::left_to_right(Align::Center)),
-            );
+            let mut row =
+                ui.new_child(UiBuilder::new().max_rect(rect.shrink2(egui::vec2(6.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
             row.spacing_mut().item_spacing.x = 4.0;
-            if icon_button(&mut row, if collapsed { "▸" } else { "▾" }, if collapsed { "Show its tabs" } else { "Hide its tabs" })
-                .clicked()
+            if icon_button(&mut row, if collapsed { "▸" } else { "▾" }, if collapsed { "Show its tabs" } else { "Hide its tabs" }).clicked()
             {
                 collapsed = !collapsed;
                 row.data_mut(|d| d.insert_temp(cid, collapsed));
@@ -274,11 +275,7 @@ fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool,
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, 6.0, fill);
-    let mut row = ui.new_child(
-        UiBuilder::new()
-            .max_rect(rect.shrink2(egui::vec2(6.0, 0.0)))
-            .layout(Layout::left_to_right(Align::Center)),
-    );
+    let mut row = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(egui::vec2(6.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
     row.spacing_mut().item_spacing.x = 6.0;
     let host = e.host();
     let av = avatar_sized(&mut row, &host, !e.is_open() || e.discarded, 18.0);
@@ -338,9 +335,11 @@ fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool,
     } else {
         ""
     };
-    let resp = resp
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text(format!("{}{state}\n{}\n\nRight-click for more", e.display_title(), e.url));
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(format!(
+        "{}{state}\n{}\n\nRight-click for more",
+        e.display_title(),
+        e.url
+    ));
     if resp.clicked() {
         acts.send(Command::OpenEntry { entry: r, discarded: false });
     }
@@ -394,7 +393,8 @@ fn row_menu(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: 
             ui.close();
         }
     }
-    if e.is_open() && ui.button("💾 Close, keep saved").on_hover_text("Close the tab; it stays in the session and its workspace").clicked() {
+    if e.is_open() && ui.button("💾 Close, keep saved").on_hover_text("Close the tab; it stays in the session and its workspace").clicked()
+    {
         acts.send(Command::CloseEntries { entries: vec![r] });
         ui.close();
     }
@@ -404,7 +404,11 @@ fn row_menu(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: 
     }
     ui.separator();
     if e.is_open() {
-        if ui.button("Stop tracking (keep the tab open)").on_hover_text("Remove it from the session and its workspace; the tab stays").clicked() {
+        if ui
+            .button("Stop tracking (keep the tab open)")
+            .on_hover_text("Remove it from the session and its workspace; the tab stays")
+            .clicked()
+        {
             acts.send(Command::RemoveEntries { entries: vec![r], close_tabs: false });
             ui.close();
         }

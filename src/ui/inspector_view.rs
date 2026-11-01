@@ -17,9 +17,9 @@ use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use super::Actions;
 use super::theme;
 use super::widgets::{badge, empty_state, icon_button, primary_button, segmented, text_input};
-use super::Actions;
 use crate::ads::{self, AdCategory, AdSignal, ProviderHit};
 use crate::guards::{BlockRule, BlockRuleKind, normalize_site};
 use crate::model::{AppState, TabId};
@@ -403,15 +403,12 @@ impl InspectorView {
 
     fn screenshot(&self, id: u64, action: &'static str) {
         let Some(tab) = self.tab else { return };
-        self.run(
-            async move { pf::capture_element(tab, id, action).await.map(|s| json!([s.width, s.height])) },
-            move |r| {
-                Reply::Shot(
-                    action,
-                    r.map(|v| pf::ShotSize { width: v[0].as_u64().unwrap_or(0) as u32, height: v[1].as_u64().unwrap_or(0) as u32 }),
-                )
-            },
-        );
+        self.run(async move { pf::capture_element(tab, id, action).await.map(|s| json!([s.width, s.height])) }, move |r| {
+            Reply::Shot(
+                action,
+                r.map(|v| pf::ShotSize { width: v[0].as_u64().unwrap_or(0) as u32, height: v[1].as_u64().unwrap_or(0) as u32 }),
+            )
+        });
     }
 
     fn load_resources(&mut self) {
@@ -741,9 +738,9 @@ impl InspectorView {
             .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, if self.dock.is_some() { 4 } else { 8 })))
             .show(ui, |ui| self.header(ui, acts));
         if let Some(e) = self.error.clone() {
-            egui::Panel::bottom("inspector-error")
-                .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
-                .show(ui, |ui| {
+            egui::Panel::bottom("inspector-error").frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 6))).show(
+                ui,
+                |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("⚠ {e}")).color(p.danger));
                         if ui.button("Retry").clicked() {
@@ -753,7 +750,8 @@ impl InspectorView {
                             self.error = None;
                         }
                     });
-                });
+                },
+            );
         }
         let pad = egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12));
         match self.pane {
@@ -821,7 +819,8 @@ impl InspectorView {
                 ui.label(RichText::new("◌ Page loading…").small().color(p.muted));
             }
             if self.network.recording() && self.pane != Pane::Network {
-                ui.label(RichText::new("● Recording").small().color(p.danger)).on_hover_text("The Network view is recording the page's requests");
+                ui.label(RichText::new("● Recording").small().color(p.danger))
+                    .on_hover_text("The Network view is recording the page's requests");
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.placement_buttons(ui, acts);
@@ -884,53 +883,55 @@ impl InspectorView {
             .default_size(if self.dock.is_some() { 520.0 } else { 440.0 })
             .frame(egui::Frame::new().fill(p.surface).inner_margin(Margin::same(12)))
             .show(ui, |ui| self.details_panel(ui, acts));
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(10)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let r = ui.add(text_input(&mut self.query, "Find by CSS selector, e.g. video, iframe[src*=ads], .popup", ui.available_width() - 70.0));
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (ui.button("Find").clicked() || enter) && !self.query.trim().is_empty() {
-                        let selector = self.query.trim().to_string();
-                        self.ask(json!({ "op": "query", "selector": selector }), |r| Reply::Query(parse(r)));
-                    }
-                });
-                if let Some(results) = self.query_results.clone() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} match(es)", results.len())).color(p.muted));
-                        if ui.small_button("Close").clicked() {
-                            self.query_results = None;
-                        }
-                    });
-                    egui::ScrollArea::vertical().id_salt("query-results").max_height(160.0).show(ui, |ui| {
-                        for n in &results {
-                            let r = self.node_label(ui, n, false);
-                            if r.clicked() {
-                                let id = n.id;
-                                self.ask(json!({ "op": "reveal", "id": id }), move |r| Reply::Reveal(id, parse(r)));
-                            }
-                            r.context_menu(|ui| self.node_menu(ui, n, acts));
-                        }
-                    });
-                    ui.separator();
-                }
-                let mut hovered = None;
-                egui::ScrollArea::both().id_salt("tree").auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    match self.root.clone() {
-                        Some(root) => self.tree(ui, &root, 0, &mut hovered, acts),
-                        None if self.error.is_none() => {
-                            ui.spinner();
-                        }
-                        None => {}
-                    }
-                });
-                if hovered != self.hovered {
-                    self.hovered = hovered;
-                    let id = hovered.or(self.selected);
-                    self.tell(json!({ "op": "highlight", "id": id }));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(10))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let r = ui.add(text_input(
+                    &mut self.query,
+                    "Find by CSS selector, e.g. video, iframe[src*=ads], .popup",
+                    ui.available_width() - 70.0,
+                ));
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("Find").clicked() || enter) && !self.query.trim().is_empty() {
+                    let selector = self.query.trim().to_string();
+                    self.ask(json!({ "op": "query", "selector": selector }), |r| Reply::Query(parse(r)));
                 }
             });
+            if let Some(results) = self.query_results.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{} match(es)", results.len())).color(p.muted));
+                    if ui.small_button("Close").clicked() {
+                        self.query_results = None;
+                    }
+                });
+                egui::ScrollArea::vertical().id_salt("query-results").max_height(160.0).show(ui, |ui| {
+                    for n in &results {
+                        let r = self.node_label(ui, n, false);
+                        if r.clicked() {
+                            let id = n.id;
+                            self.ask(json!({ "op": "reveal", "id": id }), move |r| Reply::Reveal(id, parse(r)));
+                        }
+                        r.context_menu(|ui| self.node_menu(ui, n, acts));
+                    }
+                });
+                ui.separator();
+            }
+            let mut hovered = None;
+            egui::ScrollArea::both().id_salt("tree").auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                match self.root.clone() {
+                    Some(root) => self.tree(ui, &root, 0, &mut hovered, acts),
+                    None if self.error.is_none() => {
+                        ui.spinner();
+                    }
+                    None => {}
+                }
+            });
+            if hovered != self.hovered {
+                self.hovered = hovered;
+                let id = hovered.or(self.selected);
+                self.tell(json!({ "op": "highlight", "id": id }));
+            }
+        });
     }
 
     fn tree(&mut self, ui: &mut egui::Ui, n: &NodeSummary, depth: usize, hovered: &mut Option<u64>, acts: &mut Actions) {
@@ -1167,9 +1168,7 @@ impl InspectorView {
                 });
             }
             if let Some(r) = &d.rect {
-                ui.label(
-                    RichText::new(format!("{:.0} × {:.0} px at ({:.0}, {:.0})", r.width, r.height, r.x, r.y)).color(p.muted),
-                );
+                ui.label(RichText::new(format!("{:.0} × {:.0} px at ({:.0}, {:.0})", r.width, r.height, r.x, r.y)).color(p.muted));
             }
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Scroll into view").clicked() {
@@ -1233,8 +1232,11 @@ impl InspectorView {
                     egui::ScrollArea::vertical().id_salt("style").max_height(260.0).show(ui, |ui| {
                         egui::Grid::new("style").num_columns(2).show(ui, |ui| {
                             for (k, v) in d.style.iter().filter(|(k, v)| f.is_empty() || k.contains(&f) || v.to_lowercase().contains(&f)) {
-                                let items = [("Copy value", v.clone()), ("Copy property", k.clone()), ("Copy declaration", format!("{k}: {v};"))];
-                                let r = ui.add(egui::Label::new(RichText::new(k).monospace().small().color(p.accent_hover)).sense(Sense::click()));
+                                let items =
+                                    [("Copy value", v.clone()), ("Copy property", k.clone()), ("Copy declaration", format!("{k}: {v};"))];
+                                let r = ui.add(
+                                    egui::Label::new(RichText::new(k).monospace().small().color(p.accent_hover)).sense(Sense::click()),
+                                );
                                 self.value_menu(&r, &items, acts);
                                 let r = ui.add(egui::Label::new(RichText::new(v).monospace().small()).selectable(true));
                                 self.value_menu(&r, &items, acts);
@@ -1273,11 +1275,9 @@ impl InspectorView {
             ui.label(RichText::new(format!("{} found", list.len())).color(p.muted));
         });
         ui.label(
-            RichText::new(
-                "From every frame of the page. A blob: video plays a stream: its real URLs are under Media requests.",
-            )
-            .small()
-            .color(p.muted),
+            RichText::new("From every frame of the page. A blob: video plays a stream: its real URLs are under Media requests.")
+                .small()
+                .color(p.muted),
         );
         ui.add_space(6.0);
         let q = self.res_query.to_lowercase();
@@ -1335,7 +1335,13 @@ impl InspectorView {
                                 .on_hover_text(format!("Add a rule blocking {pattern} on {site}"))
                                 .clicked()
                             {
-                                let rule = BlockRule { enabled: true, kind: BlockRuleKind::Script, pattern, sites: vec![site], ..Default::default() };
+                                let rule = BlockRule {
+                                    enabled: true,
+                                    kind: BlockRuleKind::Script,
+                                    pattern,
+                                    sites: vec![site],
+                                    ..Default::default()
+                                };
                                 acts.send(Command::SaveBlockRule { rule });
                             }
                         }
@@ -1486,21 +1492,36 @@ impl InspectorView {
                                     .clicked()
                             {
                                 for d in &domains {
-                                    let rule = BlockRule { enabled: true, kind: BlockRuleKind::Script, pattern: d.clone(), sites: here.clone(), ..Default::default() };
+                                    let rule = BlockRule {
+                                        enabled: true,
+                                        kind: BlockRuleKind::Script,
+                                        pattern: d.clone(),
+                                        sites: here.clone(),
+                                        ..Default::default()
+                                    };
                                     acts.send(Command::SaveBlockRule { rule });
                                 }
                             }
-                            if ui.button("Block everywhere").on_hover_text(format!("Rules blocking scripts from {} on every site", domains.join(", "))).clicked() {
+                            if ui
+                                .button("Block everywhere")
+                                .on_hover_text(format!("Rules blocking scripts from {} on every site", domains.join(", ")))
+                                .clicked()
+                            {
                                 for d in &domains {
-                                    let rule = BlockRule { enabled: true, kind: BlockRuleKind::Script, pattern: d.clone(), ..Default::default() };
+                                    let rule =
+                                        BlockRule { enabled: true, kind: BlockRuleKind::Script, pattern: d.clone(), ..Default::default() };
                                     acts.send(Command::SaveBlockRule { rule });
                                 }
                             }
                         }
                         let opens_tabs = h.category == AdCategory::Popunder || h.signals.iter().any(|s| s.kind == "popup");
-                        if opens_tabs && !domains.iter().all(|d| has_rule(BlockRuleKind::PopupTo, d, &[])) && ui.button("Close tabs it opens").clicked() {
+                        if opens_tabs
+                            && !domains.iter().all(|d| has_rule(BlockRuleKind::PopupTo, d, &[]))
+                            && ui.button("Close tabs it opens").clicked()
+                        {
                             for d in &domains {
-                                let rule = BlockRule { enabled: true, kind: BlockRuleKind::PopupTo, pattern: d.clone(), ..Default::default() };
+                                let rule =
+                                    BlockRule { enabled: true, kind: BlockRuleKind::PopupTo, pattern: d.clone(), ..Default::default() };
                                 acts.send(Command::SaveBlockRule { rule });
                             }
                         }
@@ -1509,11 +1530,22 @@ impl InspectorView {
                 egui::CollapsingHeader::new(RichText::new("What gave it away").small()).id_salt(("ad", &h.name)).show(ui, |ui| {
                     for s in &h.signals {
                         ui.horizontal(|ui| {
-                            badge(ui, if s.kind == "popup" { "tab" } else if s.kind == "inline" { "code" } else { &s.kind }, s.kind == "popup");
+                            badge(
+                                ui,
+                                if s.kind == "popup" {
+                                    "tab"
+                                } else if s.kind == "inline" {
+                                    "code"
+                                } else {
+                                    &s.kind
+                                },
+                                s.kind == "popup",
+                            );
                             if s.kind == "slot" {
                                 let selector = s.detail.split(" × ").next().unwrap_or("").to_string();
                                 ui.label(RichText::new(&s.detail).monospace().small());
-                                if s.frame == self.url && ui.small_button("🎯 Show").on_hover_text("Select it in the elements").clicked() {
+                                if s.frame == self.url && ui.small_button("🎯 Show").on_hover_text("Select it in the elements").clicked()
+                                {
                                     self.query = selector.clone();
                                     self.select_first_match = true;
                                     self.ask(json!({ "op": "query", "selector": selector }), |r| Reply::Query(parse(r)));

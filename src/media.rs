@@ -192,7 +192,8 @@ impl MediaState {
     /// background streams" stops.
     pub fn background_streams(&self, tabs: &[BrowserTab]) -> Vec<TabId> {
         let active: BTreeSet<TabId> = tabs.iter().filter(|t| t.active).map(|t| t.id).collect();
-        let tabs: BTreeSet<TabId> = self.playing.iter().map(|p| p.tab_id).filter(|t| !active.contains(t) && !self.stopped.contains(t)).collect();
+        let tabs: BTreeSet<TabId> =
+            self.playing.iter().map(|p| p.tab_id).filter(|t| !active.contains(t) && !self.stopped.contains(t)).collect();
         tabs.into_iter().collect()
     }
 

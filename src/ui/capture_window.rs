@@ -191,7 +191,15 @@ pub struct CaptureWindow {
 /// A local time stamp for file names ("2026-10-27 14-03-22").
 fn stamp() -> String {
     let d = js_sys::Date::new_0();
-    format!("{:04}-{:02}-{:02} {:02}-{:02}-{:02}", d.get_full_year(), d.get_month() + 1, d.get_date(), d.get_hours(), d.get_minutes(), d.get_seconds())
+    format!(
+        "{:04}-{:02}-{:02} {:02}-{:02}-{:02}",
+        d.get_full_year(),
+        d.get_month() + 1,
+        d.get_date(),
+        d.get_hours(),
+        d.get_minutes(),
+        d.get_seconds()
+    )
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(r: Result<Value, String>) -> Result<T, String> {
@@ -211,7 +219,10 @@ async fn inspect_url(url: String, via: Option<(TabId, i64)>) -> Result<Stream, S
         _ => None,
     });
     let Some(kind) = kind else {
-        return Ok(Stream::File { mime: probe["type"].as_str().unwrap_or("").split(';').next().unwrap_or("").to_string(), length: probe["length"].as_u64().unwrap_or(0) });
+        return Ok(Stream::File {
+            mime: probe["type"].as_str().unwrap_or("").split(';').next().unwrap_or("").to_string(),
+            length: probe["length"].as_u64().unwrap_or(0),
+        });
     };
     let text = if probe["complete"].as_bool() == Some(true) {
         text.to_string()
@@ -518,7 +529,13 @@ impl CaptureWindow {
                 if ext.is_empty() {
                     ext = ext_for_mime(mime, mime.starts_with("audio")).to_string();
                 }
-                out.push(Planned::Ready(Track { kind: TrackKind::Muxed, label: String::new(), ext, parts: vec![stream::Part { url, range: None }], duration: 0.0 }));
+                out.push(Planned::Ready(Track {
+                    kind: TrackKind::Muxed,
+                    label: String::new(),
+                    ext,
+                    parts: vec![stream::Part { url, range: None }],
+                    duration: 0.0,
+                }));
             }
             Stream::Probing | Stream::Failed(_) => return Err("nothing to save yet".into()),
         }
@@ -722,7 +739,9 @@ impl CaptureWindow {
                                 self.audio_choice = audio.iter().position(|r| r.default).unwrap_or(0);
                             }
                         }
-                        Stream::HlsMedia(m) if !m.ended => self.notes.push("This is a live stream: only the part available now is saved.".into()),
+                        Stream::HlsMedia(m) if !m.ended => {
+                            self.notes.push("This is a live stream: only the part available now is saved.".into())
+                        }
                         Stream::Dash(mpd) => {
                             if mpd.live {
                                 self.notes.push("This is a live stream: only the part listed now is saved.".into());
@@ -857,16 +876,17 @@ impl CaptureWindow {
             .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| self.header(ui));
         if let Some(e) = self.error.clone() {
-            egui::Panel::bottom("capture-error")
-                .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
-                .show(ui, |ui| {
+            egui::Panel::bottom("capture-error").frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 6))).show(
+                ui,
+                |ui| {
                     ui.horizontal(|ui| {
                         ui.add(egui::Label::new(RichText::new(format!("⚠ {e}")).color(p.danger)).wrap());
                         if icon_button(ui, "🗙", "Dismiss").clicked() {
                             self.error = None;
                         }
                     });
-                });
+                },
+            );
         }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12))).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -904,7 +924,10 @@ impl CaptureWindow {
                 let title = if self.title.is_empty() { "Capture" } else { &self.title };
                 ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
                 let what = match &self.source {
-                    Source::Element { label, .. } => format!("{label} · {}", if self.settings.method == Method::Screen { "rendered on screen" } else { "element stream" }),
+                    Source::Element { label, .. } => format!(
+                        "{label} · {}",
+                        if self.settings.method == Method::Screen { "rendered on screen" } else { "element stream" }
+                    ),
                     Source::Url { url, .. } => url.clone(),
                     Source::Nothing => String::new(),
                 };
@@ -1003,7 +1026,10 @@ impl CaptureWindow {
             let screen = element.is_some() && self.settings.method == Method::Screen;
             if screen && idle {
                 ui.horizontal(|ui| {
-                    let r = ui.add_enabled(self.caps.screen, egui::Button::new(if self.screen.is_some() { "🖥 Choose again…" } else { "🖥 Choose the tab…" }));
+                    let r = ui.add_enabled(
+                        self.caps.screen,
+                        egui::Button::new(if self.screen.is_some() { "🖥 Choose again…" } else { "🖥 Choose the tab…" }),
+                    );
                     if r.hovered() {
                         acts.arm("capture:screen");
                     }
@@ -1020,7 +1046,10 @@ impl CaptureWindow {
             ui.horizontal(|ui| {
                 match self.phase {
                     Phase::Idle | Phase::Starting => {
-                        let can = self.phase == Phase::Idle && !self.downloading && (!screen || self.screen.is_some()) && (element.is_some() || self.playable == Some(true));
+                        let can = self.phase == Phase::Idle
+                            && !self.downloading
+                            && (!screen || self.screen.is_some())
+                            && (element.is_some() || self.playable == Some(true));
                         if ui.add_enabled(can, primary_button(ui, "● Start recording")).clicked() {
                             self.start();
                         }
@@ -1040,7 +1069,10 @@ impl CaptureWindow {
                             self.tell("resume", json!({}));
                         }
                         let dot = if self.phase == Phase::Recording { "●" } else { "❚❚" };
-                        ui.label(RichText::new(format!("{dot} {} · {}", format_duration(self.live_ms), format_bytes(self.live_bytes))).color(p.danger));
+                        ui.label(
+                            RichText::new(format!("{dot} {} · {}", format_duration(self.live_ms), format_bytes(self.live_bytes)))
+                                .color(p.danger),
+                        );
                         if self.settings.method == Method::Element && element.is_some() {
                             let mut on = self.settings.listen_here;
                             if ui.checkbox(&mut on, "Listen here").changed() {
@@ -1066,7 +1098,11 @@ impl CaptureWindow {
                 }
             });
             if matches!(self.phase, Phase::Recording | Phase::Paused) && !self.live_preview && self.settings.method == Method::Element {
-                ui.label(RichText::new("The player above shows the recording once it's done (this format can't be shown while it's made).").small().color(p.muted));
+                ui.label(
+                    RichText::new("The player above shows the recording once it's done (this format can't be shown while it's made).")
+                        .small()
+                        .color(p.muted),
+                );
             }
         });
     }
@@ -1190,7 +1226,11 @@ impl CaptureWindow {
                     if ui.add(danger_button(ui, "Cancel")).clicked() {
                         self.cancel_downloads();
                     }
-                } else if ui.add_enabled(self.phase == Phase::Idle, primary_button(ui, "⬇ Download")).on_hover_text("Fetch it (original quality), then save or upload it").clicked() {
+                } else if ui
+                    .add_enabled(self.phase == Phase::Idle, primary_button(ui, "⬇ Download"))
+                    .on_hover_text("Fetch it (original quality), then save or upload it")
+                    .clicked()
+                {
                     self.download();
                 }
             });
@@ -1198,7 +1238,11 @@ impl CaptureWindow {
                 ui.horizontal(|ui| {
                     let frac = if j.total > 0 { j.done as f32 / j.total as f32 } else { 0.0 };
                     let label = if j.label.is_empty() { "file" } else { &j.label };
-                    let text = if j.total > 1 { format!("{label}: {} / {} · {}", j.done, j.total, format_bytes(j.bytes)) } else { format!("{label}: {}", format_bytes(j.bytes)) };
+                    let text = if j.total > 1 {
+                        format!("{label}: {} / {} · {}", j.done, j.total, format_bytes(j.bytes))
+                    } else {
+                        format!("{label}: {}", format_bytes(j.bytes))
+                    };
                     ui.add(egui::ProgressBar::new(if j.finished { 1.0 } else { frac }).text(text).desired_width(ui.available_width()));
                 });
             }
@@ -1249,7 +1293,11 @@ impl CaptureWindow {
                                 if r.clicked() {
                                     act = Some((i, "upload"));
                                 }
-                                if ui.add(primary_button(ui, "💾 Save")).on_hover_text("Save it as a file (your browser's downloads)").clicked() {
+                                if ui
+                                    .add(primary_button(ui, "💾 Save"))
+                                    .on_hover_text("Save it as a file (your browser's downloads)")
+                                    .clicked()
+                                {
                                     act = Some((i, "save"));
                                 }
                                 if icon_button(ui, "▶", "Play it in the player above").clicked() {
@@ -1260,7 +1308,11 @@ impl CaptureWindow {
                         if let Some((sent, total)) = t.uploading {
                             ui.horizontal(|ui| {
                                 let frac = if total > 0 { sent as f32 / total as f32 } else { 0.0 };
-                                ui.add(egui::ProgressBar::new(frac).text(format!("Uploading {} / {}", format_bytes(sent), format_bytes(total))).desired_width(ui.available_width() - 80.0));
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .text(format!("Uploading {} / {}", format_bytes(sent), format_bytes(total)))
+                                        .desired_width(ui.available_width() - 80.0),
+                                );
                                 if ui.button("Cancel").clicked() {
                                     act = Some((i, "cancelUpload"));
                                 }
@@ -1308,7 +1360,12 @@ impl CaptureWindow {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Sound plays on").color(p.muted));
                 if self.outputs.can_choose && !self.outputs.devices.is_empty() && (self.outputs.named || !self.outputs.select) {
-                    let current = self.outputs.devices.iter().find(|d| d.id == self.settings.output).map_or("System default".to_string(), |d| d.label.clone());
+                    let current = self
+                        .outputs
+                        .devices
+                        .iter()
+                        .find(|d| d.id == self.settings.output)
+                        .map_or("System default".to_string(), |d| d.label.clone());
                     let before = self.settings.output.clone();
                     egui::ComboBox::from_id_salt("capture-output").selected_text(current).width(240.0).show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.settings.output, String::new(), "System default");
@@ -1351,7 +1408,11 @@ impl CaptureWindow {
                 .show(ui, |ui| {
                     let before = self.settings.upload.clone();
                     let u = &mut self.settings.upload;
-                    ui.label(RichText::new("Where ⇪ Upload sends a file: your server, a storage bucket's upload URL, a webhook…").small().color(p.muted));
+                    ui.label(
+                        RichText::new("Where ⇪ Upload sends a file: your server, a storage bucket's upload URL, a webhook…")
+                            .small()
+                            .color(p.muted),
+                    );
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Address").color(p.muted));
                         ui.add(text_input(&mut u.url, "https://upload.example.com/media", ui.available_width() - 8.0));
@@ -1363,10 +1424,17 @@ impl CaptureWindow {
                             u.method = if m == 1 { "POST" } else { "PUT" }.to_string();
                         }
                         ui.label(RichText::new("Form field").color(p.muted));
-                        ui.add(text_input(&mut u.field, "none: the file is the body", 180.0)).on_hover_text("Set it to send a multipart form with the file in this field");
+                        ui.add(text_input(&mut u.field, "none: the file is the body", 180.0))
+                            .on_hover_text("Set it to send a multipart form with the file in this field");
                     });
                     ui.label(RichText::new("Headers (one per line, Name: value)").color(p.muted));
-                    ui.add(egui::TextEdit::multiline(&mut u.headers).hint_text("Authorization: Bearer …").desired_rows(2).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut u.headers)
+                            .hint_text("Authorization: Bearer …")
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
                     if let Some(why) = u.problem().filter(|_| !u.url.trim().is_empty()) {
                         ui.label(RichText::new(format!("⚠ {why}")).small().color(p.warn));
                     }

@@ -3,9 +3,7 @@
 /// Returns the URL scheme (lowercased, without `:`), or an empty string.
 pub fn scheme(url: &str) -> String {
     match url.find(':') {
-        Some(i) if url[..i].chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) => {
-            url[..i].to_ascii_lowercase()
-        }
+        Some(i) if url[..i].chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) => url[..i].to_ascii_lowercase(),
         _ => String::new(),
     }
 }
@@ -40,8 +38,8 @@ pub fn host(url: &str) -> String {
 /// Second-level labels that act as public suffixes under a country TLD
 /// (e.g. `co.uk`, `com.au`). This is a heuristic, not the full Public Suffix List.
 const MULTI_LABEL_SUFFIXES: &[&str] = &[
-    "ac", "co", "com", "edu", "gov", "gob", "net", "org", "or", "ne", "go", "mil", "nic", "ltd",
-    "plc", "sch", "nhs", "police", "nom", "web", "info", "biz",
+    "ac", "co", "com", "edu", "gov", "gob", "net", "org", "or", "ne", "go", "mil", "nic", "ltd", "plc", "sch", "nhs", "police", "nom",
+    "web", "info", "biz",
 ];
 
 /// Approximates the registrable domain ("eTLD+1") of a host:

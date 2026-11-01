@@ -60,10 +60,7 @@ pub fn section_card<R>(ui: &mut egui::Ui, title: &str, subtitle: &str, add: impl
 
 pub fn primary_button(ui: &egui::Ui, text: impl Into<String>) -> egui::Button<'static> {
     let p = theme::palette(ui);
-    egui::Button::new(RichText::new(text.into()).color(p.on_accent).strong())
-        .fill(p.accent)
-        .stroke(Stroke::NONE)
-        .corner_radius(RADIUS)
+    egui::Button::new(RichText::new(text.into()).color(p.on_accent).strong()).fill(p.accent).stroke(Stroke::NONE).corner_radius(RADIUS)
 }
 
 pub fn danger_button(ui: &egui::Ui, text: impl Into<String>) -> egui::Button<'static> {
@@ -205,9 +202,7 @@ pub fn nav_item(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, trai
         ui.painter().rect_filled(rect, RADIUS, fill);
         let fg = if selected { p.accent_hover } else { p.text };
         let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         child.label(RichText::new(icon).color(if selected { p.accent_hover } else { p.muted }));
         child.add(egui::Label::new(RichText::new(label).color(fg)).truncate());
@@ -222,12 +217,9 @@ pub fn nav_item(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, trai
 pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let p = theme::palette(ui);
     let mut changed = false;
-    egui::Frame::new()
-        .fill(p.input)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(RADIUS + 2)
-        .inner_margin(Margin::same(3))
-        .show(ui, |ui| {
+    egui::Frame::new().fill(p.input).stroke(Stroke::new(1.0, p.border)).corner_radius(RADIUS + 2).inner_margin(Margin::same(3)).show(
+        ui,
+        |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.horizontal(|ui| {
                 for (v, label) in options {
@@ -243,7 +235,8 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options:
                     }
                 }
             });
-        });
+        },
+    );
     changed
 }
 
@@ -251,10 +244,9 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options:
 pub fn toast(ctx: &egui::Context, text: &str, error: bool, dark: bool) -> bool {
     let p = if dark { &theme::DARK } else { &theme::LIGHT };
     let mut dismissed = false;
-    egui::Area::new(egui::Id::unique("toast"))
-        .anchor(Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
+    egui::Area::new(egui::Id::unique("toast")).anchor(Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0)).order(egui::Order::Foreground).show(
+        ctx,
+        |ui| {
             egui::Frame::new()
                 .fill(p.surface)
                 .stroke(Stroke::new(1.0, if error { p.danger.gamma_multiply(0.6) } else { p.border }))
@@ -272,7 +264,8 @@ pub fn toast(ctx: &egui::Context, text: &str, error: bool, dark: bool) -> bool {
                         }
                     });
                 });
-        });
+        },
+    );
     dismissed
 }
 

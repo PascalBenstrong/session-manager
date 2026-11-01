@@ -10,9 +10,9 @@ use std::rc::Rc;
 use eframe::egui::{self, Align, Layout, Margin, RichText};
 use wasm_bindgen_futures::spawn_local;
 
+use super::Actions;
 use super::theme;
 use super::widgets::{badge, danger_button, empty_state, icon_button, primary_button, segmented, text_input};
-use super::Actions;
 use crate::capture::{self, CaptureSettings, CaptureSummary, Method, PageMedia, PageMediaUrl, Tracks, format_bytes, format_duration};
 use crate::model::TabId;
 use crate::platform::{self as pf, CaptureMediaList};
@@ -100,7 +100,8 @@ impl CapturePane {
         let json = serde_json::to_string(&self.settings).unwrap_or_default();
         spawn_local(async move {
             // The window reads the rest of the settings and keeps them; only merge ours in.
-            let mut s: CaptureSettings = pf::storage_get(capture::SETTINGS_KEY).await.ok().flatten().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            let mut s: CaptureSettings =
+                pf::storage_get(capture::SETTINGS_KEY).await.ok().flatten().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             if let Ok(ours) = serde_json::from_str::<CaptureSettings>(&json) {
                 s.tracks = ours.tracks;
                 s.method = ours.method;
@@ -224,19 +225,33 @@ impl CapturePane {
                 .id_salt("capture-url")
                 .default_open(media.is_empty() && self.urls.is_empty())
                 .show(ui, |ui| {
-                    ui.label(RichText::new("A video or audio file, or an HLS (.m3u8) or DASH (.mpd) stream: play it, record it, or save it.").small().color(p.muted));
+                    ui.label(
+                        RichText::new("A video or audio file, or an HLS (.m3u8) or DASH (.mpd) stream: play it, record it, or save it.")
+                            .small()
+                            .color(p.muted),
+                    );
                     ui.horizontal(|ui| {
-                        let r = ui.add(text_input(&mut self.url_input, "https://…/video.mp4, …/master.m3u8, …/manifest.mpd", ui.available_width() - 80.0));
+                        let r = ui.add(text_input(
+                            &mut self.url_input,
+                            "https://…/video.mp4, …/master.m3u8, …/manifest.mpd",
+                            ui.available_width() - 80.0,
+                        ));
                         let url = self.url_input.trim().to_string();
                         let ok = url.starts_with("http://") || url.starts_with("https://");
-                        let go = ui.add_enabled(ok, primary_button(ui, "Open")).clicked() || (ok && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        let go = ui.add_enabled(ok, primary_button(ui, "Open")).clicked()
+                            || (ok && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                         if go {
                             self.open(BTreeMap::from([("url", url), ("tracks", self.settings.tracks.code().to_string())]));
                         }
                     });
                 });
             if media.is_empty() && self.urls.is_empty() && self.captures.is_empty() {
-                empty_state(ui, "🎬", "Nothing to capture here", "This page has no video or audio. Press play first if its player loads on demand, then ⟳ Refresh.");
+                empty_state(
+                    ui,
+                    "🎬",
+                    "Nothing to capture here",
+                    "This page has no video or audio. Press play first if its player loads on demand, then ⟳ Refresh.",
+                );
             }
         });
     }
@@ -329,9 +344,11 @@ impl CapturePane {
             .default_open(true)
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Saved as they are (original quality, faster than playing them), fetched the way the page's player does.")
-                        .small()
-                        .color(p.muted),
+                    RichText::new(
+                        "Saved as they are (original quality, faster than playing them), fetched the way the page's player does.",
+                    )
+                    .small()
+                    .color(p.muted),
                 );
                 if segments > 0 {
                     ui.checkbox(&mut self.show_segments, format!("Show the {segments} stream segment(s) too"));
@@ -350,7 +367,9 @@ impl CapturePane {
                             ui.horizontal(|ui| {
                                 badge(ui, kind.label(), matches!(kind, SourceKind::Hls | SourceKind::Dash));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if *kind != SourceKind::Segment && ui.button("⬇ Save…").on_hover_text("Open it in a capture window to save it").clicked() {
+                                    if *kind != SourceKind::Segment
+                                        && ui.button("⬇ Save…").on_hover_text("Open it in a capture window to save it").clicked()
+                                    {
                                         save = Some((*u).clone());
                                     }
                                     if icon_button(ui, "⧉", "Copy the URL").clicked() {
@@ -358,7 +377,8 @@ impl CapturePane {
                                         acts.notice("URL copied");
                                     }
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                        ui.add(egui::Label::new(RichText::new(&u.url).monospace().small()).truncate().selectable(true)).on_hover_text(&u.url);
+                                        ui.add(egui::Label::new(RichText::new(&u.url).monospace().small()).truncate().selectable(true))
+                                            .on_hover_text(&u.url);
                                     });
                                 });
                             });

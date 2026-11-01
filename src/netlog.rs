@@ -217,8 +217,10 @@ impl NetLog {
                             cut -= 1;
                         }
                         b.truncate(cut);
-                        b.push_str("
-… (cut when the inspector was restored)");
+                        b.push_str(
+                            "
+… (cut when the inspector was restored)",
+                        );
                     }
                 }
                 Value::Object(m)
@@ -291,7 +293,13 @@ impl ThrottleRule {
 }
 
 /// The first rule matching a request.
-pub fn throttle_rule_for<'a>(rules: &'a [ThrottleRule], page_url: &str, url: &str, method: &str, tab: Option<i64>) -> Option<&'a ThrottleRule> {
+pub fn throttle_rule_for<'a>(
+    rules: &'a [ThrottleRule],
+    page_url: &str,
+    url: &str,
+    method: &str,
+    tab: Option<i64>,
+) -> Option<&'a ThrottleRule> {
     rules.iter().find(|r| r.matches(page_url, url, method, tab))
 }
 
@@ -398,8 +406,14 @@ mod tests {
     #[test]
     fn documents() {
         let mut log = NetLog::default();
-        log.apply_doc(1, vec![json!({ "id": 1, "kind": "ws", "url": "wss://x" }), json!({ "id": 2, "kind": "frame", "socket": 1, "replayOf": 0 })]);
-        log.apply_doc(2, vec![json!({ "id": 1, "kind": "fetch", "url": "https://x/a" }), json!({ "id": 2, "kind": "fetch", "replayOf": 1 })]);
+        log.apply_doc(
+            1,
+            vec![json!({ "id": 1, "kind": "ws", "url": "wss://x" }), json!({ "id": 2, "kind": "frame", "socket": 1, "replayOf": 0 })],
+        );
+        log.apply_doc(
+            2,
+            vec![json!({ "id": 1, "kind": "fetch", "url": "https://x/a" }), json!({ "id": 2, "kind": "fetch", "replayOf": 1 })],
+        );
         log.apply_doc(2, vec![json!({ "update": true, "id": 1, "status": 200 }), json!({ "update": true, "id": 0, "replayDone": 1 })]);
         assert_eq!(log.entries.len(), 4);
         let frame = log.get(1 << 32 | 2).unwrap();
@@ -423,8 +437,10 @@ mod tests {
         assert_eq!(back.entries.iter().map(|e| e.url.as_str()).collect::<Vec<_>>(), vec!["u3", "u4", "u5"]);
         let e = back.get(1 << 32 | 5).unwrap();
         assert_eq!(e.status, 200);
-        assert!(e.res_body.as_ref().unwrap().starts_with("éééééééééé
-…"));
+        assert!(e.res_body.as_ref().unwrap().starts_with(
+            "éééééééééé
+…"
+        ));
         back.apply_doc(1, vec![json!({ "update": true, "id": 4, "status": 404 })]);
         assert_eq!(back.get(1 << 32 | 4).unwrap().status, 404);
     }
@@ -449,7 +465,10 @@ mod tests {
             req_body: Some("{\"it's\":1}".into()),
             ..Default::default()
         };
-        assert_eq!(e.as_curl(), "curl 'https://x.com/a' -X POST \\\n  -H 'content-type: application/json' \\\n  --data-raw '{\"it'\\''s\":1}'");
+        assert_eq!(
+            e.as_curl(),
+            "curl 'https://x.com/a' -X POST \\\n  -H 'content-type: application/json' \\\n  --data-raw '{\"it'\\''s\":1}'"
+        );
         assert!(e.as_fetch().starts_with("fetch(\"https://x.com/a\", {"));
         assert!(e.as_fetch().contains("\"method\": \"POST\""));
     }
@@ -470,10 +489,7 @@ mod tests {
         assert_eq!(exact_pattern("https://x.com/api/items?page=2"), "https://x.com/api/items*");
         assert_eq!(exact_pattern("https://x.com/api/items"), "https://x.com/api/items");
         assert_eq!(similar_pattern("https://x.com/api/users/12345/posts?x=1"), "https://x.com/api/users/*/posts*");
-        assert_eq!(
-            similar_pattern("https://x.com/o/3f2a9c1e-0b4d-4e8f-9a7b-1c2d3e4f5a6b/v"),
-            "https://x.com/o/*/v*"
-        );
+        assert_eq!(similar_pattern("https://x.com/o/3f2a9c1e-0b4d-4e8f-9a7b-1c2d3e4f5a6b/v"), "https://x.com/o/*/v*");
         assert_eq!(similar_pattern("https://x.com"), "https://x.com*");
         assert!(glob_match(&similar_pattern("https://x.com/api/users/1/posts"), "https://x.com/api/users/99/posts?y"));
     }
@@ -481,9 +497,33 @@ mod tests {
     #[test]
     fn throttle_rules() {
         let rules = vec![
-            ThrottleRule { id: 1, enabled: true, site: "news.com".into(), pattern: "*/api/*".into(), method: "POST".into(), delay: 500, tab: None },
-            ThrottleRule { id: 2, enabled: true, site: "news.com".into(), pattern: "*".into(), method: String::new(), delay: 2000, tab: None },
-            ThrottleRule { id: 3, enabled: false, site: "shop.com".into(), pattern: "*".into(), method: String::new(), delay: 100, tab: None },
+            ThrottleRule {
+                id: 1,
+                enabled: true,
+                site: "news.com".into(),
+                pattern: "*/api/*".into(),
+                method: "POST".into(),
+                delay: 500,
+                tab: None,
+            },
+            ThrottleRule {
+                id: 2,
+                enabled: true,
+                site: "news.com".into(),
+                pattern: "*".into(),
+                method: String::new(),
+                delay: 2000,
+                tab: None,
+            },
+            ThrottleRule {
+                id: 3,
+                enabled: false,
+                site: "shop.com".into(),
+                pattern: "*".into(),
+                method: String::new(),
+                delay: 100,
+                tab: None,
+            },
         ];
         let page = "https://www.news.com/today";
         assert_eq!(throttle_rule_for(&rules, page, "https://cdn.x.com/api/save", "post", Some(7)).unwrap().id, 1);

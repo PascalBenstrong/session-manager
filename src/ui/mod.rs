@@ -7,10 +7,10 @@
 //! The browser sidebar / side panel page shows the tabs of its window by workspace.
 
 mod backup_view;
-mod cleanup_view;
-mod guards_view;
 mod capture_view;
 mod capture_window;
+mod cleanup_view;
+mod guards_view;
 mod inspector_view;
 mod mini_view;
 mod network_view;
@@ -50,10 +50,7 @@ pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
     let capture = mode == "capture";
     IS_POPUP.store(popup, Ordering::Relaxed);
     let document = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
+    let canvas = document.get_element_by_id(canvas_id).ok_or("canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
     let runner = Box::leak(Box::new(eframe::WebRunner::new()));
     runner
         .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(App::new(cc, popup, sidebar, inspector, capture)))))
@@ -353,10 +350,9 @@ impl App {
         spawn_local(async move {
             let notice = match pf::open_url(&url).await {
                 Ok(()) => (format!("Opened {url}"), false),
-                Err(_) => (
-                    format!("The browser doesn't let extensions open {url}. The address is copied: paste it into the address bar."),
-                    false,
-                ),
+                Err(_) => {
+                    (format!("The browser doesn't let extensions open {url}. The address is copied: paste it into the address bar."), false)
+                }
             };
             inbox.borrow_mut().notices.push(notice);
             ctx.request_repaint();
@@ -682,10 +678,7 @@ impl App {
                 );
                 ui.close();
             }
-            if ui
-                .add_enabled(can_delete && session.open_count() > 0, egui::Button::new("🗑 Delete and close its tabs…"))
-                .clicked()
-            {
+            if ui.add_enabled(can_delete && session.open_count() > 0, egui::Button::new("🗑 Delete and close its tabs…")).clicked() {
                 self.confirm(
                     format!("Delete session \"{}\" and close its {} open tab(s)?", session.name, session.open_count()),
                     Command::DeleteSession { id: session.id, close_tabs: true },
@@ -770,33 +763,29 @@ impl App {
         egui::Panel::top("header")
             .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 10)))
             .show(ui, |ui| self.compact_bar(ui, state, session));
-        egui::Panel::bottom("footer")
-            .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 6)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    self.mini.footer(ui);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.link("Manager ⛶").clicked() {
-                            open_manager("");
-                        }
-                        let text = if self.unseen_notes {
-                            RichText::new("✨ What's new").color(p.accent_hover).strong()
-                        } else {
-                            RichText::new("What's new").color(p.muted)
-                        };
-                        if ui.link(text).on_hover_text(format!("Release notes · version {}", crate::release_notes::VERSION)).clicked() {
-                            open_manager("whatsnew");
-                        }
-                    });
+        egui::Panel::bottom("footer").frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(12, 6))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                self.mini.footer(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.link("Manager ⛶").clicked() {
+                        open_manager("");
+                    }
+                    let text = if self.unseen_notes {
+                        RichText::new("✨ What's new").color(p.accent_hover).strong()
+                    } else {
+                        RichText::new("What's new").color(p.muted)
+                    };
+                    if ui.link(text).on_hover_text(format!("Release notes · version {}", crate::release_notes::VERSION)).clicked() {
+                        open_manager("whatsnew");
+                    }
                 });
             });
+        });
         let mut acts = Actions::default();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(10)))
-            .show(ui, |ui| {
-                let cx = ViewCtx { state, caps: &self.caps, viewed: session.id };
-                self.mini.show(ui, &cx, &mut acts);
-            });
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(10))).show(ui, |ui| {
+            let cx = ViewCtx { state, caps: &self.caps, viewed: session.id };
+            self.mini.show(ui, &cx, &mut acts);
+        });
         acts
     }
 
@@ -853,21 +842,19 @@ impl App {
         let mut acts = Actions::default();
         let caps = self.caps.clone();
         let cx = ViewCtx { state, caps: &caps, viewed: state.active_session };
-        egui::Panel::top("header")
-            .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(10, 8)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("◧").size(18.0).color(p.accent));
-                    ui.label(RichText::new("Workspaces").strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, "⛶", "Open the full manager").clicked() {
-                            open_manager("");
-                        }
-                        self.theme_button(ui);
-                    });
+        egui::Panel::top("header").frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(10, 8))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("◧").size(18.0).color(p.accent));
+                ui.label(RichText::new("Workspaces").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, "⛶", "Open the full manager").clicked() {
+                        open_manager("");
+                    }
+                    self.theme_button(ui);
                 });
-                self.side.switcher(ui, &cx, &mut acts);
             });
+            self.side.switcher(ui, &cx, &mut acts);
+        });
         egui::Panel::bottom("footer")
             .frame(egui::Frame::new().fill(p.chrome).inner_margin(Margin::symmetric(10, 6)))
             .show(ui, |ui| self.side.footer(ui, &cx, &mut acts));
@@ -944,20 +931,18 @@ impl App {
 
         let mut acts = Actions::default();
         let margin = if wide { Margin { left: 24, right: 24, top: 6, bottom: 16 } } else { Margin::same(12) };
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(margin))
-            .show(ui, |ui| {
-                let cx = ViewCtx { state: &state, caps: &self.caps, viewed: session.id };
-                match self.view {
-                    View::Tabs => self.tabs.show(ui, &cx, &mut acts),
-                    View::Organize => self.organize.show(ui, &cx, &mut acts),
-                    View::Cleanup => self.cleanup.show(ui, &cx, &mut acts),
-                    View::Backup => self.backup.show(ui, &cx, &mut acts),
-                    View::Settings => settings_view::show(ui, &cx, &mut acts),
-                    View::Guards => self.guards.show(ui, &cx, &mut acts),
-                    View::WhatsNew => whats_new_view::show(ui),
-                }
-            });
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin)).show(ui, |ui| {
+            let cx = ViewCtx { state: &state, caps: &self.caps, viewed: session.id };
+            match self.view {
+                View::Tabs => self.tabs.show(ui, &cx, &mut acts),
+                View::Organize => self.organize.show(ui, &cx, &mut acts),
+                View::Cleanup => self.cleanup.show(ui, &cx, &mut acts),
+                View::Backup => self.backup.show(ui, &cx, &mut acts),
+                View::Settings => settings_view::show(ui, &cx, &mut acts),
+                View::Guards => self.guards.show(ui, &cx, &mut acts),
+                View::WhatsNew => whats_new_view::show(ui),
+            }
+        });
         if self.view == View::WhatsNew && self.unseen_notes {
             whats_new_view::mark_seen();
             self.unseen_notes = false;

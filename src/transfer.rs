@@ -255,10 +255,8 @@ fn collect_urls(text: &str, out: &mut UrlList, seen: &mut HashSet<String>) {
         let mut pieces: Vec<String> = Vec::new();
         for part in split_outside_quotes(&chunk, |c| c == ',') {
             let quoted = whole_quoted(&part).is_some();
-            let rejoin = !quoted
-                && !part.is_empty()
-                && !starts_like_url(&part)
-                && pieces.last().is_some_and(|prev| normalize_url(prev).is_some());
+            let rejoin =
+                !quoted && !part.is_empty() && !starts_like_url(&part) && pieces.last().is_some_and(|prev| normalize_url(prev).is_some());
             if rejoin {
                 let prev = pieces.last_mut().expect("a piece to join to");
                 prev.push(',');
@@ -424,13 +422,7 @@ mod tests {
         );
         assert_eq!(
             l.urls,
-            vec![
-                "https://a.com/x",
-                "https://example.org/path",
-                "https://b.com/?ids=1,2,3",
-                "https://www.c.io",
-                "ftp://f.net/f"
-            ]
+            vec!["https://a.com/x", "https://example.org/path", "https://b.com/?ids=1,2,3", "https://www.c.io", "ftp://f.net/f"]
         );
         assert_eq!(l.invalid, vec!["not", "a", "url"]);
     }
@@ -535,6 +527,12 @@ mod tests {
         assert!(parse_import(r#"{"hello":1}"#).is_err());
         assert!(parse_import("   ").is_err());
         assert!(parse_import("nothing useful here").is_err());
-        assert_eq!(export_urls(&[TabEntry { url: "https://a".into(), ..Default::default() }, TabEntry { url: "https://b".into(), ..Default::default() }]), "https://a,\nhttps://b");
+        assert_eq!(
+            export_urls(&[
+                TabEntry { url: "https://a".into(), ..Default::default() },
+                TabEntry { url: "https://b".into(), ..Default::default() }
+            ]),
+            "https://a,\nhttps://b"
+        );
     }
 }

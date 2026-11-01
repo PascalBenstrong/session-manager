@@ -167,11 +167,7 @@ pub struct CleanupReport {
 
 impl CleanupReport {
     pub fn summary(&self) -> String {
-        let sites = if self.all_sites {
-            "all sites".to_string()
-        } else {
-            format!("{} site(s)", self.hosts.len())
-        };
+        let sites = if self.all_sites { "all sites".to_string() } else { format!("{} site(s)", self.hosts.len()) };
         format!("{}: {} cookie(s) removed, site data cleared for {}", self.label, self.cookies_removed, sites)
     }
 }
@@ -235,12 +231,7 @@ fn hosts_of(urls: &[String]) -> BTreeSet<String> {
 /// * `open_tab_urls` – URLs of open tabs.
 /// * `known_hosts` – other hosts we know about (session entries), used as candidates for
 ///   site-data removal since the browser can only remove that data for explicit hosts.
-pub fn plan(
-    spec: &CleanupSpec,
-    cookies: &[Cookie],
-    open_tab_urls: &[String],
-    known_hosts: &[String],
-) -> Result<CleanupPlan, String> {
+pub fn plan(spec: &CleanupSpec, cookies: &[Cookie], open_tab_urls: &[String], known_hosts: &[String]) -> Result<CleanupPlan, String> {
     if spec.data_types.is_empty() {
         return Err("no data types selected".into());
     }
@@ -307,17 +298,12 @@ mod tests {
 
     #[test]
     fn pattern_target() {
-        let spec = CleanupSpec {
-            target: CleanupTarget::Pattern(SitePattern::new(PatternKind::Domain, "example.com")),
-            ..Default::default()
-        };
+        let spec =
+            CleanupSpec { target: CleanupTarget::Pattern(SitePattern::new(PatternKind::Domain, "example.com")), ..Default::default() };
         let p = plan(&spec, &cookies(), &[], &["docs.example.com".into()]).unwrap();
         assert_eq!(p.cookies.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
         assert_eq!(p.cookies[0].url, "https://example.com/");
-        assert_eq!(
-            p.site_data_hosts.unwrap(),
-            vec!["docs.example.com".to_string(), "example.com".into(), "www.example.com".into()]
-        );
+        assert_eq!(p.site_data_hosts.unwrap(), vec!["docs.example.com".to_string(), "example.com".into(), "www.example.com".into()]);
     }
 
     #[test]
@@ -349,10 +335,7 @@ mod tests {
         assert_eq!(p.cookies.len(), 3);
         assert_eq!(p.site_data_hosts, None);
 
-        let spec = CleanupSpec {
-            exclude: vec![SitePattern::new(PatternKind::Domain, "example.com")],
-            ..Default::default()
-        };
+        let spec = CleanupSpec { exclude: vec![SitePattern::new(PatternKind::Domain, "example.com")], ..Default::default() };
         let p = plan(&spec, &cookies(), &[], &[]).unwrap();
         assert_eq!(p.cookies.len(), 1);
         assert_eq!(p.site_data_hosts.unwrap(), vec!["other.org".to_string()]);

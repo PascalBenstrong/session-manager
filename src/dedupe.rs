@@ -111,11 +111,7 @@ pub fn find_duplicates(state: &AppState, scope: Scope, o: &DedupeOptions) -> Vec
             }
             members.sort_by_key(|m| std::cmp::Reverse(rank(m)));
             let (keep, kept) = members[0];
-            Some(DuplicateGroup {
-                url: kept.url.clone(),
-                keep,
-                remove: members[1..].iter().map(|(r, _)| *r).collect(),
-            })
+            Some(DuplicateGroup { url: kept.url.clone(), keep, remove: members[1..].iter().map(|(r, _)| *r).collect() })
         })
         .collect()
 }
@@ -172,13 +168,8 @@ impl AppState {
     /// in any session: extra copies of a page the browser restored at startup. Saved
     /// entries are never touched, so a page kept in several sessions stays in all of them.
     pub fn remove_restored_copies(&mut self, since: f64, o: &DedupeOptions) -> DedupeResult {
-        let older: HashSet<String> = self
-            .sessions
-            .iter()
-            .flat_map(|s| &s.entries)
-            .filter(|e| e.is_open() && e.created_at < since)
-            .map(|e| key(&e.url, o))
-            .collect();
+        let older: HashSet<String> =
+            self.sessions.iter().flat_map(|s| &s.entries).filter(|e| e.is_open() && e.created_at < since).map(|e| key(&e.url, o)).collect();
         let mut result = DedupeResult::default();
         for s in &mut self.sessions {
             s.entries.retain(|e| {
@@ -206,11 +197,7 @@ impl AppState {
         let k = key(&tab.url, o);
         let s = self.session(self.active_session)?;
         // Prefer an open entry (switch to it), otherwise an unloaded one (link to it).
-        let found = s
-            .entries
-            .iter()
-            .filter(|e| key(&e.url, o) == k)
-            .max_by_key(|e| (e.is_open(), ordered(e.last_accessed)))?;
+        let found = s.entries.iter().filter(|e| key(&e.url, o) == k).max_by_key(|e| (e.is_open(), ordered(e.last_accessed)))?;
         Some(EntryRef { session: s.id, entry: found.id })
     }
 }

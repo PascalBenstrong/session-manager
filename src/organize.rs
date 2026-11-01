@@ -75,11 +75,7 @@ pub struct WindowPlan {
 
 /// Computes per-window tab order sorted by `key` (stable within a key, ungrouped last).
 /// `entry_for` resolves a browser tab to its session entry (for tags/groups).
-pub fn plan<'a>(
-    key: OrganizeKey,
-    tabs: &[BrowserTab],
-    entry_for: impl Fn(TabId) -> Option<&'a TabEntry>,
-) -> Vec<WindowPlan> {
+pub fn plan<'a>(key: OrganizeKey, tabs: &[BrowserTab], entry_for: impl Fn(TabId) -> Option<&'a TabEntry>) -> Vec<WindowPlan> {
     let mut windows: BTreeMap<TabId, Vec<&BrowserTab>> = BTreeMap::new();
     for t in tabs {
         windows.entry(t.window_id).or_default().push(t);
@@ -116,12 +112,7 @@ pub fn plan<'a>(
         }
         buckets.retain(|(_, ids)| ids.len() >= 2);
 
-        plans.push(WindowPlan {
-            window_id,
-            order: keyed.iter().map(|k| k.2).collect(),
-            start_index: pinned,
-            groups: buckets,
-        });
+        plans.push(WindowPlan { window_id, order: keyed.iter().map(|k| k.2).collect(), start_index: pinned, groups: buckets });
     }
     plans
 }

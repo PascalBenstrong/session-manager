@@ -218,30 +218,62 @@ async fn persist() {
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Event {
     BrowserStartup,
-    TabCreated { tab: BrowserTab },
+    TabCreated {
+        tab: BrowserTab,
+    },
     #[serde(rename_all = "camelCase")]
-    TabUpdated { tab: BrowserTab, url_changed: bool },
+    TabUpdated {
+        tab: BrowserTab,
+        url_changed: bool,
+    },
     #[serde(rename_all = "camelCase")]
-    TabRemoved { tab_id: TabId, window_closing: bool },
+    TabRemoved {
+        tab_id: TabId,
+        window_closing: bool,
+    },
     #[serde(rename_all = "camelCase")]
-    TabActivated { tab_id: TabId },
-    TabReplaced { added: TabId, removed: TabId },
+    TabActivated {
+        tab_id: TabId,
+    },
+    TabReplaced {
+        added: TabId,
+        removed: TabId,
+    },
     /// The media content script reports playback in a frame.
     #[serde(rename_all = "camelCase")]
-    MediaState { tab_id: TabId, frame_id: i64, playing: bool, video: bool, pip: bool },
+    MediaState {
+        tab_id: TabId,
+        frame_id: i64,
+        playing: bool,
+        video: bool,
+        pip: bool,
+    },
     /// The media content script about stopping streams: `toggle` (its button on a video was
     /// clicked), `fresh` (a new page loaded in the tab), `stuck` (playback didn't recover
     /// after resuming).
     #[serde(rename_all = "camelCase")]
-    Stream { tab_id: TabId, frame_id: i64, what: String },
+    Stream {
+        tab_id: TabId,
+        frame_id: i64,
+        what: String,
+    },
     /// An optional permission was granted or revoked.
     PermissionsChanged,
     /// A keyboard shortcut handled here (`open-inspector`).
     #[serde(rename_all = "camelCase")]
-    Command { name: String, tab_id: Option<TabId> },
-    CookieSet { cookie: Cookie },
-    Alarm { name: String },
-    Message { payload: String },
+    Command {
+        name: String,
+        tab_id: Option<TabId>,
+    },
+    CookieSet {
+        cookie: Cookie,
+    },
+    Alarm {
+        name: String,
+    },
+    Message {
+        payload: String,
+    },
 }
 
 async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
@@ -388,9 +420,10 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         }
         Event::Alarm { name } => {
             if let Some(id) = name.strip_prefix(ALARM_PREFIX).and_then(|s| s.parse::<Id>().ok())
-                && let Err(e) = run_rule(id).await {
-                    log(&format!("scheduled cleanup failed: {e}"));
-                }
+                && let Err(e) = run_rule(id).await
+            {
+                log(&format!("scheduled cleanup failed: {e}"));
+            }
         }
         Event::Message { payload } => {
             let resp = match serde_json::from_str::<Command>(&payload) {
@@ -439,19 +472,12 @@ async fn prevent_duplicate(tab: &BrowserTab, now: f64) -> bool {
 async fn on_cookie_set(cookie: Cookie) {
     let (rules, open_urls) = STATE.with(|s| {
         let s = s.borrow();
-        let rules: Vec<CleanupSpec> = s
-            .cleanup_rules
-            .iter()
-            .filter(|r| r.enabled && r.on_cookie_set && r.spec.data_types.cookies)
-            .map(|r| r.spec.clone())
-            .collect();
+        let rules: Vec<CleanupSpec> =
+            s.cleanup_rules.iter().filter(|r| r.enabled && r.on_cookie_set && r.spec.data_types.cookies).map(|r| r.spec.clone()).collect();
         let urls = open_urls(&s);
         (rules, urls)
     });
-    let hit = rules
-        .iter()
-        .filter_map(|spec| SpecMatcher::new(spec, &open_urls).ok())
-        .any(|m| m.matches_cookie(&cookie));
+    let hit = rules.iter().filter_map(|spec| SpecMatcher::new(spec, &open_urls).ok()).any(|m| m.matches_cookie(&cookie));
     if hit {
         let removal = cleanup::CookieRemoval {
             url: cookie.url(),
@@ -976,14 +1002,7 @@ async fn open_entries(id: Id, only: Option<&[Id]>, discarded: bool, new_window: 
     let mut opened = 0;
     let mut errors = Vec::new();
     for (entry, url, title, pinned) in &closed {
-        let opts = CreateTab {
-            url,
-            title,
-            active: false,
-            discarded,
-            pinned: *pinned,
-            window_id: window.as_ref().map(|w| w.window_id),
-        };
+        let opts = CreateTab { url, title, active: false, discarded, pinned: *pinned, window_id: window.as_ref().map(|w| w.window_id) };
         match pf::create_tab(&opts).await {
             Ok(tab) => {
                 with_state(|s| s.link_tab(EntryRef { session: id, entry: *entry }, &tab));
@@ -1024,14 +1043,7 @@ async fn open_entry(r: EntryRef, discarded: bool) -> Result<(), String> {
     };
     if !focused {
         let _opening = OpeningGuard::new();
-        let opts = CreateTab {
-            url: &e.url,
-            title: &e.title,
-            active: !discarded,
-            discarded,
-            pinned: e.pinned,
-            window_id: None,
-        };
+        let opts = CreateTab { url: &e.url, title: &e.title, active: !discarded, discarded, pinned: e.pinned, window_id: None };
         let tab = pf::create_tab(&opts).await?;
         with_state(|s| s.link_tab(r, &tab));
         if !discarded {
@@ -1386,8 +1398,9 @@ async fn sync_alarms() {
     }
     for (name, period) in &desired {
         if !existing.iter().any(|a| a.name == *name && a.period_in_minutes == Some(*period))
-            && let Err(e) = pf::create_alarm(name, *period).await {
-                log(&format!("could not create alarm {name}: {e}"));
-            }
+            && let Err(e) = pf::create_alarm(name, *period).await
+        {
+            log(&format!("could not create alarm {name}: {e}"));
+        }
     }
 }

@@ -328,29 +328,17 @@ impl BackupView {
                         }
                     }
                     Some(Ok(Imported::Urls(list))) => {
-                        imported = urls_ui(
-                            ui,
-                            session,
-                            acts,
-                            &mut self.target,
-                            &mut self.new_session_name,
-                            &mut self.open_imported,
-                            list,
-                        );
+                        imported = urls_ui(ui, session, acts, &mut self.target, &mut self.new_session_name, &mut self.open_imported, list);
                     }
                     Some(Ok(Imported::Table(table))) => {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("CSV file: {} row(s), {} column(s).", table.rows.len(), table.headers.len()));
                             ui.label(
-                                RichText::new("The first row is the header; pick the column that holds the URLs.")
-                                    .small()
-                                    .color(p.muted),
+                                RichText::new("The first row is the header; pick the column that holds the URLs.").small().color(p.muted),
                             );
                         });
-                        let stale = self
-                            .csv_cache
-                            .as_ref()
-                            .is_none_or(|(text, column, _)| text != &self.import_text || *column != self.csv_column);
+                        let stale =
+                            self.csv_cache.as_ref().is_none_or(|(text, column, _)| text != &self.import_text || *column != self.csv_column);
                         if stale {
                             self.csv_cache = Some((self.import_text.clone(), self.csv_column, table.urls(self.csv_column)));
                         }
@@ -366,15 +354,7 @@ impl BackupView {
                                     }
                                 });
                         });
-                        imported = urls_ui(
-                            ui,
-                            session,
-                            acts,
-                            &mut self.target,
-                            &mut self.new_session_name,
-                            &mut self.open_imported,
-                            list,
-                        );
+                        imported = urls_ui(ui, session, acts, &mut self.target, &mut self.new_session_name, &mut self.open_imported, list);
                     }
                 }
                 if imported {

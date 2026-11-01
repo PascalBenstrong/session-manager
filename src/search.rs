@@ -126,7 +126,10 @@ enum Flag {
 
 #[derive(Debug, Clone)]
 enum Matcher {
-    Text { mode: MatchMode, needle: String },
+    Text {
+        mode: MatchMode,
+        needle: String,
+    },
     Pattern(Regex),
     Flag(Flag),
     /// Not used for at least this many milliseconds.
@@ -336,10 +339,7 @@ fn build_matcher(tok: &str, default_mode: MatchMode, case_sensitive: bool) -> Re
             Matcher::Pattern(Regex::new(&src).map_err(|e| format!("invalid regex /{value}/: {e}"))?)
         }
         MatchMode::Glob => Matcher::Pattern(glob_to_regex(value, case_sensitive)?),
-        mode => Matcher::Text {
-            mode,
-            needle: if case_sensitive { value.to_string() } else { value.to_lowercase() },
-        },
+        mode => Matcher::Text { mode, needle: if case_sensitive { value.to_string() } else { value.to_lowercase() } },
     })
 }
 
@@ -450,14 +450,7 @@ mod tests {
 
     #[test]
     fn workspaces_hibernation_idle() {
-        let e = TabEntry {
-            id: 1,
-            tab_id: Some(9),
-            discarded: true,
-            workspace: Some(5),
-            last_accessed: 1_000.0,
-            ..Default::default()
-        };
+        let e = TabEntry { id: 1, tab_id: Some(9), discarded: true, workspace: Some(5), last_accessed: 1_000.0, ..Default::default() };
         let names: HashMap<Id, String> = [(5, "Deep Work".to_string())].into();
         let ctx = |q: Query| q.with_context(names.clone(), [9].into(), 1_000.0 + 3_600_000.0);
         assert!(ctx(q("ws:deep is:hibernated is:playing idle:30m")).matches(&e));

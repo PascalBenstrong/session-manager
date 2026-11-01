@@ -23,7 +23,8 @@ pub enum Tracks {
 }
 
 impl Tracks {
-    pub const ALL: [(Tracks, &'static str); 3] = [(Tracks::Both, "Video + sound"), (Tracks::Video, "Video only"), (Tracks::Audio, "Sound only")];
+    pub const ALL: [(Tracks, &'static str); 3] =
+        [(Tracks::Both, "Video + sound"), (Tracks::Video, "Video only"), (Tracks::Audio, "Sound only")];
 
     pub fn code(self) -> &'static str {
         match self {
@@ -415,7 +416,10 @@ mod tests {
 
     #[test]
     fn file_names() {
-        assert_eq!(file_name("My: video / part 2?", "1080p", "2026-10-27 14-03-22", "mp4"), "My video part 2 - 1080p - 2026-10-27 14-03-22.mp4");
+        assert_eq!(
+            file_name("My: video / part 2?", "1080p", "2026-10-27 14-03-22", "mp4"),
+            "My video part 2 - 1080p - 2026-10-27 14-03-22.mp4"
+        );
         assert_eq!(file_name("  ", "", "", ".webm"), "capture.webm");
         assert_eq!(file_name("Title...", "sound", "", "m4a"), "Title - sound.m4a");
         let long = "x".repeat(200);
@@ -452,10 +456,10 @@ mod tests {
         t.url = "https://upload.example.com/media".into();
         assert_eq!(t.problem(), None);
         t.headers = "Authorization: Bearer abc:def\n\nX-Folder: clips".into();
-        assert_eq!(t.header_list().unwrap(), vec![
-            ("Authorization".to_string(), "Bearer abc:def".to_string()),
-            ("X-Folder".to_string(), "clips".to_string())
-        ]);
+        assert_eq!(
+            t.header_list().unwrap(),
+            vec![("Authorization".to_string(), "Bearer abc:def".to_string()), ("X-Folder".to_string(), "clips".to_string())]
+        );
         t.headers = "no colon".into();
         assert!(t.problem().is_some());
         t.headers = "Bad Name: x".into();
@@ -477,7 +481,15 @@ mod tests {
 
     #[test]
     fn media_summary() {
-        let m = PageMedia { width: 1280, height: 720, duration: 90.0, paused: false, source: "stream".into(), shown: true, ..Default::default() };
+        let m = PageMedia {
+            width: 1280,
+            height: 720,
+            duration: 90.0,
+            paused: false,
+            source: "stream".into(),
+            shown: true,
+            ..Default::default()
+        };
         assert_eq!(m.summary(), "1280 × 720 · 1:30 · playing · streamed (Media Source)");
     }
 }

@@ -15,9 +15,9 @@ use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Layout, Margin, Ri
 use serde_json::{Value, json};
 use wasm_bindgen_futures::spawn_local;
 
+use super::Actions;
 use super::theme;
 use super::widgets::{badge, empty_state, icon_button, primary_button, segmented, text_input};
-use super::Actions;
 use crate::guards::normalize_site;
 use crate::model::TabId;
 use crate::netlog::{self, NetEntry, NetLog, NetSettings, ThrottleRule};
@@ -95,10 +95,7 @@ impl NetworkPane {
             revision: 0,
         };
         p.run(async { pf::get_throttle().await }, Reply::Throttle);
-        p.run(
-            async { pf::storage_get(SETTINGS_KEY).await.ok().flatten().and_then(|s| serde_json::from_str(&s).ok()) },
-            Reply::Settings,
-        );
+        p.run(async { pf::storage_get(SETTINGS_KEY).await.ok().flatten().and_then(|s| serde_json::from_str(&s).ok()) }, Reply::Settings);
         p
     }
 
@@ -264,7 +261,8 @@ impl NetworkPane {
 
     fn quick_rule(&mut self, site: &str, pattern: String, method: &str, acts: &mut Actions) {
         let rule = self.new_rule(site, pattern, method);
-        let same = self.throttle.iter().find(|r| r.site == rule.site && r.pattern == rule.pattern && r.method == rule.method && r.tab == rule.tab);
+        let same =
+            self.throttle.iter().find(|r| r.site == rule.site && r.pattern == rule.pattern && r.method == rule.method && r.tab == rule.tab);
         let rule = match same {
             Some(r) => ThrottleRule { enabled: true, delay: rule.delay, ..r.clone() },
             None => rule,
@@ -430,10 +428,12 @@ impl NetworkPane {
             let mut changed = false;
             egui::Grid::new("net-settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                 ui.label("Delay of new throttle rules");
-                changed |= ui.add(egui::DragValue::new(&mut self.settings.default_delay).range(0..=120_000).speed(20.0).suffix(" ms")).changed();
+                changed |=
+                    ui.add(egui::DragValue::new(&mut self.settings.default_delay).range(0..=120_000).speed(20.0).suffix(" ms")).changed();
                 ui.end_row();
                 ui.label("Pause between replayed requests");
-                changed |= ui.add(egui::DragValue::new(&mut self.settings.replay_gap).range(0..=60_000).speed(10.0).suffix(" ms")).changed();
+                changed |=
+                    ui.add(egui::DragValue::new(&mut self.settings.replay_gap).range(0..=60_000).speed(10.0).suffix(" ms")).changed();
                 ui.end_row();
                 ui.label("New throttle rules apply to");
                 ui.horizontal(|ui| {
@@ -464,7 +464,10 @@ impl NetworkPane {
                 if self.recording {
                     ("Listening…", "Requests the page makes (fetch, XHR, WebSocket, beacons) show up here, also after it reloads.")
                 } else {
-                    ("Not recording", "● Record listens from now on and after reloads; ⟳ Reload and record also catches the page's first requests.")
+                    (
+                        "Not recording",
+                        "● Record listens from now on and after reloads; ⟳ Reload and record also catches the page's first requests.",
+                    )
                 }
             } else {
                 ("No matches", "Try another filter.")
@@ -536,7 +539,8 @@ impl NetworkPane {
                     x += 30.0;
                 }
                 let right = rect.right() - 150.0;
-                let label = if e.kind == "frame" { e.req_body.clone().unwrap_or_else(|| e.req_body_note.clone()) } else { short_url(&e.url) };
+                let label =
+                    if e.kind == "frame" { e.req_body.clone().unwrap_or_else(|| e.req_body_note.clone()) } else { short_url(&e.url) };
                 let galley = painter.layout_no_wrap(label, mono.clone(), if current { p.text } else { p.muted });
                 let clip = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(right - 8.0, rect.bottom()));
                 painter.with_clip_rect(clip).galley(egui::pos2(x, y - galley.size().y / 2.0), galley, p.text);
@@ -639,7 +643,10 @@ impl NetworkPane {
                 self.kind = "ws";
                 self.query = e.url.clone();
             }
-            if e.kind != "frame" && !site.is_empty() && ui.button("🐢 Throttle…").on_hover_text("Make a throttle rule from this request").clicked() {
+            if e.kind != "frame"
+                && !site.is_empty()
+                && ui.button("🐢 Throttle…").on_hover_text("Make a throttle rule from this request").clicked()
+            {
                 let method = if is_http(e) { e.method.as_str() } else { "" };
                 self.editing = Some(self.new_rule(site, netlog::similar_pattern(&e.url), method));
             }
@@ -706,7 +713,11 @@ impl NetworkPane {
                 if on > 0 { format!(" · {on} rule(s) on") } else { String::new() }
             );
             let color = if on > 0 { p.warn } else { p.text };
-            if ui.add(egui::Label::new(RichText::new(title).strong().color(color)).sense(Sense::click())).on_hover_text("Show / hide").clicked() {
+            if ui
+                .add(egui::Label::new(RichText::new(title).strong().color(color)).sense(Sense::click()))
+                .on_hover_text("Show / hide")
+                .clicked()
+            {
                 self.throttle_open = Some(!open);
             }
             if open {
@@ -748,7 +759,9 @@ impl NetworkPane {
         egui::ScrollArea::vertical().id_salt("throttle-rules").auto_shrink([false, true]).show(ui, |ui| {
             if mine.is_empty() && self.editing.is_none() {
                 ui.label(
-                    RichText::new("No rules for this site yet. Right-click a request to throttle it, or requests like it.").small().color(p.muted),
+                    RichText::new("No rules for this site yet. Right-click a request to throttle it, or requests like it.")
+                        .small()
+                        .color(p.muted),
                 );
             }
             for r in &mine {
@@ -794,11 +807,13 @@ impl NetworkPane {
                 ui.add(text_input(&mut rule.pattern, "https://example.com/api/*   (* matches anything)", width));
                 ui.end_row();
                 ui.label("Method");
-                egui::ComboBox::from_id_salt("rule-method").selected_text(if rule.method.is_empty() { "any" } else { &rule.method }).show_ui(ui, |ui| {
-                    for m in METHODS {
-                        ui.selectable_value(&mut rule.method, m.to_string(), if m.is_empty() { "any" } else { m });
-                    }
-                });
+                egui::ComboBox::from_id_salt("rule-method")
+                    .selected_text(if rule.method.is_empty() { "any" } else { &rule.method })
+                    .show_ui(ui, |ui| {
+                        for m in METHODS {
+                            ui.selectable_value(&mut rule.method, m.to_string(), if m.is_empty() { "any" } else { m });
+                        }
+                    });
                 ui.end_row();
                 ui.label("Delay");
                 ui.add(egui::DragValue::new(&mut rule.delay).range(0..=120_000).speed(20.0).suffix(" ms"));
@@ -849,7 +864,9 @@ fn replay_hint(e: &NetEntry, doc: u64) -> &'static str {
         ("xhr", _) => "Sent again, and the page's own handlers get the new response: you see what it does with it.",
         ("frame", "in") => "Delivered to the page again, as if the server sent it: the page's code handles it.",
         ("frame", _) => "Sent to the server again on the same connection.",
-        ("fetch", _) => "Sent again from the page (same cookies). The page's code can't get a fetch answer twice: the new response shows here.",
+        ("fetch", _) => {
+            "Sent again from the page (same cookies). The page's code can't get a fetch answer twice: the new response shows here."
+        }
         ("beacon", _) => "Sent again from the page.",
         ("ws", _) => "Replay its messages instead.",
         _ => "",
@@ -919,7 +936,8 @@ fn body(ui: &mut egui::Ui, title: &str, text: &Option<String>, note: &str, acts:
         }
         if let Some(t) = text {
             // JSON is shown indented.
-            let shown = serde_json::from_str::<Value>(t).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_else(|| t.clone());
+            let shown =
+                serde_json::from_str::<Value>(t).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_else(|| t.clone());
             egui::Frame::new().fill(p.input).corner_radius(6).inner_margin(Margin::same(6)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let r = ui.add(egui::Label::new(RichText::new(&shown).monospace().small()).wrap().selectable(true));

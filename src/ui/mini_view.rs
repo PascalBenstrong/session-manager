@@ -132,9 +132,7 @@ impl MiniView {
             }
             for (i, e) in matched.iter().enumerate() {
                 let r = entry_ref(e);
-                let session_name = self
-                    .all_sessions
-                    .then(|| cx.state.session(r.session).map(|s| s.name.as_str()).unwrap_or(""));
+                let session_name = self.all_sessions.then(|| cx.state.session(r.session).map(|s| s.name.as_str()).unwrap_or(""));
                 let resp = row(ui, cx, e, r, i == self.selected, session_name, self.reload_after_clean, acts);
                 if i == self.selected && moved {
                     resp.scroll_to_me(None);
@@ -181,8 +179,7 @@ impl MiniView {
     }
 }
 
-const COOKIES_ONLY: DataTypes =
-    DataTypes { cookies: true, cache: false, local_storage: false, indexed_db: false, service_workers: false };
+const COOKIES_ONLY: DataTypes = DataTypes { cookies: true, cache: false, local_storage: false, indexed_db: false, service_workers: false };
 
 /// Asks for confirmation, then clears `tab`'s site data (`None` = the current tab).
 fn clean(acts: &mut Actions, tab: Option<TabId>, site: &str, data_types: DataTypes, reload: bool) {
@@ -219,11 +216,7 @@ fn row(
     };
     ui.painter().rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
 
-    let mut row = ui.new_child(
-        UiBuilder::new()
-            .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
-            .layout(Layout::left_to_right(Align::Center)),
-    );
+    let mut row = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
     let host = e.host();
     let av = avatar(&mut row, &host, !open || e.discarded);
     status_dot(&row, av, tab_state_color(&row, e));
@@ -240,7 +233,11 @@ fn row(
                 let media = &cx.state.media;
                 let stopped = media.stopped.contains(&tab_id);
                 if stopped || media.playing.iter().any(|p| p.tab_id == tab_id) {
-                    let (icon, tip) = if stopped { ("▶", "Resume the stream") } else { ("⏸", "Stop the stream: pause it and download nothing until you resume it") };
+                    let (icon, tip) = if stopped {
+                        ("▶", "Resume the stream")
+                    } else {
+                        ("⏸", "Stop the stream: pause it and download nothing until you resume it")
+                    };
                     if icon_button(ui, icon, tip).clicked() {
                         acts.send(Command::StopStream { tab: tab_id, stop: !stopped });
                     }

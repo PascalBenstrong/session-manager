@@ -8,9 +8,9 @@ use crate::dedupe::Scope;
 use crate::guards::BlockRule;
 use crate::hibernate::HibernateTarget;
 use crate::model::{AppState, AutoRule, EntryRef, Id, Session, Settings, TabId};
-use crate::workspace::Workspace;
-use crate::state::{ImportTarget, RestoreMode};
 use crate::organize::OrganizeKey;
+use crate::state::{ImportTarget, RestoreMode};
+use crate::workspace::Workspace;
 
 /// Storage key holding the serialized [`AppState`].
 pub const STATE_KEY: &str = "sm_state";
@@ -19,80 +19,188 @@ pub const STATE_KEY: &str = "sm_state";
 #[serde(tag = "cmd")]
 pub enum Command {
     GetState,
-    CreateSession { name: String, make_active: bool },
-    RenameSession { id: Id, name: String },
-    DeleteSession { id: Id, close_tabs: bool },
+    CreateSession {
+        name: String,
+        make_active: bool,
+    },
+    RenameSession {
+        id: Id,
+        name: String,
+    },
+    DeleteSession {
+        id: Id,
+        close_tabs: bool,
+    },
     /// Make a session active without opening any of its tabs.
-    SetActiveSession { id: Id },
+    SetActiveSession {
+        id: Id,
+    },
     /// Open the session's closed entries. `discarded` opens them unloaded (lazy).
-    LoadSession { id: Id, discarded: bool, new_window: bool },
+    LoadSession {
+        id: Id,
+        discarded: bool,
+        new_window: bool,
+    },
     /// Focus the entry's tab, or open it if closed.
-    OpenEntry { entry: EntryRef, discarded: bool },
+    OpenEntry {
+        entry: EntryRef,
+        discarded: bool,
+    },
     /// Open the closed ones of these entries in the background (`discarded`: unloaded), e.g.
     /// a workspace's saved tabs.
-    OpenEntries { entries: Vec<EntryRef>, discarded: bool },
+    OpenEntries {
+        entries: Vec<EntryRef>,
+        discarded: bool,
+    },
     /// Focus (or open) the most recently used tab of a session.
-    FocusLastTab { session: Id },
-    RemoveEntries { entries: Vec<EntryRef>, close_tabs: bool },
+    FocusLastTab {
+        session: Id,
+    },
+    RemoveEntries {
+        entries: Vec<EntryRef>,
+        close_tabs: bool,
+    },
     /// Close the entries' tabs, keeping them as saved tabs in their session and workspace.
-    CloseEntries { entries: Vec<EntryRef> },
-    TagEntries { entries: Vec<EntryRef>, tag: String, add: bool },
-    SetGroup { entries: Vec<EntryRef>, group: Option<String> },
-    MoveEntries { entries: Vec<EntryRef>, target: Id },
+    CloseEntries {
+        entries: Vec<EntryRef>,
+    },
+    TagEntries {
+        entries: Vec<EntryRef>,
+        tag: String,
+        add: bool,
+    },
+    SetGroup {
+        entries: Vec<EntryRef>,
+        group: Option<String>,
+    },
+    MoveEntries {
+        entries: Vec<EntryRef>,
+        target: Id,
+    },
     /// Re-order browser tabs by key (optionally creating native tab groups).
-    Organize { key: OrganizeKey, native_groups: bool },
-    SaveAutoRule { rule: AutoRule },
-    DeleteAutoRule { id: Id },
+    Organize {
+        key: OrganizeKey,
+        native_groups: bool,
+    },
+    SaveAutoRule {
+        rule: AutoRule,
+    },
+    DeleteAutoRule {
+        id: Id,
+    },
     /// Re-apply auto rules to all existing entries.
     ApplyAutoRules,
-    UpdateSettings { settings: Settings },
-    RunCleanup { label: String, spec: CleanupSpec },
-    SaveCleanupRule { rule: CleanupRule },
-    DeleteCleanupRule { id: Id },
-    RunCleanupRule { id: Id },
+    UpdateSettings {
+        settings: Settings,
+    },
+    RunCleanup {
+        label: String,
+        spec: CleanupSpec,
+    },
+    SaveCleanupRule {
+        rule: CleanupRule,
+    },
+    DeleteCleanupRule {
+        id: Id,
+    },
+    RunCleanupRule {
+        id: Id,
+    },
     ClearCleanupLog,
     /// Remove cookies / site data of one tab's site (`None` = the active tab of the
     /// focused window), optionally reloading the tab afterwards.
-    ClearTabData { tab: Option<TabId>, data_types: DataTypes, reload: bool },
+    ClearTabData {
+        tab: Option<TabId>,
+        data_types: DataTypes,
+        reload: bool,
+    },
     /// Save the session's current tab list as a named revision.
-    CreateSnapshot { session: Id, name: String },
-    RestoreSnapshot { session: Id, snapshot: Id, mode: RestoreMode, open: bool },
-    DeleteSnapshot { session: Id, snapshot: Id },
+    CreateSnapshot {
+        session: Id,
+        name: String,
+    },
+    RestoreSnapshot {
+        session: Id,
+        snapshot: Id,
+        mode: RestoreMode,
+        open: bool,
+    },
+    DeleteSnapshot {
+        session: Id,
+        snapshot: Id,
+    },
     /// Add URLs to a session (or a new one); optionally open them unloaded.
-    ImportUrls { urls: Vec<String>, target: ImportTarget, open: bool },
+    ImportUrls {
+        urls: Vec<String>,
+        target: ImportTarget,
+        open: bool,
+    },
     /// Add sessions from a saved file as new sessions.
-    ImportSessions { sessions: Vec<Session> },
+    ImportSessions {
+        sessions: Vec<Session>,
+    },
     /// Remove duplicate tabs (compared with `settings.dedupe`). `close_tabs` closes open
     /// duplicates; otherwise they stay open but untracked.
-    RemoveDuplicates { scope: Scope, close_tabs: bool },
+    RemoveDuplicates {
+        scope: Scope,
+        close_tabs: bool,
+    },
     /// Create (`id == 0`) or update a workspace.
-    SaveWorkspace { workspace: Workspace },
+    SaveWorkspace {
+        workspace: Workspace,
+    },
     /// Delete a workspace; its tabs are kept without a workspace.
-    DeleteWorkspace { id: Id },
+    DeleteWorkspace {
+        id: Id,
+    },
     /// Move a workspace up (`delta < 0`) or down.
-    MoveWorkspace { id: Id, delta: i32 },
+    MoveWorkspace {
+        id: Id,
+        delta: i32,
+    },
     /// Put entries in a workspace (`None` = no workspace). Rules leave them there.
-    AssignWorkspace { entries: Vec<EntryRef>, workspace: Option<Id> },
+    AssignWorkspace {
+        entries: Vec<EntryRef>,
+        workspace: Option<Id>,
+    },
     /// Let the workspace rules place these entries again, even if they were placed by
     /// hand. `None` applies the rules to every entry not placed by hand.
-    AutoPlaceEntries { entries: Option<Vec<EntryRef>> },
+    AutoPlaceEntries {
+        entries: Option<Vec<EntryRef>>,
+    },
     /// Unload tabs to free memory. `force` includes pinned tabs and tabs playing media.
-    Hibernate { target: HibernateTarget, force: bool },
+    Hibernate {
+        target: HibernateTarget,
+        force: bool,
+    },
     /// Stop a tab's streams (pause them and hold back their media data), or resume them.
-    StopStream { tab: TabId, stop: bool },
+    StopStream {
+        tab: TabId,
+        stop: bool,
+    },
     /// Stop the streams playing in tabs that aren't the active tab of their window.
     StopBackgroundStreams,
     /// Switch to a workspace (`None`: no current workspace, show every tab): focus its
     /// most recently used tab and, if enabled, hide the other workspaces' tabs.
-    SetActiveWorkspace { id: Option<Id> },
+    SetActiveWorkspace {
+        id: Option<Id>,
+    },
     /// Open a new tab that joins a workspace (`None`: the current one).
-    NewTabInWorkspace { workspace: Option<Id> },
+    NewTabInWorkspace {
+        workspace: Option<Id>,
+    },
     /// Create (`id == 0`) or update a rule blocking ad scripts / ad tabs.
-    SaveBlockRule { rule: BlockRule },
-    DeleteBlockRule { id: Id },
+    SaveBlockRule {
+        rule: BlockRule,
+    },
+    DeleteBlockRule {
+        id: Id,
+    },
     ClearPopupLog,
     /// Open the inspector window for a tab (`None`: the active tab of the focused window).
-    OpenInspector { tab: Option<TabId> },
+    OpenInspector {
+        tab: Option<TabId>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

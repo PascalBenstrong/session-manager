@@ -225,11 +225,9 @@ impl CleanupView {
                 ui.add_space(8.0);
             }
             for rule in &cx.state.cleanup_rules {
-                egui::Frame::new()
-                    .fill(p.surface_hover)
-                    .corner_radius(theme::RADIUS)
-                    .inner_margin(egui::Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
+                egui::Frame::new().fill(p.surface_hover).corner_radius(theme::RADIUS).inner_margin(egui::Margin::symmetric(10, 6)).show(
+                    ui,
+                    |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             let mut enabled = rule.enabled;
@@ -273,7 +271,8 @@ impl CleanupView {
                                 }
                             });
                         });
-                    });
+                    },
+                );
                 ui.add_space(2.0);
             }
         });

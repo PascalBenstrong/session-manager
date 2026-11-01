@@ -109,8 +109,7 @@ pub fn plan_groups(
                 plan.groups.push(GroupSync { window_id, workspace: ws.id, tab_ids, group, title: label, color, collapsed, update });
             }
         }
-        let ws_groups: HashMap<i64, Id> =
-            wgroups.iter().filter_map(|g| labels.get(&g.title).map(|w| (g.id, *w))).collect();
+        let ws_groups: HashMap<i64, Id> = wgroups.iter().filter_map(|g| labels.get(&g.title).map(|w| (g.id, *w))).collect();
         for t in &wtabs {
             if let Some(w) = t.group_id.and_then(|g| ws_groups.get(&g))
                 && workspace_of(t) != Some(*w)
@@ -197,11 +196,8 @@ pub const FIREFOX_EXTENSION_ID: &str = "session-manager@local.extension";
 
 /// The id Firefox gives an extension's sidebar, from the extension id.
 pub fn sidebar_command_id(extension_id: &str) -> String {
-    let widget: String = extension_id
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
+    let widget: String =
+        extension_id.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
     format!("{widget}-sidebar-action")
 }
 
@@ -234,16 +230,19 @@ mod tests {
         let groups = vec![NativeGroup { id: 7, window_id: 1, title: "💻 Dev".into(), color: "green".into(), collapsed: false }];
         let plan = plan_groups(&ws, &tabs, &groups, ws_of(&map), Some(&BTreeMap::new()));
         // Dev: reuse group 7, add tab 1, already expanded and green -> no update.
-        assert_eq!(plan.groups[0], GroupSync {
-            window_id: 1,
-            workspace: 10,
-            tab_ids: vec![1],
-            group: Some(7),
-            title: "💻 Dev".into(),
-            color: "green",
-            collapsed: Some(false),
-            update: false
-        });
+        assert_eq!(
+            plan.groups[0],
+            GroupSync {
+                window_id: 1,
+                workspace: 10,
+                tab_ids: vec![1],
+                group: Some(7),
+                title: "💻 Dev".into(),
+                color: "green",
+                collapsed: Some(false),
+                update: false
+            }
+        );
         // Read: new group, collapsed (the active tab is in Dev); and one in window 2.
         assert_eq!((plan.groups[1].group, plan.groups[1].collapsed, plan.groups[1].update), (None, Some(true), true));
         assert_eq!((plan.groups[2].window_id, plan.groups[2].tab_ids.clone()), (2, vec![5]));

@@ -55,9 +55,7 @@ impl SitePattern {
         }
         Ok(match self.kind {
             PatternKind::Host => CompiledPattern::Host(value.to_ascii_lowercase()),
-            PatternKind::Domain => {
-                CompiledPattern::Domain(value.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase())
-            }
+            PatternKind::Domain => CompiledPattern::Domain(value.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase()),
             PatternKind::UrlPrefix => CompiledPattern::UrlPrefix(value.to_ascii_lowercase()),
             PatternKind::Glob => {
                 let on_url = value.contains('/') || value.contains(':');

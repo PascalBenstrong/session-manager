@@ -112,10 +112,8 @@ mod tests {
         let r = releases();
         assert!(!r.is_empty() && r[0].sections.iter().all(|s| !s.items.is_empty()), "changelog has content");
         assert_eq!(r[0].version, VERSION, "latest CHANGELOG.md entry must match Cargo.toml");
-        for (name, manifest) in [
-            ("firefox", include_str!("../firefox/manifest.json")),
-            ("chrome", include_str!("../chrome/manifest.json")),
-        ] {
+        for (name, manifest) in [("firefox", include_str!("../firefox/manifest.json")), ("chrome", include_str!("../chrome/manifest.json"))]
+        {
             let m: serde_json::Value = serde_json::from_str(manifest).unwrap();
             assert_eq!(m["version"].as_str(), Some(VERSION), "{name}/manifest.json version");
         }

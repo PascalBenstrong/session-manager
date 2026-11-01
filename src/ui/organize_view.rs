@@ -3,7 +3,9 @@
 use eframe::egui::{self, RichText};
 
 use super::theme;
-use super::widgets::{ChipKind, chip, empty_state, icon_button, parse_list, pattern_editor, pattern_error, primary_button, section_card, text_input};
+use super::widgets::{
+    ChipKind, chip, empty_state, icon_button, parse_list, pattern_editor, pattern_error, primary_button, section_card, text_input,
+};
 use super::{Actions, ViewCtx};
 use crate::dedupe::{Scope, find_duplicates};
 use crate::model::AutoRule;
@@ -134,8 +136,8 @@ impl OrganizeView {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let valid = self.draft.pattern.compile().is_ok()
-                        && (!self.draft_tags.trim().is_empty() || !self.draft_group.trim().is_empty());
+                    let valid =
+                        self.draft.pattern.compile().is_ok() && (!self.draft_tags.trim().is_empty() || !self.draft_group.trim().is_empty());
                     if ui.add_enabled(valid, primary_button(ui, "Save rule")).clicked() {
                         let group = self.draft_group.trim();
                         let rule = AutoRule {

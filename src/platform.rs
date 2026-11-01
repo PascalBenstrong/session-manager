@@ -674,4 +674,3 @@ pub async fn read_clipboard() -> Result<String> {
 pub fn download_text(filename: &str, text: &str, mime: &str) -> Result<()> {
     js_download_text(filename, text, mime).map_err(js_error)
 }
-

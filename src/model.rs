@@ -111,9 +111,7 @@ impl Session {
 
     /// The most recently accessed entry ("last open tab").
     pub fn last_accessed(&self) -> Option<&TabEntry> {
-        self.entries
-            .iter()
-            .max_by(|a, b| a.last_accessed.total_cmp(&b.last_accessed).then(a.created_at.total_cmp(&b.created_at)))
+        self.entries.iter().max_by(|a, b| a.last_accessed.total_cmp(&b.last_accessed).then(a.created_at.total_cmp(&b.created_at)))
     }
 
     pub fn urls(&self) -> BTreeSet<&str> {

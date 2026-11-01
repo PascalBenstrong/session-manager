@@ -158,9 +158,7 @@ fn visuals(theme: Theme, p: &Palette) -> Visuals {
 const PREF_KEY: &str = "sm_theme";
 
 pub fn load_preference() -> ThemePreference {
-    let stored = web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(PREF_KEY).ok().flatten());
+    let stored = web_sys::window().and_then(|w| w.local_storage().ok().flatten()).and_then(|s| s.get_item(PREF_KEY).ok().flatten());
     match stored.as_deref() {
         Some("dark") => ThemePreference::Dark,
         Some("light") => ThemePreference::Light,

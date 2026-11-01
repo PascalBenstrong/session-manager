@@ -55,19 +55,15 @@ use AdCategory::*;
 
 pub const PROVIDERS: &[Provider] = &[
     // Pop-ups, pop-unders and redirect networks.
-    p("PropellerAds / Monetag", Popunder, &[
-        "propellerads.com", "propellerclick.com", "onclickads.net", "onclkds.com", "monetag.com", "llvpn.com", "libtl.com",
-    ]),
-    p("PopAds", Popunder, &[
-        "popads.net", "popadscdn.net", "displayvertising.com", "predictivadnetwork.com", "predictivadnetworks.com",
-    ]),
+    p(
+        "PropellerAds / Monetag",
+        Popunder,
+        &["propellerads.com", "propellerclick.com", "onclickads.net", "onclkds.com", "monetag.com", "llvpn.com", "libtl.com"],
+    ),
+    p("PopAds", Popunder, &["popads.net", "popadscdn.net", "displayvertising.com", "predictivadnetwork.com", "predictivadnetworks.com"]),
     p("PopCash", Popunder, &["popcash.net"]),
-    p("Adsterra", Popunder, &[
-        "adsterra.com", "highperformanceformat.com", "effectivecreativeformat.com", "effectivecreativeformats.com",
-    ]),
-    p("ExoClick", Popunder, &[
-        "exoclick.com", "exosrv.com", "exdynsrv.com", "exacdn.com", "opoxv.com", "pemsrv.com", "smartfloralab.com",
-    ]),
+    p("Adsterra", Popunder, &["adsterra.com", "highperformanceformat.com", "effectivecreativeformat.com", "effectivecreativeformats.com"]),
+    p("ExoClick", Popunder, &["exoclick.com", "exosrv.com", "exdynsrv.com", "exacdn.com", "opoxv.com", "pemsrv.com", "smartfloralab.com"]),
     p("JuicyAds", Popunder, &["juicyads.com"]),
     p("TrafficJunky", Popunder, &["trafficjunky.com", "trafficjunky.net"]),
     p("TrafficStars", Popunder, &["trafficstars.com", "tsyndicate.com"]),
@@ -83,9 +79,11 @@ pub const PROVIDERS: &[Provider] = &[
     p("Zeropark", Popunder, &["zeropark.com"]),
     p("EroAdvertising", Popunder, &["ero-advertising.com"]),
     // Display.
-    p("Google Ads (AdSense, Ad Manager, DoubleClick)", Display, &[
-        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "googletagservices.com", "adservice.google.com", "2mdn.net",
-    ]),
+    p(
+        "Google Ads (AdSense, Ad Manager, DoubleClick)",
+        Display,
+        &["doubleclick.net", "googlesyndication.com", "googleadservices.com", "googletagservices.com", "adservice.google.com", "2mdn.net"],
+    ),
     p("Amazon Ads", Display, &["amazon-adsystem.com"]),
     p("Media.net", Display, &["media.net"]),
     p("Infolinks", Display, &["infolinks.com"]),
@@ -226,15 +224,43 @@ pub const SLOT_SELECTORS: &[(&str, &str)] = &[
 
 /// Host labels that name ad servers ("ads.example.net", "adserver-3.cdn.io").
 const SUSPECT_TOKENS: &[&str] = &[
-    "ad", "ads", "adserver", "adservers", "adsrv", "adservice", "adx", "adnet", "adnetwork", "advert", "adverts", "advertising",
-    "banner", "banners", "popunder", "popunders", "popup", "popups", "pop", "pops",
+    "ad",
+    "ads",
+    "adserver",
+    "adservers",
+    "adsrv",
+    "adservice",
+    "adx",
+    "adnet",
+    "adnetwork",
+    "advert",
+    "adverts",
+    "advertising",
+    "banner",
+    "banners",
+    "popunder",
+    "popunders",
+    "popup",
+    "popups",
+    "pop",
+    "pops",
 ];
 
 /// Shared hosts where one ad tag's domain says nothing about the next one: blocking the
 /// registrable domain would hit unrelated sites, so a rule must name the host itself.
 const SHARED_HOSTS: &[&str] = &[
-    "cloudfront.net", "akamaized.net", "fastly.net", "azureedge.net", "edgekey.net", "amazonaws.com",
-    "workers.dev", "pages.dev", "netlify.app", "vercel.app", "cloudflare.net", "googleusercontent.com",
+    "cloudfront.net",
+    "akamaized.net",
+    "fastly.net",
+    "azureedge.net",
+    "edgekey.net",
+    "amazonaws.com",
+    "workers.dev",
+    "pages.dev",
+    "netlify.app",
+    "vercel.app",
+    "cloudflare.net",
+    "googleusercontent.com",
 ];
 
 /// The catalogue entry for a host, if it belongs to a known ad network.
@@ -438,7 +464,9 @@ pub fn providers(page_url: &str, signals: &[AdSignal]) -> Vec<ProviderHit> {
             Some((p.name.to_string(), p.category, true, Some(domain.clone())))
         } else if third_party && let Some(p) = provider_for_url(&s.url) {
             Some((p.name.to_string(), p.category, true, Some(domain.clone())))
-        } else if s.kind == "script" && let Some((name, category)) = script_hint(&s.url) {
+        } else if s.kind == "script"
+            && let Some((name, category)) = script_hint(&s.url)
+        {
             Some((name.to_string(), category, true, None))
         } else if third_party && suspect_host(&host) {
             Some((domain.clone(), Suspected, false, Some(domain.clone())))
@@ -474,12 +502,7 @@ pub fn providers(page_url: &str, signals: &[AdSignal]) -> Vec<ProviderHit> {
 }
 
 /// The hit for a provider, created if this is its first signal.
-fn hit<'a>(
-    hits: &'a mut BTreeMap<String, ProviderHit>,
-    name: String,
-    category: AdCategory,
-    known: bool,
-) -> &'a mut ProviderHit {
+fn hit<'a>(hits: &'a mut BTreeMap<String, ProviderHit>, name: String, category: AdCategory, known: bool) -> &'a mut ProviderHit {
     hits.entry(name.clone()).or_insert_with(|| ProviderHit { name, category, known, domains: BTreeSet::new(), signals: Vec::new() })
 }
 
@@ -760,7 +783,9 @@ mod tests {
         let reanime = providers(
             "https://reanime.to/watch/x",
             &[
-                inline("var TAGS={monetag:function(s){s.dataset.zone='1';s.src='https://llvpn.com/tag.min.js'},admaven:function(s){s.src='https://d2f9q8zryik75d.cloudfront.net/?rzqfd=1500352'}};"),
+                inline(
+                    "var TAGS={monetag:function(s){s.dataset.zone='1';s.src='https://llvpn.com/tag.min.js'},admaven:function(s){s.src='https://d2f9q8zryik75d.cloudfront.net/?rzqfd=1500352'}};",
+                ),
                 sig("script", "https://llvpn.com/tag.min.js"),
             ],
         );

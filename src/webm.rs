@@ -137,7 +137,8 @@ pub fn set_duration(head: &[u8], ms: f64) -> Result<Vec<u8>, String> {
     }
     let (segment, info) = locate(head)?;
     let kids = children(head, &info);
-    let scale = kids.iter().find(|e| e.id == TIMECODE_SCALE).map_or(1_000_000, |e| read_uint(&head[e.data..e.end().unwrap_or(e.data)])).max(1);
+    let scale =
+        kids.iter().find(|e| e.id == TIMECODE_SCALE).map_or(1_000_000, |e| read_uint(&head[e.data..e.end().unwrap_or(e.data)])).max(1);
     let units = ms * 1e6 / scale as f64;
     let mut out = head.to_vec();
 

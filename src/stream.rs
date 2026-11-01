@@ -265,7 +265,12 @@ impl Variant {
             && !self.codecs.is_empty()
             && self.codecs.split(',').all(|c| {
                 let c = c.trim();
-                c.starts_with("mp4a") || c.starts_with("ac-3") || c.starts_with("ec-3") || c.starts_with("opus") || c.starts_with("mp3") || c.starts_with("flac")
+                c.starts_with("mp4a")
+                    || c.starts_with("ac-3")
+                    || c.starts_with("ec-3")
+                    || c.starts_with("opus")
+                    || c.starts_with("mp3")
+                    || c.starts_with("flac")
             })
     }
 
@@ -496,16 +501,15 @@ impl Master {
     /// Variants by quality, best first (sound-only ones last).
     pub fn sorted_variants(&self) -> Vec<&Variant> {
         let mut v: Vec<&Variant> = self.variants.iter().collect();
-        v.sort_by_key(|x| (x.audio_only(), std::cmp::Reverse(x.resolution.map_or(0, |(w, h)| w as u64 * h as u64)), std::cmp::Reverse(x.bandwidth)));
+        v.sort_by_key(|x| {
+            (x.audio_only(), std::cmp::Reverse(x.resolution.map_or(0, |(w, h)| w as u64 * h as u64)), std::cmp::Reverse(x.bandwidth))
+        });
         v
     }
 
     /// Audio renditions with their own playlist, of `group` (or of any group if `None`).
     pub fn audio_renditions(&self, group: Option<&str>) -> Vec<&Rendition> {
-        self.renditions
-            .iter()
-            .filter(|r| r.kind == "AUDIO" && r.url.is_some() && group.is_none_or(|g| r.group == g))
-            .collect()
+        self.renditions.iter().filter(|r| r.kind == "AUDIO" && r.url.is_some() && group.is_none_or(|g| r.group == g)).collect()
     }
 
     pub fn subtitle_renditions(&self) -> Vec<&Rendition> {
@@ -748,7 +752,9 @@ fn kind_of(content_type: &str, mime: &str, codecs: &str) -> TrackKind {
     match t {
         "audio" => TrackKind::Audio,
         "text" => TrackKind::Subtitles,
-        "application" if mime.contains("ttml") || mime.contains("mp4") && codecs.starts_with("stpp") || codecs.starts_with("wvtt") => TrackKind::Subtitles,
+        "application" if mime.contains("ttml") || mime.contains("mp4") && codecs.starts_with("stpp") || codecs.starts_with("wvtt") => {
+            TrackKind::Subtitles
+        }
         _ => TrackKind::Video,
     }
 }
@@ -1027,14 +1033,16 @@ mod tests {
         assert_eq!(video[0].id, "v1080");
         assert_eq!(video[0].init.as_ref().unwrap().url, "https://h.com/x/media/v1080/init.mp4");
         // 10 s in 4 s segments: 3
-        assert_eq!(video[0].segments.iter().map(|s| s.url.as_str()).collect::<Vec<_>>(), [
-            "https://h.com/x/media/v1080/1.m4s",
-            "https://h.com/x/media/v1080/2.m4s",
-            "https://h.com/x/media/v1080/3.m4s"
-        ]);
+        assert_eq!(
+            video[0].segments.iter().map(|s| s.url.as_str()).collect::<Vec<_>>(),
+            ["https://h.com/x/media/v1080/1.m4s", "https://h.com/x/media/v1080/2.m4s", "https://h.com/x/media/v1080/3.m4s"]
+        );
         assert_eq!(video[0].label(), "1080p (1920×1080) · 5.0 Mbps · avc1");
         let audio = mpd.of_kind(TrackKind::Audio);
-        assert_eq!(audio[0].segments.iter().map(|s| s.url.rsplit('/').next().unwrap()).collect::<Vec<_>>(), ["0.m4s", "192000.m4s", "384000.m4s"]);
+        assert_eq!(
+            audio[0].segments.iter().map(|s| s.url.rsplit('/').next().unwrap()).collect::<Vec<_>>(),
+            ["0.m4s", "192000.m4s", "384000.m4s"]
+        );
         assert_eq!(audio[0].language, "en");
         assert_eq!(audio[0].ext(), "m4a");
         let subs = mpd.of_kind(TrackKind::Subtitles);

@@ -8,8 +8,7 @@ use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Margin, RichText, S
 use super::theme::{self, RADIUS};
 use super::widgets::{
     ChipKind, DraggedTab, avatar_sized, badge, chip, color_swatch, danger_button, drag_ghost, empty_state, icon_button,
-    icon_button_colored,
-    parse_list, pill, primary_button, status_dot, tab_state_color, text_input, workspace_chip, ws_color,
+    icon_button_colored, parse_list, pill, primary_button, status_dot, tab_state_color, text_input, workspace_chip, ws_color,
 };
 use super::{Actions, ViewCtx};
 use crate::dedupe::{Scope, duplicate_ids, find_duplicates};
@@ -245,7 +244,16 @@ impl TabsView {
 
     /// The tabs, by workspace or by another key.
     #[allow(clippy::too_many_arguments)]
-    fn list(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, rc: &RowCtx, matched: &[&TabEntry], filtering: bool, total: usize, acts: &mut Actions) {
+    fn list(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &ViewCtx,
+        rc: &RowCtx,
+        matched: &[&TabEntry],
+        filtering: bool,
+        total: usize,
+        acts: &mut Actions,
+    ) {
         let grouping = cx.state.settings.tab_list.grouping;
         if grouping == TabGrouping::Workspace {
             self.by_workspace(ui, cx, rc, matched, filtering, total, acts);
@@ -313,8 +321,7 @@ impl TabsView {
             }
             self.workspace_section(ui, cx, rc, Some(ws), &entries, acts);
         }
-        let rest: Vec<&TabEntry> =
-            matched.iter().copied().filter(|e| e.workspace.is_none_or(|w| !known.contains(&w))).collect();
+        let rest: Vec<&TabEntry> = matched.iter().copied().filter(|e| e.workspace.is_none_or(|w| !known.contains(&w))).collect();
         if !rest.is_empty() || !filtering {
             self.workspace_section(ui, cx, rc, None, &rest, acts);
         }
@@ -335,10 +342,7 @@ impl TabsView {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("◫ Group your tabs into workspaces").strong());
-                    ui.label(
-                        RichText::new("Give each a color and icon, and rules that add matching tabs automatically.")
-                            .color(p.muted),
-                    );
+                    ui.label(RichText::new("Give each a color and icon, and rules that add matching tabs automatically.").color(p.muted));
                     if ui.add(primary_button(ui, "＋ New workspace")).clicked() {
                         self.start_new_workspace(cx);
                     }
@@ -425,9 +429,8 @@ impl TabsView {
             let bar = egui::Rect::from_min_size(rect.min + egui::vec2(0.0, 7.0), egui::vec2(4.0, rect.height() - 14.0));
             ui.painter().rect_filled(bar, 2.0, color);
 
-            let mut row = ui.new_child(
-                UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 0.0))).layout(Layout::left_to_right(Align::Center)),
-            );
+            let mut row =
+                ui.new_child(UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
             let (fold_icon, fold_tip) = if collapsed { ("▸", "Show its tabs") } else { ("▾", "Hide its tabs") };
             if icon_button(&mut row, fold_icon, fold_tip).clicked() {
                 toggle = true;
@@ -469,8 +472,7 @@ impl TabsView {
                         ));
                     }
                 }
-                let loaded: Vec<EntryRef> =
-                    entries.iter().filter(|e| e.is_open() && !e.discarded).map(|e| rc.entry_ref(e)).collect();
+                let loaded: Vec<EntryRef> = entries.iter().filter(|e| e.is_open() && !e.discarded).map(|e| rc.entry_ref(e)).collect();
                 let switch_tip = ws.map_or("Leave the current workspace (no workspace)".to_string(), |w| format!("Switch to {}", w.name));
                 if hovered && !current && icon_button(ui, "⇄", &switch_tip).clicked() {
                     acts.send(Command::SetActiveWorkspace { id: ws.map(|w| w.id) });
@@ -498,13 +500,18 @@ impl TabsView {
                 let closed: Vec<EntryRef> = entries.iter().filter(|e| !e.is_open()).map(|e| rc.entry_ref(e)).collect();
                 if hovered
                     && !closed.is_empty()
-                    && icon_button(ui, "⤓", &format!("Open the {} closed tab(s) listed here, unloaded, in the background", closed.len())).clicked()
+                    && icon_button(ui, "⤓", &format!("Open the {} closed tab(s) listed here, unloaded, in the background", closed.len()))
+                        .clicked()
                 {
                     acts.send(Command::OpenEntries { entries: closed, discarded: true });
                 }
             });
         }
-        let tip = if ws.is_some() { "Click for the workspace settings · drop tabs here" } else { "Drop tabs here to take them out of their workspace" };
+        let tip = if ws.is_some() {
+            "Click for the workspace settings · drop tabs here"
+        } else {
+            "Drop tabs here to take them out of their workspace"
+        };
         let resp = resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip);
         if resp.clicked() {
             match ws {
@@ -685,14 +692,11 @@ impl TabsView {
         let empty = self.rule_value.trim().is_empty();
         let compiled = if empty { None } else { Some(rule.compile()) };
         ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_salt(("rule-kind", ws.id)).selected_text(self.rule_kind.label()).width(150.0).show_ui(
-                ui,
-                |ui| {
-                    for k in RuleKind::ALL {
-                        ui.selectable_value(&mut self.rule_kind, k, k.label());
-                    }
-                },
-            );
+            egui::ComboBox::from_id_salt(("rule-kind", ws.id)).selected_text(self.rule_kind.label()).width(150.0).show_ui(ui, |ui| {
+                for k in RuleKind::ALL {
+                    ui.selectable_value(&mut self.rule_kind, k, k.label());
+                }
+            });
             let r = ui.add(text_input(&mut self.rule_value, self.rule_kind.hint(), 240.0));
             // Suggest existing groups (including native tab groups) and tags.
             let suggestions: Vec<String> = match self.rule_kind {
@@ -766,9 +770,7 @@ impl TabsView {
             let name = self.new_ws.take().unwrap_or_default();
             if create {
                 let n = cx.state.workspaces.len();
-                acts.send(Command::SaveWorkspace {
-                    workspace: Workspace { name, color: WorkspaceColor::nth(n), ..Default::default() },
-                });
+                acts.send(Command::SaveWorkspace { workspace: Workspace { name, color: WorkspaceColor::nth(n), ..Default::default() } });
                 self.open_created = Some(n);
             }
         }
@@ -865,12 +867,8 @@ impl TabsView {
             return;
         }
         let p = theme::palette(ui);
-        let names: Vec<String> = self
-            .opts
-            .workspaces
-            .iter()
-            .map(|id| cx.state.workspace(*id).map_or("no workspace".to_string(), |w| w.label()))
-            .collect();
+        let names: Vec<String> =
+            self.opts.workspaces.iter().map(|id| cx.state.workspace(*id).map_or("no workspace".to_string(), |w| w.label())).collect();
         let resp = pill(ui, &format!("in {}  ✕", names.join(", ")), p.accent_hover, p.accent_soft(), Sense::click());
         if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Search all workspaces").clicked() {
             self.opts.workspaces.clear();
@@ -1023,11 +1021,8 @@ impl TabsView {
 
     fn group_filter(&mut self, ui: &mut egui::Ui, cx: &ViewCtx) {
         let groups = cx.state.all_groups();
-        let label = if self.opts.groups.is_empty() {
-            "In: all groups".to_string()
-        } else {
-            format!("In: {} group(s)", self.opts.groups.len())
-        };
+        let label =
+            if self.opts.groups.is_empty() { "In: all groups".to_string() } else { format!("In: {} group(s)", self.opts.groups.len()) };
         ui.menu_button(label, |ui| {
             ui.set_min_width(180.0);
             if ui.button("Any group").clicked() {
@@ -1085,7 +1080,11 @@ impl TabsView {
                         if ui.button("✕ Clear").on_hover_text("Clear the selection (Esc)").clicked() {
                             self.selection.clear();
                         }
-                    } else if ui.button("☑ Select them").on_hover_text("Select the matching tabs, to pick some out or act on them").clicked() {
+                    } else if ui
+                        .button("☑ Select them")
+                        .on_hover_text("Select the matching tabs, to pick some out or act on them")
+                        .clicked()
+                    {
                         self.selection.extend(refs.iter().copied());
                     }
                     ui.add(text_input(&mut self.bulk_tag, "tag", 90.0));
@@ -1121,7 +1120,10 @@ impl TabsView {
                     }
                     let closed: Vec<EntryRef> = matched.iter().zip(refs).filter(|(e, _)| !e.is_open()).map(|(_, r)| *r).collect();
                     if !closed.is_empty()
-                        && ui.button(format!("⤓ Open {}", closed.len())).on_hover_text("Open the closed ones, unloaded and in the background").clicked()
+                        && ui
+                            .button(format!("⤓ Open {}", closed.len()))
+                            .on_hover_text("Open the closed ones, unloaded and in the background")
+                            .clicked()
                     {
                         acts.send(Command::OpenEntries { entries: closed, discarded: true });
                     }
@@ -1184,7 +1186,8 @@ impl TabsView {
         // and only the small action buttons take clicks themselves.
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click_and_drag());
         let selected = self.selection.contains(&r);
-        let title = if selected && self.selection.len() > 1 { format!("{} tabs", self.selection.len()) } else { e.display_title().to_string() };
+        let title =
+            if selected && self.selection.len() > 1 { format!("{} tabs", self.selection.len()) } else { e.display_title().to_string() };
         resp.dnd_set_drag_payload(DraggedTab { entry: r, title });
         self.order.push(r);
         if !ui.is_rect_visible(rect) {
@@ -1211,9 +1214,8 @@ impl TabsView {
         };
         ui.painter().rect(rect, if look.compact { 8.0 } else { 10.0 }, fill, stroke, egui::StrokeKind::Inside);
 
-        let mut row = ui.new_child(
-            UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 0.0))).layout(Layout::left_to_right(Align::Center)),
-        );
+        let mut row =
+            ui.new_child(UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
         // The checkbox shows while selecting, or on the row under the pointer.
         if hovered || !self.selection.is_empty() {
             let mut checked = selected;
