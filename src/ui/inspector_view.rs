@@ -193,25 +193,31 @@ pub struct InspectorView {
     error: Option<String>,
     title: String,
     url: String,
-    root: Option<NodeSummary>,
-    children: HashMap<u64, Vec<NodeSummary>>,
+    root: Option<Rc<NodeSummary>>,
+    children: HashMap<u64, Rc<Vec<NodeSummary>>>,
     expanded: HashSet<u64>,
     selected: Option<u64>,
-    details: Option<Details>,
+    details: Option<Rc<Details>>,
     scroll_to_selected: bool,
     picking: bool,
     hovered: Option<u64>,
     query: String,
-    query_results: Option<Vec<NodeSummary>>,
+    query_results: Option<Rc<Vec<NodeSummary>>>,
     /// Select the first match of the running query (ad slots' "Show").
     select_first_match: bool,
     style_filter: String,
     confirm_delete: bool,
-    resources: Option<Vec<PageResource>>,
+    resources: Option<Rc<Vec<PageResource>>>,
     res_query: String,
-    ads: Option<Vec<AdSignal>>,
-    source: Option<Vec<String>>,
+    /// The resources matching `res_query`, by kind (see [`InspectorView::media`]).
+    res_groups: Option<(String, Rc<ResourceGroups>)>,
+    ads: Option<Rc<Vec<AdSignal>>>,
+    /// The ad networks found, for (the page, the state revision).
+    ad_hits: Option<((String, Option<u64>), Rc<Vec<ProviderHit>>)>,
+    source: Option<Rc<Vec<String>>>,
     source_query: String,
+    /// The source lines matching `source_query`.
+    source_shown: Option<(String, Rc<Vec<usize>>)>,
     network: super::network_view::NetworkPane,
     capture: super::capture_view::CapturePane,
     /// After a reload: replace the tree once the new page is read, and select this again.
@@ -225,6 +231,24 @@ pub struct InspectorView {
     pending_net: Vec<Vec<Value>>,
     saved: (u64, u8, Option<u64>),
     last_save: f64,
+}
+
+/// Page resources matching a search, by their place in [`KINDS`] (positions in the list).
+type ResourceGroups = BTreeMap<usize, Vec<usize>>;
+
+/// Previews longer than this (in bytes) are cut; copying gives all of it.
+const PREVIEW_MAX: usize = 50 * 1024;
+
+/// `text`, cut to [`PREVIEW_MAX`] with a note saying so.
+fn preview(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= PREVIEW_MAX {
+        return text.into();
+    }
+    let mut cut = PREVIEW_MAX;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n… ({} KB more: copy it to see all of it)", &text[..cut], (text.len() - cut) / 1024).into()
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(r: Result<Value, String>) -> Result<T, String> {
@@ -270,6 +294,9 @@ impl InspectorView {
             confirm_delete: false,
             resources: None,
             res_query: String::new(),
+            res_groups: None,
+            ad_hits: None,
+            source_shown: None,
             ads: None,
             source: None,
             source_query: String::new(),
@@ -593,7 +620,7 @@ impl InspectorView {
                     self.restore_selection();
                     self.expanded.insert(root.node.id);
                     self.load_children(root.node.id);
-                    self.root = Some(root.node);
+                    self.root = Some(Rc::new(root.node));
                 }
                 Reply::Ready(Err(e)) => {
                     // Still loading after a navigation: try again shortly.
@@ -612,7 +639,7 @@ impl InspectorView {
                             self.load_children(n.id);
                         }
                     }
-                    self.children.insert(id, list);
+                    self.children.insert(id, Rc::new(list));
                 }
                 Reply::Children(id, Err(_)) => {
                     // The node went away with a change of the page.
@@ -621,7 +648,7 @@ impl InspectorView {
                 }
                 Reply::Details(Ok(d)) | Reply::Refreshed(Ok(d)) => {
                     if self.selected == Some(d.node.id) {
-                        self.details = Some(d);
+                        self.details = Some(Rc::new(d));
                     }
                 }
                 Reply::Refreshed(Err(_)) => {
@@ -635,7 +662,7 @@ impl InspectorView {
                         let id = first.id;
                         self.ask(json!({ "op": "reveal", "id": id }), move |r| Reply::Reveal(id, parse(r)));
                     }
-                    self.query_results = Some(list);
+                    self.query_results = Some(Rc::new(list));
                 }
                 Reply::Reveal(id, Ok(path)) => self.reveal(id, &path),
                 Reply::Restored(saved) => self.restore(saved),
@@ -649,9 +676,18 @@ impl InspectorView {
                     }
                 }
                 Reply::Reselect(Err(_)) => {}
-                Reply::Source(Ok(s)) => self.source = Some(s.lines().map(String::from).collect()),
-                Reply::Resources(Ok(list)) => self.resources = Some(list),
-                Reply::Ads(Ok(list)) => self.ads = Some(list),
+                Reply::Source(Ok(s)) => {
+                    self.source = Some(Rc::new(s.lines().map(String::from).collect()));
+                    self.source_shown = None;
+                }
+                Reply::Resources(Ok(list)) => {
+                    self.resources = Some(Rc::new(list));
+                    self.res_groups = None;
+                }
+                Reply::Ads(Ok(list)) => {
+                    self.ads = Some(Rc::new(list));
+                    self.ad_hits = None;
+                }
                 Reply::Copy(label, Ok(text)) => {
                     if text.is_empty() {
                         acts.notice(format!("Nothing to copy ({label} is empty)"));
@@ -904,7 +940,7 @@ impl InspectorView {
                     }
                 });
                 egui::ScrollArea::vertical().id_salt("query-results").max_height(160.0).show(ui, |ui| {
-                    for n in &results {
+                    for n in results.iter() {
                         let r = self.node_label(ui, n, false);
                         if r.clicked() {
                             let id = n.id;
@@ -969,7 +1005,7 @@ impl InspectorView {
         if open {
             match self.children.get(&n.id).cloned() {
                 Some(kids) => {
-                    for k in &kids {
+                    for k in kids.iter() {
                         self.tree(ui, k, depth + 1, hovered, acts);
                     }
                 }
@@ -1118,8 +1154,9 @@ impl InspectorView {
     }
 
     /// Context menu of a text in the details panel: the selection, or the whole value.
-    fn value_menu(&self, r: &egui::Response, items: &[(&str, String)], acts: &mut Actions) {
+    fn value_menu(&self, r: &egui::Response, items: impl FnOnce() -> Vec<(&'static str, String)>, acts: &mut Actions) {
         r.context_menu(|ui| {
+            let items = items();
             if let Some(text) = self.inspector_selection(ui)
                 && ui.button("Copy selected text").clicked()
             {
@@ -1127,8 +1164,8 @@ impl InspectorView {
                 acts.notice("Copied the selected text");
             }
             for (label, value) in items {
-                if ui.button(*label).clicked() {
-                    ui.ctx().copy_text(value.clone());
+                if ui.button(label).clicked() {
+                    ui.ctx().copy_text(value);
                     acts.notice("Copied");
                 }
             }
@@ -1161,7 +1198,7 @@ impl InspectorView {
             if !d.selector.is_empty() {
                 ui.horizontal(|ui| {
                     let r = ui.add(egui::Label::new(RichText::new(&d.selector).monospace().small()).truncate().selectable(true));
-                    self.value_menu(&r, &[("Copy CSS selector", d.selector.clone())], acts);
+                    self.value_menu(&r, || vec![("Copy CSS selector", d.selector.clone())], acts);
                     if icon_button(ui, "⧉", "Copy the CSS selector").clicked() {
                         ui.ctx().copy_text(d.selector.clone());
                     }
@@ -1211,15 +1248,17 @@ impl InspectorView {
                     .show(ui, |ui| {
                         egui::Grid::new("attrs").num_columns(2).striped(true).show(ui, |ui| {
                             for (k, v) in &d.attributes {
-                                let items = [
-                                    ("Copy value", v.clone()),
-                                    ("Copy name", k.clone()),
-                                    ("Copy as name=\"value\"", format!("{k}=\"{v}\"")),
-                                ];
+                                let items = || {
+                                    vec![
+                                        ("Copy value", v.clone()),
+                                        ("Copy name", k.clone()),
+                                        ("Copy as name=\"value\"", format!("{k}=\"{v}\"")),
+                                    ]
+                                };
                                 let r = ui.add(egui::Label::new(RichText::new(k).monospace().color(p.warn)).sense(Sense::click()));
-                                self.value_menu(&r, &items, acts);
+                                self.value_menu(&r, items, acts);
                                 let r = ui.add(egui::Label::new(RichText::new(v).monospace()).wrap().selectable(true));
-                                self.value_menu(&r, &items, acts);
+                                self.value_menu(&r, items, acts);
                                 ui.end_row();
                             }
                         });
@@ -1232,14 +1271,19 @@ impl InspectorView {
                     egui::ScrollArea::vertical().id_salt("style").max_height(260.0).show(ui, |ui| {
                         egui::Grid::new("style").num_columns(2).show(ui, |ui| {
                             for (k, v) in d.style.iter().filter(|(k, v)| f.is_empty() || k.contains(&f) || v.to_lowercase().contains(&f)) {
-                                let items =
-                                    [("Copy value", v.clone()), ("Copy property", k.clone()), ("Copy declaration", format!("{k}: {v};"))];
+                                let items = || {
+                                    vec![
+                                        ("Copy value", v.clone()),
+                                        ("Copy property", k.clone()),
+                                        ("Copy declaration", format!("{k}: {v};")),
+                                    ]
+                                };
                                 let r = ui.add(
                                     egui::Label::new(RichText::new(k).monospace().small().color(p.accent_hover)).sense(Sense::click()),
                                 );
-                                self.value_menu(&r, &items, acts);
+                                self.value_menu(&r, items, acts);
                                 let r = ui.add(egui::Label::new(RichText::new(v).monospace().small()).selectable(true));
-                                self.value_menu(&r, &items, acts);
+                                self.value_menu(&r, items, acts);
                                 ui.end_row();
                             }
                         });
@@ -1248,15 +1292,15 @@ impl InspectorView {
             }
             if !d.text.trim().is_empty() {
                 egui::CollapsingHeader::new(RichText::new("Text").strong()).show(ui, |ui| {
-                    let r = ui.add(egui::Label::new(&d.text).wrap().selectable(true));
-                    self.value_menu(&r, &[("Copy all text", d.text.clone())], acts);
+                    let r = ui.add(egui::Label::new(preview(&d.text)).wrap().selectable(true));
+                    self.value_menu(&r, || vec![("Copy all text", d.text.clone())], acts);
                 });
             }
             egui::CollapsingHeader::new(RichText::new("HTML").strong()).default_open(true).show(ui, |ui| {
                 egui::Frame::new().fill(p.input).corner_radius(6).inner_margin(Margin::same(8)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    let r = ui.add(egui::Label::new(RichText::new(&d.outer_html).monospace().small()).wrap().selectable(true));
-                    self.value_menu(&r, &[("Copy all HTML", d.outer_html.clone())], acts);
+                    let r = ui.add(egui::Label::new(RichText::new(preview(&d.outer_html)).monospace().small()).wrap().selectable(true));
+                    self.value_menu(&r, || vec![("Copy all HTML", d.outer_html.clone())], acts);
                 });
             });
         });
@@ -1280,16 +1324,24 @@ impl InspectorView {
                 .color(p.muted),
         );
         ui.add_space(6.0);
-        let q = self.res_query.to_lowercase();
-        let mut groups: BTreeMap<usize, Vec<&PageResource>> = BTreeMap::new();
-        for r in &list {
-            let hay = format!("{} {} {} {}", r.kind, r.url, r.detail, r.frame).to_lowercase();
-            if !q.is_empty() && !q.split_whitespace().all(|t| hay.contains(t)) {
-                continue;
+        let groups = match &self.res_groups {
+            Some((q, groups)) if *q == self.res_query => groups.clone(),
+            _ => {
+                let q = self.res_query.to_lowercase();
+                let mut groups = ResourceGroups::new();
+                for (i, r) in list.iter().enumerate() {
+                    let hay = format!("{} {} {} {}", r.kind, r.url, r.detail, r.frame).to_lowercase();
+                    if !q.is_empty() && !q.split_whitespace().all(|t| hay.contains(t)) {
+                        continue;
+                    }
+                    let order = KINDS.iter().position(|(k, _)| *k == r.kind).unwrap_or(KINDS.len());
+                    groups.entry(order).or_default().push(i);
+                }
+                let groups = Rc::new(groups);
+                self.res_groups = Some((self.res_query.clone(), groups.clone()));
+                groups
             }
-            let order = KINDS.iter().position(|(k, _)| *k == r.kind).unwrap_or(KINDS.len());
-            groups.entry(order).or_default().push(r);
-        }
+        };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if groups.is_empty() {
                 let (title, hint) = if list.is_empty() {
@@ -1299,14 +1351,14 @@ impl InspectorView {
                 };
                 empty_state(ui, "🔍", title, hint);
             }
-            for (order, items) in &groups {
+            for (order, items) in groups.iter() {
                 let label = KINDS.get(*order).map_or("Other", |(_, l)| *l);
                 egui::CollapsingHeader::new(RichText::new(label).strong())
                     .id_salt(("kind", *order))
                     .default_open(true)
                     .show(ui, |ui| {
-                        for r in items {
-                            self.resource_row(ui, r, acts);
+                        for &i in items {
+                            self.resource_row(ui, &list[i], acts);
                         }
                     })
                     .header_response
@@ -1398,21 +1450,35 @@ impl InspectorView {
 
     fn ads(&mut self, ui: &mut egui::Ui, acts: &mut Actions, state: Option<&AppState>) {
         let p = theme::palette(ui);
-        let Some(mut signals) = self.ads.clone() else {
+        let Some(found) = self.ads.clone() else {
             ui.spinner();
             return;
         };
-        // Tabs this site opened (from the log of tabs opened by pages).
         let site = crate::url::registrable_domain(&crate::url::host(&self.url));
-        if let Some(s) = state {
-            for e in &s.popup_log {
-                if !site.is_empty() && crate::url::registrable_domain(&crate::url::host(&e.opener)) == site {
-                    let detail = if e.closed_by.is_some() { "closed by a rule" } else { "" };
-                    signals.push(AdSignal { kind: "popup".into(), url: e.url.clone(), detail: detail.into(), frame: e.opener.clone() });
+        let key = (self.url.clone(), state.map(|s| s.revision));
+        let hits = match &self.ad_hits {
+            Some((k, hits)) if *k == key => hits.clone(),
+            _ => {
+                // Tabs this site opened (from the log of tabs opened by pages).
+                let mut signals = (*found).clone();
+                if let Some(s) = state {
+                    for e in &s.popup_log {
+                        if !site.is_empty() && crate::url::registrable_domain(&crate::url::host(&e.opener)) == site {
+                            let detail = if e.closed_by.is_some() { "closed by a rule" } else { "" };
+                            signals.push(AdSignal {
+                                kind: "popup".into(),
+                                url: e.url.clone(),
+                                detail: detail.into(),
+                                frame: e.opener.clone(),
+                            });
+                        }
+                    }
                 }
+                let hits = Rc::new(ads::providers(&self.url, &signals));
+                self.ad_hits = Some((key, hits.clone()));
+                hits
             }
-        }
-        let hits = ads::providers(&self.url, &signals);
+        };
         ui.label(
             RichText::new(
                 "Ad networks this page uses, from the scripts, frames and requests of all its frames, the ad code written \
@@ -1435,7 +1501,7 @@ impl InspectorView {
                 );
             }
             let mut category = None;
-            for h in &hits {
+            for h in hits.iter() {
                 let cat = if h.signals.iter().any(|s| s.kind == "popup") { AdCategory::Popunder } else { h.category };
                 if category != Some(cat) {
                     category = Some(cat);
@@ -1578,10 +1644,18 @@ impl InspectorView {
             return;
         };
         let q = self.source_query.to_lowercase();
-        let shown: Vec<usize> = if q.is_empty() {
-            (0..lines.len()).collect()
-        } else {
-            lines.iter().enumerate().filter(|(_, l)| l.to_lowercase().contains(&q)).map(|(i, _)| i).collect()
+        let shown = match &self.source_shown {
+            Some((k, shown)) if *k == self.source_query => shown.clone(),
+            _ => {
+                let shown: Vec<usize> = if q.is_empty() {
+                    (0..lines.len()).collect()
+                } else {
+                    lines.iter().enumerate().filter(|(_, l)| l.to_lowercase().contains(&q)).map(|(i, _)| i).collect()
+                };
+                let shown = Rc::new(shown);
+                self.source_shown = Some((self.source_query.clone(), shown.clone()));
+                shown
+            }
         };
         ui.horizontal(|ui| {
             ui.add(text_input(&mut self.source_query, "Find in the page source…", ui.available_width() - 260.0));
@@ -1601,7 +1675,7 @@ impl InspectorView {
                     ui.horizontal(|ui| {
                         ui.add_sized([48.0, row_height], egui::Label::new(RichText::new(format!("{}", i + 1)).monospace().color(p.muted)));
                         let r = ui.add(egui::Label::new(RichText::new(&lines[i]).monospace()).extend().selectable(true));
-                        self.value_menu(&r, &[("Copy line", lines[i].clone())], acts);
+                        self.value_menu(&r, || vec![("Copy line", lines[i].clone())], acts);
                     });
                 }
             });
