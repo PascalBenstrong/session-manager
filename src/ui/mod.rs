@@ -218,7 +218,7 @@ pub struct App {
     ctx: egui::Context,
     inbox: Rc<RefCell<Inbox>>,
     pending: u32,
-    state: Option<AppState>,
+    state: Option<Rc<AppState>>,
     snapshots: BTreeMap<Id, Vec<Snapshot>>,
     caps: Capabilities,
     status: Option<Status>,
@@ -454,7 +454,7 @@ impl App {
     /// storage changes can arrive out of order).
     fn accept_state(&mut self, s: AppState) {
         if self.state.as_ref().is_none_or(|cur| s.revision >= cur.revision) {
-            self.state = Some(s);
+            self.state = Some(Rc::new(s));
         }
     }
 
@@ -916,7 +916,7 @@ impl App {
         self.drain_inbox();
         if let Some(mut inspector) = self.inspector.take() {
             let mut acts = Actions::default();
-            inspector.ui(ui, &mut acts, self.state.as_ref());
+            inspector.ui(ui, &mut acts, self.state.as_deref());
             self.inspector = Some(inspector);
             self.apply(acts);
             let dark = ui.visuals().dark_mode;
@@ -951,7 +951,7 @@ impl App {
             return;
         };
         let viewed = self.viewed_session.unwrap_or(state.active_session);
-        let session = state.session(viewed).cloned().unwrap_or_else(|| state.active().clone());
+        let session = state.session(viewed).unwrap_or_else(|| state.active());
         let wide = !self.popup && ui.available_width() >= WIDE_LAYOUT;
 
         if self.popup || self.sidebar {
