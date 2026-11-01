@@ -2,6 +2,7 @@
 //! actions, workspace settings and hibernation.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Margin, RichText, Sense, Stroke, UiBuilder};
 
@@ -154,6 +155,8 @@ pub struct TabsView {
     /// The open workspace's tabs: (closed ones in the viewed session, loaded, all), for
     /// (workspace, viewed session, state generation).
     ws_counts: Option<((Id, Id, u64), (Vec<EntryRef>, usize, usize))>,
+    /// The session of each entry listed, for (state generation, all sessions, viewed session).
+    owners: Option<((u64, bool, Id), Rc<HashMap<Id, Id>>)>,
 }
 
 impl TabsView {
@@ -175,13 +178,21 @@ impl TabsView {
         let (hits, query_error) = self.search.run(ui.ctx(), state, &self.query, &self.opts, Some(scope));
 
         // Entry ids are globally unique, so map them back to their session.
-        let mut owner: HashMap<Id, Id> = HashMap::new();
+        let key = (super::state_generation(), self.all_sessions, cx.viewed);
+        let owner = match &self.owners {
+            Some((k, owner)) if *k == key => owner.clone(),
+            _ => {
+                let sessions = state.sessions.iter().filter(|s| self.all_sessions || s.id == cx.viewed);
+                let owner: Rc<HashMap<Id, Id>> = Rc::new(sessions.flat_map(|s| s.entries.iter().map(|e| (e.id, s.id))).collect());
+                self.owners = Some((key, owner.clone()));
+                owner
+            }
+        };
         let mut matched: Vec<&TabEntry> = Vec::new();
         let mut total = 0;
         for s in state.sessions.iter().filter(|s| self.all_sessions || s.id == cx.viewed) {
             for e in &s.entries {
                 total += 1;
-                owner.insert(e.id, s.id);
                 if hits.contains(e.id) {
                     matched.push(e);
                 }
@@ -193,8 +204,10 @@ impl TabsView {
 
         // Only tabs that are listed stay selected.
         self.prev_order = std::mem::take(&mut self.order);
-        let listed: HashSet<EntryRef> = refs.iter().copied().collect();
-        self.selection.retain(|r| listed.contains(r));
+        if !self.selection.is_empty() {
+            let listed: HashSet<EntryRef> = refs.iter().copied().collect();
+            self.selection.retain(|r| listed.contains(r));
+        }
         if !ui.ctx().egui_wants_keyboard_input() {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.selection.clear();
@@ -1201,9 +1214,11 @@ impl TabsView {
         // and only the small action buttons take clicks themselves.
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click_and_drag());
         let selected = self.selection.contains(&r);
-        let title =
-            if selected && self.selection.len() > 1 { format!("{} tabs", self.selection.len()) } else { e.display_title().to_string() };
-        resp.dnd_set_drag_payload(DraggedTab { entry: r, title });
+        if resp.drag_started() {
+            let title =
+                if selected && self.selection.len() > 1 { format!("{} tabs", self.selection.len()) } else { e.display_title().to_string() };
+            resp.dnd_set_drag_payload(DraggedTab { entry: r, title });
+        }
         self.order.push(r);
         if !ui.is_rect_visible(rect) {
             if editing {

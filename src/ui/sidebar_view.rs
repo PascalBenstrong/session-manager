@@ -265,7 +265,9 @@ fn pill_actions(ui: &egui::Ui, resp: &egui::Response, ws: Option<Id>, acts: &mut
 fn row(ui: &mut egui::Ui, cx: &ViewCtx, r: EntryRef, e: &TabEntry, active: bool, playing: bool, acts: &mut Actions) {
     let p = theme::palette(ui);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), Sense::click_and_drag());
-    resp.dnd_set_drag_payload(DraggedTab { entry: r, title: e.display_title().to_string() });
+    if resp.drag_started() {
+        resp.dnd_set_drag_payload(DraggedTab { entry: r, title: e.display_title().to_string() });
+    }
     if !ui.is_rect_visible(rect) {
         return;
     }
