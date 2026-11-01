@@ -361,6 +361,8 @@
     if (!config.streamControls) hide();
     if (config.replay) for (const v of playingVideos) capture(v);
   }
+  // Live is known from the start (an infinite duration) or found out while it plays.
+  document.addEventListener('timeupdate', (e) => config.replay && isVideo(e.target) && !e.target.paused && !rings.has(e.target) && capture(e.target), true);
   // A video that's done (emptied) lets its frames go.
   document.addEventListener(
     'emptied',
@@ -384,6 +386,8 @@
 
   function capture(v) {
     if (!v.requestVideoFrameCallback || typeof createImageBitmap !== 'function') return;
+    // Only live streams are replayed (and not previews).
+    if (!isLive(v) || isPreview(v)) return;
     const existing = rings.get(v);
     if (existing && existing.gen === generation) return;
     if (existing) freeRing(existing);
@@ -393,7 +397,13 @@
       if (ring.gen !== generation || !config.replay || rings.get(v) !== ring) return freeRing(ring);
       try {
         const due = !ring.busy && now - ring.last >= REPLAY_GAP_MS && !document.hidden;
-        if (due && v.videoWidth && v.videoHeight && isLive(v) && !isPreview(v) && (playingVideos.size < 2 || mainVideo([...playingVideos]) === v)) {
+        if (due && v.videoWidth && v.videoHeight && (!isLive(v) || isPreview(v))) {
+          // No longer one to replay: stop (it starts again if that changes).
+          freeRing(ring);
+          rings.delete(v);
+          return;
+        }
+        if (due && v.videoWidth && v.videoHeight && (playingVideos.size < 2 || mainVideo([...playingVideos]) === v)) {
           ring.last = now;
           ring.busy = true;
           const h = Math.min(config.replayHeight, v.videoHeight);
