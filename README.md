@@ -189,7 +189,8 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
 - Download one session or all sessions as `.json` (optionally with snapshots), a single snapshot, or the URL list as `.txt` (comma separated). *Copy URLs* puts that list on the clipboard.
 - Import from a file (*Open file…* or drag-and-drop onto the page), from the clipboard, or by pasting into the text box.
   - **Session files** become new sessions; nothing is overwritten.
-  - **URL lists:** URLs can be separated by commas, newlines, spaces or semicolons. Bare hosts like `example.com/x` get `https://`, duplicates and non-URLs are skipped, and commas inside URLs (`?ids=1,2`) are kept. Choose to add them to the current session or a new one, and whether to open them unloaded right away.
+  - **URL lists:** URLs can be separated by commas, newlines, spaces or semicolons, and may be enclosed in single or double quotes, so a quoted URL keeps its commas and separators (`"https://example.com/?ids=1,2"`). Bare hosts like `example.com/x` get `https://`, duplicates and non-URLs are skipped. Choose to add them to the current session or a new one, and whether to open them unloaded right away.
+  - **CSV / TSV:** a file with a header row is read as a table; pick the column that holds the URLs (each column shows how many URLs it has, and the best one is chosen first). Quoted fields, commas inside them and semicolon- or tab-separated files work.
 
 **Cookies and site data**
 - Clean cookies, cache, localStorage, IndexedDB and service workers for:

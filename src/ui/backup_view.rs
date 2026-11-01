@@ -16,7 +16,7 @@ use crate::protocol::Command;
 use crate::state::{ImportTarget, RestoreMode};
 use crate::transfer::{self, Imported};
 
-const IMPORT_ACCEPT: &str = ".json,.txt,.csv,.url,text/plain,application/json";
+const IMPORT_ACCEPT: &str = ".json,.txt,.csv,.tsv,.url,text/plain,text/csv,text/tab-separated-values,application/json";
 
 /// Text loaded asynchronously (file picker / clipboard), picked up on the next frame.
 type Incoming = Rc<RefCell<Option<Result<(String, String), String>>>>;
@@ -37,6 +37,11 @@ pub struct BackupView {
     target: Target,
     new_session_name: String,
     open_imported: bool,
+    /// The CSV column the URLs come from.
+    csv_column: usize,
+    /// The URLs of that column, kept until the text or the column changes (a large CSV
+    /// would otherwise be read again on every frame).
+    csv_cache: Option<(String, usize, transfer::UrlList)>,
     parsed_for: String,
     parsed: Option<Result<Imported, String>>,
     incoming: Incoming,
@@ -54,6 +59,8 @@ impl Default for BackupView {
             target: Target::Viewed,
             new_session_name: String::new(),
             open_imported: false,
+            csv_column: 0,
+            csv_cache: None,
             parsed_for: String::new(),
             parsed: None,
             incoming: Rc::new(RefCell::new(None)),
@@ -246,7 +253,8 @@ impl BackupView {
         section_card(
             ui,
             "Import",
-            "Load a saved session file, or a comma separated list of URLs from a text file or the clipboard. You can also drop a file onto this page.",
+            "Load a saved session file, a list of URLs (quoted ones too) from a text file or the clipboard, or a CSV / TSV \
+             and pick the column that holds the URLs. You can also drop a file onto this page.",
             |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("📂  Open file…").clicked() {
@@ -288,7 +296,7 @@ impl BackupView {
                 }
                 ui.add(
                     egui::TextEdit::multiline(&mut self.import_text)
-                        .hint_text("https://example.com, https://docs.rs/egui,\nnews.ycombinator.com …\n\nor the contents of a saved session file")
+                        .hint_text("https://example.com, https://docs.rs/egui,\nnews.ycombinator.com, or 'https://example.com/?ids=1,2' …\n\nor a saved session file, or a CSV with a header row")
                         .desired_rows(6)
                         .desired_width(ui.available_width())
                         .margin(egui::vec2(8.0, 6.0))
@@ -298,7 +306,12 @@ impl BackupView {
                 if self.parsed_for != self.import_text {
                     self.parsed_for = self.import_text.clone();
                     self.parsed = (!self.import_text.trim().is_empty()).then(|| transfer::parse_import(&self.import_text));
+                    self.csv_cache = None;
+                    if let Some(Ok(Imported::Table(table))) = &self.parsed {
+                        self.csv_column = table.best_column();
+                    }
                 }
+                let mut imported = false;
                 match &self.parsed {
                     None => {}
                     Some(Err(e)) => {
@@ -311,40 +324,114 @@ impl BackupView {
                         ui.label(RichText::new("They are added as new sessions; nothing is overwritten.").small().color(p.muted));
                         if ui.add(primary_button(ui, format!("Import {} session(s)", sessions.len()))).clicked() {
                             acts.send(Command::ImportSessions { sessions: sessions.clone() });
-                            self.import_text.clear();
-                            self.import_source.clear();
+                            imported = true;
                         }
                     }
                     Some(Ok(Imported::Urls(list))) => {
-                        let existing = session.urls();
-                        let new = list.urls.iter().filter(|u| !existing.contains(u.as_str())).count();
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(format!("{} URL(s) found", list.urls.len()));
-                            if !list.invalid.is_empty() {
-                                ui.label(RichText::new(format!("· {} skipped (not URLs)", list.invalid.len())).color(p.warn))
-                                    .on_hover_text(list.invalid.iter().take(20).cloned().collect::<Vec<_>>().join("\n"));
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.radio_value(&mut self.target, Target::Viewed, format!("Add to \"{}\" ({new} new)", session.name));
-                            ui.radio_value(&mut self.target, Target::New, "New session:");
-                            ui.add_enabled(self.target == Target::New, text_input(&mut self.new_session_name, "name", 160.0));
-                        });
-                        ui.checkbox(&mut self.open_imported, "Open them now (unloaded)");
-                        let count = if self.target == Target::New { list.urls.len() } else { new };
-                        if ui.add_enabled(count > 0, primary_button(ui, format!("Import {count} URL(s)"))).clicked() {
-                            let target = match self.target {
-                                Target::Viewed => ImportTarget::Session(session.id),
-                                Target::New => ImportTarget::NewSession(std::mem::take(&mut self.new_session_name)),
-                            };
-                            acts.send(Command::ImportUrls { urls: list.urls.clone(), target, open: self.open_imported });
-                            self.import_text.clear();
-                            self.import_source.clear();
-                        }
+                        imported = urls_ui(
+                            ui,
+                            session,
+                            acts,
+                            &mut self.target,
+                            &mut self.new_session_name,
+                            &mut self.open_imported,
+                            list,
+                        );
                     }
+                    Some(Ok(Imported::Table(table))) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("CSV file: {} row(s), {} column(s).", table.rows.len(), table.headers.len()));
+                            ui.label(
+                                RichText::new("The first row is the header; pick the column that holds the URLs.")
+                                    .small()
+                                    .color(p.muted),
+                            );
+                        });
+                        let stale = self
+                            .csv_cache
+                            .as_ref()
+                            .is_none_or(|(text, column, _)| text != &self.import_text || *column != self.csv_column);
+                        if stale {
+                            self.csv_cache = Some((self.import_text.clone(), self.csv_column, table.urls(self.csv_column)));
+                        }
+                        let list = &self.csv_cache.as_ref().expect("the URLs were just read").2;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("URL column:");
+                            egui::ComboBox::from_id_salt("import-csv-column")
+                                .selected_text(column_label(table, self.csv_column, list.urls.len()))
+                                .show_ui(ui, |ui| {
+                                    for column in 0..table.headers.len() {
+                                        let count = table.urls(column).urls.len();
+                                        ui.selectable_value(&mut self.csv_column, column, column_label(table, column, count));
+                                    }
+                                });
+                        });
+                        imported = urls_ui(
+                            ui,
+                            session,
+                            acts,
+                            &mut self.target,
+                            &mut self.new_session_name,
+                            &mut self.open_imported,
+                            list,
+                        );
+                    }
+                }
+                if imported {
+                    self.import_text.clear();
+                    self.import_source.clear();
                 }
             },
         );
+    }
+}
+
+/// The URLs found in the import text: a preview of what will be added, and the import
+/// button. Returns true when the URLs were sent to be imported.
+fn urls_ui(
+    ui: &mut egui::Ui,
+    session: &Session,
+    acts: &mut Actions,
+    target: &mut Target,
+    new_session_name: &mut String,
+    open_imported: &mut bool,
+    list: &transfer::UrlList,
+) -> bool {
+    let p = theme::palette(ui);
+    let existing = session.urls();
+    let new = list.urls.iter().filter(|u| !existing.contains(u.as_str())).count();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("{} URL(s) found", list.urls.len()));
+        if !list.invalid.is_empty() {
+            ui.label(RichText::new(format!("· {} skipped (not URLs)", list.invalid.len())).color(p.warn))
+                .on_hover_text(list.invalid.iter().take(20).cloned().collect::<Vec<_>>().join("\n"));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.radio_value(target, Target::Viewed, format!("Add to \"{}\" ({new} new)", session.name));
+        ui.radio_value(target, Target::New, "New session:");
+        ui.add_enabled(*target == Target::New, text_input(new_session_name, "name", 160.0));
+    });
+    ui.checkbox(open_imported, "Open them now (unloaded)");
+    let count = if *target == Target::New { list.urls.len() } else { new };
+    if ui.add_enabled(count > 0, primary_button(ui, format!("Import {count} URL(s)"))).clicked() {
+        let target = match target {
+            Target::Viewed => ImportTarget::Session(session.id),
+            Target::New => ImportTarget::NewSession(std::mem::take(new_session_name)),
+        };
+        acts.send(Command::ImportUrls { urls: list.urls.clone(), target, open: *open_imported });
+        return true;
+    }
+    false
+}
+
+/// "url (12 URLs)", or "Column 2" when the header has no name.
+fn column_label(table: &transfer::Table, column: usize, count: usize) -> String {
+    let name = table.column_name(column);
+    match count {
+        0 => name,
+        1 => format!("{name} (1 URL)"),
+        n => format!("{name} ({n} URLs)"),
     }
 }
 

@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.9.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.10.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -109,7 +109,7 @@ Version: 0.9.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Saving and importing
 - Allow saving sessions to disk: one session or all sessions as a file (optionally including snapshots), a single snapshot, or the URL list as text.
-- Allow loading a comma separated list of URLs from a text file or the clipboard (also pasted text or a file dropped onto the page). Newlines, spaces and semicolons also separate URLs. Hosts without a scheme get `https://`, duplicates and non-URLs are skipped, and commas inside URLs are kept.
+- Allow loading a comma separated list of URLs from a text file or the clipboard (also pasted text or a file dropped onto the page). Newlines, spaces and semicolons also separate URLs, and a URL may be enclosed in single or double quotes, which keeps its commas. A CSV / TSV file with a header row is read as a table, and the column that holds the URLs is chosen. Hosts without a scheme get `https://`, duplicates and non-URLs are skipped, and commas inside URLs are kept.
 - Imported URLs go into the current session or a new one, optionally opened unloaded.
 - Importing a saved session file adds its sessions as new sessions and never overwrites existing ones.
 

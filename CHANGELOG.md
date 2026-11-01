@@ -2,6 +2,12 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.10.0] - 2026-11-01
+
+### New
+- Import URLs that are enclosed in single or double quotes: a quoted URL keeps its commas, so `'https://example.com/watch?v=1,2'` is one URL, and a list quoted as a whole (`"https://a.com, https://b.com"`) is still split inside.
+- Import a CSV or TSV file with a header row: pick the column that holds the URLs. Each column shows how many URLs it has, the best one is chosen first, and quoted fields, commas inside them and semicolon- or tab-separated files are read properly.
+
 ## [0.9.0] - 2026-11-01
 
 ### New
