@@ -3,7 +3,7 @@
 //! capture window (see `capture_window.rs`), which does the work and keeps going when the
 //! page reloads; the pane lists the capture windows that are open, and can stop them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -33,6 +33,8 @@ pub struct CapturePane {
     urls: Vec<PageMediaUrl>,
     captures: Vec<CaptureSummary>,
     last_poll: f64,
+    /// When this pane last opened a capture window (polled often for a while after).
+    opened_at: Cell<f64>,
     settings: CaptureSettings,
     url_input: String,
     show_segments: bool,
@@ -49,6 +51,7 @@ impl CapturePane {
             urls: Vec::new(),
             captures: Vec::new(),
             last_poll: 0.0,
+            opened_at: Cell::new(0.0),
             settings: CaptureSettings::default(),
             url_input: String::new(),
             show_segments: false,
@@ -131,6 +134,7 @@ impl CapturePane {
     }
 
     fn open(&self, params: BTreeMap<&'static str, String>) {
+        self.opened_at.set(pf::now());
         self.run(async move { pf::open_capture(&params).await }, Reply::Done);
     }
 
@@ -163,11 +167,14 @@ impl CapturePane {
     pub fn ui(&mut self, ui: &mut egui::Ui, acts: &mut Actions, page_title: &str) {
         self.drain();
         let p = theme::palette(ui);
-        // Capture windows publish their state as they go.
-        if pf::now() - self.last_poll > 1500.0 {
+        // Capture windows publish their state as they go: read often while there are some
+        // (or one is opening), now and then otherwise (one opened from elsewhere).
+        let busy = !self.captures.is_empty() || pf::now() - self.opened_at.get() < 10_000.0;
+        let every = if busy { 1500.0 } else { 5000.0 };
+        if pf::now() - self.last_poll > every {
             self.poll_captures();
         }
-        self.ctx.request_repaint_after(std::time::Duration::from_millis(1500));
+        self.ctx.request_repaint_after(std::time::Duration::from_millis(every as u64));
         let Some(media) = self.media.clone() else {
             ui.spinner();
             return;
