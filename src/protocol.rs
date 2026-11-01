@@ -213,6 +213,7 @@ pub struct Response {
     pub error: Option<String>,
     /// Human readable result ("3 tabs tagged").
     pub info: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<AppState>,
     pub report: Option<CleanupReport>,
     pub capabilities: Option<Capabilities>,

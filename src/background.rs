@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 
 use js_sys::Promise;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
 
@@ -93,8 +93,17 @@ fn with_state<R>(f: impl FnOnce(&mut AppState) -> R) -> R {
 
 /// A copy of the state for pages, without the sessions' snapshots (pages read those from
 /// SNAPSHOTS_KEY).
-fn snapshot() -> AppState {
-    STATE.with(|s| without_snapshots(&mut s.borrow_mut(), |s| s.clone()))
+/// A command's reply with the state (without snapshots), written from the state itself
+/// rather than from a copy.
+#[derive(Serialize)]
+struct Reply<'a> {
+    #[serde(flatten)]
+    response: &'a Response,
+    state: &'a AppState,
+}
+
+fn reply_json(resp: &Response) -> serde_json::Result<String> {
+    STATE.with(|s| without_snapshots(&mut s.borrow_mut(), |s| serde_json::to_string(&Reply { response: resp, state: s })))
 }
 
 /// Runs `f` on the state with its snapshots taken out (and puts them back).
@@ -498,11 +507,11 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             }
         }
         Event::Message { payload } => {
-            let resp = match serde_json::from_str::<Command>(&payload) {
-                Ok(cmd) => execute(cmd).await,
-                Err(e) => Response::err(format!("bad command: {e}")),
-            };
-            let json = serde_json::to_string(&resp).map_err(|e| e.to_string())?;
+            let json = match serde_json::from_str::<Command>(&payload) {
+                Ok(cmd) => reply_json(&execute(cmd).await),
+                Err(e) => serde_json::to_string(&Response::err(format!("bad command: {e}"))),
+            }
+            .map_err(|e| e.to_string())?;
             return Ok(JsValue::from_str(&json));
         }
     }
@@ -642,7 +651,6 @@ async fn execute(cmd: Command) -> Response {
         Ok(r) => r,
         Err(e) => Response::err(e),
     };
-    resp.state = Some(snapshot());
     resp.capabilities = Some(CAPS.with(|c| c.borrow().clone()));
     resp
 }
