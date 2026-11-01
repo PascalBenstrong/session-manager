@@ -102,9 +102,10 @@ enum Source {
 enum Stream {
     Probing,
     Failed(String),
-    Hls(Master),
+    // Shared: the window draws from them every frame.
+    Hls(Rc<Master>),
     HlsMedia(MediaPlaylist),
-    Dash(Mpd),
+    Dash(Rc<Mpd>),
     File { mime: String, length: u64 },
 }
 
@@ -230,9 +231,9 @@ async fn inspect_url(url: String, via: Option<(TabId, i64)>) -> Result<Stream, S
         pf::capture_call("fetchText", &json!({ "url": url, "via": via_json(via) })).await?.as_str().unwrap_or("").to_string()
     };
     match kind {
-        SourceKind::Dash => stream::parse_mpd(&text, &url).map(Stream::Dash),
+        SourceKind::Dash => stream::parse_mpd(&text, &url).map(|m| Stream::Dash(Rc::new(m))),
         _ => match stream::parse_hls(&text, &url)? {
-            Playlist::Master(m) => Ok(Stream::Hls(m)),
+            Playlist::Master(m) => Ok(Stream::Hls(Rc::new(m))),
             Playlist::Media(m) => Ok(Stream::HlsMedia(m)),
         },
     }
