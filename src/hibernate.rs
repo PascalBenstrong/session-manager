@@ -33,6 +33,7 @@ impl AppState {
 
     /// Marks tabs as hibernated right away (the browser's update events follow).
     pub fn mark_discarded(&mut self, ids: &[TabId]) -> bool {
+        let ids: HashSet<TabId> = ids.iter().copied().collect();
         let mut changed = false;
         for e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()) {
             if e.tab_id.is_some_and(|t| ids.contains(&t)) && !e.discarded {

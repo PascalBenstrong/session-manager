@@ -291,10 +291,11 @@ impl AppState {
     /// Returns how many entries changed workspace.
     pub fn auto_place(&mut self, refs: Option<&[EntryRef]>, reset_manual: bool) -> usize {
         let placer = Placer::new(&self.workspaces);
+        let refs: Option<std::collections::HashSet<EntryRef>> = refs.map(|r| r.iter().copied().collect());
         let mut n = 0;
         for s in &mut self.sessions {
             let sid = s.id;
-            for e in s.entries.iter_mut().filter(|e| refs.is_none_or(|r| r.contains(&EntryRef { session: sid, entry: e.id }))) {
+            for e in s.entries.iter_mut().filter(|e| refs.as_ref().is_none_or(|r| r.contains(&EntryRef { session: sid, entry: e.id }))) {
                 if reset_manual && e.workspace_manual {
                     e.workspace_manual = false;
                     if placer.workspace_for(e).is_none() {

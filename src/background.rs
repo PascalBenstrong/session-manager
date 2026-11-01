@@ -119,7 +119,18 @@ fn without_snapshots<T>(s: &mut AppState, f: impl FnOnce(&AppState) -> T) -> T {
 /// What identifies the snapshots as saved (they don't change once taken, only get added,
 /// renamed or removed).
 fn snapshots_fingerprint(s: &AppState) -> Vec<(Id, Id, String, usize)> {
-    s.sessions.iter().flat_map(|x| x.snapshots.iter().map(move |n| (x.id, n.id, n.name.clone(), n.entries.len()))).collect()
+    fingerprint_parts(s).map(|(a, b, name, n)| (a, b, name.to_string(), n)).collect()
+}
+
+fn fingerprint_parts(s: &AppState) -> impl Iterator<Item = (Id, Id, &str, usize)> {
+    s.sessions.iter().flat_map(|x| x.snapshots.iter().map(move |n| (x.id, n.id, n.name.as_str(), n.entries.len())))
+}
+
+/// Whether the snapshots are as last saved (compared without copying their names).
+fn snapshots_saved(s: &AppState) -> bool {
+    SNAPSHOTS_SAVED.with(|f| {
+        f.borrow().as_ref().is_some_and(|saved| saved.iter().map(|(a, b, name, n)| (*a, *b, name.as_str(), *n)).eq(fingerprint_parts(s)))
+    })
 }
 
 fn log(msg: &str) {
@@ -253,10 +264,9 @@ async fn persist() {
         });
         s.revision = next;
         // Snapshots are saved apart, and only when they changed.
-        let fingerprint = snapshots_fingerprint(&s);
-        let snapshots = (SNAPSHOTS_SAVED.with(|f| f.borrow().as_ref() != Some(&fingerprint))).then(|| {
+        let snapshots = (!snapshots_saved(&s)).then(|| {
             let all: std::collections::BTreeMap<Id, &Vec<Snapshot>> = s.sessions.iter().map(|x| (x.id, &x.snapshots)).collect();
-            (serde_json::to_string(&all), fingerprint)
+            (serde_json::to_string(&all), snapshots_fingerprint(&s))
         });
         (without_snapshots(&mut s, |s| serde_json::to_string(s)), snapshots)
     });
