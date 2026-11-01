@@ -155,7 +155,14 @@ function liveFeed(mime) {
   setPreview(URL.createObjectURL(ms));
   let sb = null;
   let ended = false;
+  // No source buffer to play the chunks (or the preview moved on): they're not kept.
+  let dead = false;
   const queue = [];
+  // Closed once open: the preview plays something else now.
+  ms.addEventListener('sourceclose', () => {
+    dead = true;
+    queue.length = 0;
+  });
   const pump = () => {
     if (!sb || sb.updating || ms.readyState !== 'open') return;
     if (queue.length) {
@@ -184,6 +191,8 @@ function liveFeed(mime) {
         sb = ms.addSourceBuffer(type);
         sb.mode = 'sequence';
       } catch {
+        dead = true;
+        queue.length = 0;
         return;
       }
       sb.addEventListener('updateend', () => {
@@ -207,6 +216,7 @@ function liveFeed(mime) {
   const feed = {
     started: false,
     push(u8) {
+      if (dead) return;
       queue.push(u8);
       pump();
     },
