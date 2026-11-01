@@ -856,6 +856,23 @@ await step('debugger statements are blanked out of script bytes', async () => {
   const kept = 'x={debugger(){}};class A{#debugger;get debugger(){}};t==="debugger"||t==`debugger`';
   assert.equal(run(kept), kept);
   assert.equal(run('debugger\n(x)'), ';       \n(x)', 'a statement before a parenthesis on the next line');
+  // In chunks (as a script file loads): the same bytes, also when a statement or what
+  // decides about it is split between two chunks.
+  const { debuggerStripper } = await import(pathToFileURL(join(dist, 'platform-common.js')).href);
+  const texts = ['x();debugger;y()', 'a.  debugger', 'a. \n debugger\n(x)', 'debugger   (x)', 'debugger  \n  (x)', 'o={debugger  :1}', ' debugger', 'debugger',
+    '"debugger"', 'debuggerdebugger debugger', 'ünï debugger;', 'f(debugger)', '  debugger ', 'x.debugger;debugger', 'ddebugger debugger d'];
+  for (let n = 0; n < 300; n++) texts.push(Array.from({ length: 40 }, () => ['debugger', ' ', '\n', '.', '(', ':', 'a', ';', '"', 'é'][Math.floor(Math.random() * 10)]).join(''));
+  for (const text of texts) {
+    const bytes = new TextEncoder().encode(text);
+    const want = Buffer.from(stripDebuggerBytes(bytes)).toString('hex');
+    for (let size = 1; size <= bytes.length; size++) {
+      const s = debuggerStripper();
+      const parts = [];
+      for (let at = 0; at < bytes.length; at += size) parts.push(s.push(bytes.subarray(at, at + size)));
+      parts.push(s.end());
+      assert.equal(Buffer.concat(parts).toString('hex'), want, `${JSON.stringify(text)} in chunks of ${size}`);
+    }
+  }
 });
 
 await step('the anti-debugger guard strips traps from built code, never breaking it', async () => {
@@ -893,7 +910,7 @@ if (browserName === 'firefox') {
       if (!f) return null;
       f.ondata({ data: new TextEncoder().encode(text).buffer });
       f.onstop();
-      return new TextDecoder().decode(f.written[0]);
+      return new TextDecoder().decode(Buffer.concat(f.written));
     };
     assert.equal(load('r1', 'https://site.example/', 'x();debugger;y()'), 'x();;       ;y()');
     assert.equal(load('r2', 'https://www.trusted.example/', 'debugger'), null, 'exception sites are not filtered');

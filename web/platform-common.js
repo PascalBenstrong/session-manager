@@ -30,28 +30,86 @@ export function tabOut(t) {
  * anti-debugger page guard. Returns the same array when there is nothing to change.
  */
 export function stripDebuggerBytes(bytes) {
-  const WORD = [100, 101, 98, 117, 103, 103, 101, 114]; // "debugger"
-  const ident = (b) => (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95 || b === 36 || b === 35 || b >= 128;
-  const quote = (b) => b === 34 || b === 39 || b === 96;
-  const space = (b) => b === 32 || b === 9 || b === 10 || b === 13;
-  const edge = (b) => b !== undefined && (ident(b) || quote(b));
+  return stripScan(bytes, undefined, undefined, true)[0];
+}
+
+const DEBUGGER_WORD = [100, 101, 98, 117, 103, 103, 101, 114]; // "debugger"
+const identByte = (b) => (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95 || b === 36 || b === 35 || b >= 128;
+const quoteByte = (b) => b === 34 || b === 39 || b === 96;
+const spaceByte = (b) => b === 32 || b === 9 || b === 10 || b === 13;
+const edgeByte = (b) => b !== undefined && (identByte(b) || quoteByte(b));
+
+/**
+ * [`stripDebuggerBytes`] on `bytes`, which follow `before` (the byte right before them) and
+ * `solid` (the last byte before them that isn't a space). Unless `last` (nothing follows),
+ * what's at the end may still change with the bytes that follow: returns [out, done],
+ * where only `out` up to `done` is final (and `bytes` from `done` on must be scanned again
+ * with what follows).
+ */
+function stripScan(bytes, before, solid, last) {
   let out = null;
+  let done = last ? bytes.length : Math.max(0, bytes.length - 8);
   for (let i = bytes.indexOf(100); i !== -1 && i + 8 <= bytes.length; i = bytes.indexOf(100, i + 1)) {
+    // Its next byte isn't known yet.
+    if (!last && i + 8 >= bytes.length) {
+      done = Math.min(done, i);
+      break;
+    }
     let k = 0;
-    while (k < 8 && bytes[i + k] === WORD[k]) k++;
-    if (k < 8 || edge(bytes[i - 1]) || edge(bytes[i + 8])) continue;
+    while (k < 8 && bytes[i + k] === DEBUGGER_WORD[k]) k++;
+    if (k < 8 || edgeByte(i > 0 ? bytes[i - 1] : before) || edgeByte(bytes[i + 8])) continue;
     let p = i - 1;
-    while (p >= 0 && space(bytes[p])) p--;
+    while (p >= 0 && spaceByte(bytes[p])) p--;
     let n = i + 8;
     let newline = false;
-    for (; n < bytes.length && space(bytes[n]); n++) newline ||= bytes[n] === 10 || bytes[n] === 13;
-    if (bytes[p] === 46 || bytes[n] === 58 || (bytes[n] === 40 && !newline)) continue; // "." ":" "("
+    for (; n < bytes.length && spaceByte(bytes[n]); n++) newline ||= bytes[n] === 10 || bytes[n] === 13;
+    // Only spaces after it so far, or it reaches into what isn't final: decided later.
+    if (!last && (n === bytes.length || i + 8 > done)) {
+      done = Math.min(done, i);
+      break;
+    }
+    if ((p >= 0 ? bytes[p] : solid) === 46 || bytes[n] === 58 || (bytes[n] === 40 && !newline)) continue; // "." ":" "("
     out ??= bytes.slice();
     out[i] = 59; // ";"
     out.fill(32, i + 1, i + 8);
     i += 7;
   }
-  return out ?? bytes;
+  return [out ?? bytes, done];
+}
+
+/**
+ * [`stripDebuggerBytes`] for bytes that come in chunks: `push` each one and write what it
+ * returns, then write what `end` returns. The output is the same as for all the bytes at
+ * once; only the few bytes whose fate depends on the next chunk are held back.
+ */
+export function debuggerStripper() {
+  let held = new Uint8Array(0);
+  let before;
+  let solid;
+  const run = (bytes, last) => {
+    const [out, done] = stripScan(bytes, before, solid, last);
+    if (done > 0) {
+      before = bytes[done - 1];
+      for (let p = done - 1; p >= 0; p--) {
+        if (!spaceByte(bytes[p])) {
+          solid = bytes[p];
+          break;
+        }
+      }
+    }
+    held = bytes.slice(done);
+    return out.subarray(0, done);
+  };
+  return {
+    push(chunk) {
+      if (!held.length) return run(chunk, false);
+      const bytes = new Uint8Array(held.length + chunk.length);
+      bytes.set(held);
+      bytes.set(chunk, held.length);
+      return run(bytes, false);
+    },
+    end: () => run(held, true),
+  };
 }
 
 /**

@@ -1,5 +1,5 @@
 // Firefox implementation of `smPlatform` (overrides on top of platform-common.js).
-import { installPlatform, readThrottleRules, STREAM_REQUEST_TYPES, STREAM_TYPE, STREAM_URL, stripDebuggerBytes, tabOut, throttleRuleFor } from './platform-common.js';
+import { debuggerStripper, installPlatform, readThrottleRules, STREAM_REQUEST_TYPES, STREAM_TYPE, STREAM_URL, tabOut, throttleRuleFor } from './platform-common.js';
 
 const api = globalThis.browser;
 const LAZY_SCHEMES = /^(https?|ftp):/i;
@@ -19,16 +19,15 @@ function filterScript(details) {
   const site = hostOf(details.documentUrl || details.originUrl || details.url);
   if (rewriteExceptions.some((d) => site === d || site.endsWith(`.${d}`))) return;
   const filter = api.webRequest.filterResponseData(details.requestId);
-  const chunks = [];
-  filter.ondata = (e) => chunks.push(new Uint8Array(e.data));
+  // Each chunk goes out as it comes (but the last few bytes, until the next one says what they are).
+  const strip = debuggerStripper();
+  filter.ondata = (e) => {
+    const out = strip.push(new Uint8Array(e.data));
+    if (out.length) filter.write(out);
+  };
   filter.onstop = () => {
-    const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-    let at = 0;
-    for (const c of chunks) {
-      all.set(c, at);
-      at += c.length;
-    }
-    filter.write(stripDebuggerBytes(all));
+    const out = strip.end();
+    if (out.length) filter.write(out);
     filter.close();
   };
   filter.onerror = () => {};
