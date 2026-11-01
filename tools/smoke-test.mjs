@@ -737,9 +737,38 @@ await step('inspector: docks in the page by default, or opens a window; not for 
 await step('debugger statements are blanked out of script bytes', async () => {
   const { stripDebuggerBytes } = await import(pathToFileURL(join(dist, 'platform-common.js')).href);
   const run = (s) => new TextDecoder().decode(stripDebuggerBytes(new TextEncoder().encode(s)));
-  assert.equal(run('setInterval(function(){debugger},50)'), 'setInterval(function(){        },50)');
+  assert.equal(run('setInterval(function(){debugger},50)'), 'setInterval(function(){;       },50)');
   assert.equal(run('a.debugger = {debugger: 1}; mydebugger()'), 'a.debugger = {debugger: 1}; mydebugger()');
-  assert.equal(run('ünï debugger;'), 'ünï         ;');
+  assert.equal(run('ünï debugger;'), 'ünï ;       ;');
+  // An empty statement: `if (x) debugger` keeps guarding only itself.
+  assert.equal(run('if(x)debugger\ny()'), 'if(x);       \ny()');
+  // Names and strings stay.
+  const kept = 'x={debugger(){}};class A{#debugger;get debugger(){}};t==="debugger"||t==`debugger`';
+  assert.equal(run(kept), kept);
+  assert.equal(run('debugger\n(x)'), ';       \n(x)', 'a statement before a parenthesis on the next line');
+});
+
+await step('the anti-debugger guard strips traps from built code, never breaking it', async () => {
+  const vm = await import('node:vm');
+  const timers = [];
+  const ctx = vm.createContext({ setTimeout: (f, ...rest) => timers.push([f, ...rest]), setInterval: (f, ...rest) => timers.push([f, ...rest]) });
+  vm.runInContext('var window = globalThis;', ctx);
+  vm.runInContext(readFileSync(join(dist, 'guards', 'anti-debugger.js'), 'utf8'), ctx);
+  const ev = (code) => vm.runInContext(code, ctx);
+  assert.ok(!ev('String(Function("debugger"))').includes('debugger'), 'a trap is removed');
+  assert.ok(!ev('String((function () {}).constructor("debugger"))').includes('debugger'));
+  // A bundle that names `debugger` as a property, built with Function, compiles and runs.
+  assert.equal(ev('Function("return {debugger: 1, a: {debugger(){ return 2 }}}.a.debugger() + 1")()'), 3);
+  assert.equal(ev('Function("var o = {debugger: 5}; debugger; return o.debugger")()'), 5);
+  // `if (x) debugger` followed by more code keeps its meaning.
+  assert.equal(ev('Function("let n = 0; if (false) debugger\\n n++; return n")()'), 1);
+  // Code that only compiles with the word in it runs unchanged.
+  // (a method name with its parameters on the next line looks like a statement).
+  assert.equal(ev('Function("return ({debugger\\n(){ return 7 }}).debugger()")()'), 7);
+  ev('setTimeout("debugger; window.ran = 1", 0); setTimeout("o = {debugger: 1}", 0)');
+  assert.ok(!timers[0][0].includes('debugger'));
+  assert.equal(timers[1][0], 'o = {debugger: 1}');
+  assert.ok(ev('String(Function.prototype.toString.call(setTimeout))') !== undefined);
 });
 
 if (browserName === 'firefox') {
@@ -756,7 +785,7 @@ if (browserName === 'firefox') {
       f.onstop();
       return new TextDecoder().decode(f.written[0]);
     };
-    assert.equal(load('r1', 'https://site.example/', 'x();debugger;y()'), 'x();        ;y()');
+    assert.equal(load('r1', 'https://site.example/', 'x();debugger;y()'), 'x();;       ;y()');
     assert.equal(load('r2', 'https://www.trusted.example/', 'debugger'), null, 'exception sites are not filtered');
     await guards({ anti_debugger: false, strip_debugger_scripts: false, exceptions: [] });
     assert.equal(requestListeners.length, 0);

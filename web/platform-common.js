@@ -24,26 +24,32 @@ export function tabOut(t) {
 }
 
 /**
- * Blanks out `debugger` statements in script source bytes (UTF-8 or any ASCII compatible
- * encoding), keeping the length. `a.debugger` and `{ debugger: 1 }` are left alone.
- * Returns the same array when there is nothing to change.
+ * Turns `debugger` statements in script source bytes (UTF-8 or any ASCII compatible
+ * encoding) into empty statements (`;` and spaces), keeping the length. The word is left
+ * alone as a property or method name (`a.debugger`, `{ debugger: 1 }`, `debugger() {}`),
+ * in a longer name, and right next to a quote (`"debugger"`); same rules as the
+ * anti-debugger page guard. Returns the same array when there is nothing to change.
  */
 export function stripDebuggerBytes(bytes) {
   const WORD = [100, 101, 98, 117, 103, 103, 101, 114]; // "debugger"
-  const ident = (b) => (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95 || b === 36 || b >= 128;
+  const ident = (b) => (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95 || b === 36 || b === 35 || b >= 128;
+  const quote = (b) => b === 34 || b === 39 || b === 96;
   const space = (b) => b === 32 || b === 9 || b === 10 || b === 13;
+  const edge = (b) => b !== undefined && (ident(b) || quote(b));
   let out = null;
   for (let i = bytes.indexOf(100); i !== -1 && i + 8 <= bytes.length; i = bytes.indexOf(100, i + 1)) {
     let k = 0;
     while (k < 8 && bytes[i + k] === WORD[k]) k++;
-    if (k < 8 || (i > 0 && ident(bytes[i - 1])) || (i + 8 < bytes.length && ident(bytes[i + 8]))) continue;
+    if (k < 8 || edge(bytes[i - 1]) || edge(bytes[i + 8])) continue;
     let p = i - 1;
     while (p >= 0 && space(bytes[p])) p--;
     let n = i + 8;
-    while (n < bytes.length && space(bytes[n])) n++;
-    if ((p >= 0 && bytes[p] === 46) || (n < bytes.length && bytes[n] === 58)) continue; // "." or ":"
+    let newline = false;
+    for (; n < bytes.length && space(bytes[n]); n++) newline ||= bytes[n] === 10 || bytes[n] === 13;
+    if (bytes[p] === 46 || bytes[n] === 58 || (bytes[n] === 40 && !newline)) continue; // "." ":" "("
     out ??= bytes.slice();
-    out.fill(32, i, i + 8);
+    out[i] = 59; // ";"
+    out.fill(32, i + 1, i + 8);
     i += 7;
   }
   return out ?? bytes;
