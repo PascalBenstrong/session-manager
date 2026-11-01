@@ -216,9 +216,13 @@
     if (cls) s += `.${cls}`;
     return `${s}  ${Math.round(r.width)} × ${Math.round(r.height)}`;
   };
+  let placed = ''; // where the box was put last (only moved when that changes)
   const place = () => {
     if (!highlighted || !highlighted.isConnected) return;
     const r = highlighted.getBoundingClientRect();
+    const where = `${r.x} ${r.y} ${r.width} ${r.height} ${label(highlighted, r)}`;
+    if (where === placed && host && host.isConnected) return;
+    placed = where;
     const b = overlay();
     Object.assign(b.style, { left: `${r.x}px`, top: `${r.y}px`, width: `${r.width}px`, height: `${r.height}px` });
     tag.textContent = label(highlighted, r);
@@ -238,6 +242,7 @@
       return;
     }
     highlighted = el;
+    placed = '';
     place();
     if (!following) following = requestAnimationFrame(follow);
   };
