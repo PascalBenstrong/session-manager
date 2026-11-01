@@ -280,7 +280,8 @@ impl App {
         theme::install(&cc.egui_ctx, theme);
 
         let inbox = Rc::new(RefCell::new(Inbox::default()));
-        {
+        // The capture window shows nothing of the state.
+        if !capture {
             let inbox = inbox.clone();
             let ctx = cc.egui_ctx.clone();
             let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
@@ -292,7 +293,8 @@ impl App {
             pf::on_state_changed(STATE_KEY, cb.as_ref().unchecked_ref());
             cb.forget();
         }
-        {
+        // Only the manager and the popup show snapshots.
+        if !sidebar && !inspector && !capture {
             // Snapshots: read once, then followed like the state.
             let pushed = inbox.clone();
             let ctx = cc.egui_ctx.clone();
