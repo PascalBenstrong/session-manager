@@ -5,8 +5,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AppState, BrowserTab, EntryRef, Id, Session, Snapshot, TabEntry, TabId};
+use crate::model::{AppState, AutoRule, BrowserTab, EntryRef, Id, Session, Snapshot, TabEntry, TabId};
+use crate::pattern::CompiledPattern;
 use crate::url;
+use crate::workspace::Placer;
 
 const MAX_CLEANUP_LOG: usize = 20;
 
@@ -26,6 +28,34 @@ pub enum RestoreMode {
 pub enum ImportTarget {
     Session(Id),
     NewSession(String),
+}
+
+/// The enabled auto rules, compiled once for a batch of entries.
+struct AutoRules {
+    rules: Vec<(CompiledPattern, BTreeSet<String>, Option<String>)>,
+}
+
+impl AutoRules {
+    fn new(rules: &[AutoRule]) -> Self {
+        let rules =
+            rules.iter().filter(|r| r.enabled).filter_map(|r| Some((r.pattern.compile().ok()?, r.tags.clone(), r.group.clone()))).collect();
+        Self { rules }
+    }
+
+    fn apply(&self, e: &mut TabEntry) {
+        if self.rules.is_empty() {
+            return;
+        }
+        let host = e.host();
+        for (p, tags, group) in &self.rules {
+            if p.matches(&host, &e.url) {
+                e.tags.extend(tags.iter().cloned());
+                if e.group.is_none() {
+                    e.group = group.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Whether a URL should be tracked in sessions.
@@ -99,30 +129,20 @@ impl AppState {
 
     /// Applies enabled auto rules (tags + group if none) to an entry.
     fn apply_auto_rules(&self, e: &mut TabEntry) {
-        let host = e.host();
-        for rule in self.auto_rules.iter().filter(|r| r.enabled) {
-            let Ok(p) = rule.pattern.compile() else { continue };
-            if p.matches(&host, &e.url) {
-                e.tags.extend(rule.tags.iter().cloned());
-                if e.group.is_none() {
-                    e.group = rule.group.clone();
-                }
-            }
-        }
+        AutoRules::new(&self.auto_rules).apply(e);
     }
 
     /// Applies auto rules to every entry (after rules change). Returns true if anything changed.
     pub fn apply_auto_rules_all(&mut self) -> bool {
-        let mut sessions = std::mem::take(&mut self.sessions);
+        let rules = AutoRules::new(&self.auto_rules);
         let mut changed = false;
-        for s in &mut sessions {
+        for s in &mut self.sessions {
             for e in &mut s.entries {
                 let before = (e.tags.clone(), e.group.clone());
-                self.apply_auto_rules(e);
+                rules.apply(e);
                 changed |= before != (e.tags.clone(), e.group.clone());
             }
         }
-        self.sessions = sessions;
         changed
     }
 
@@ -560,10 +580,12 @@ impl AppState {
         };
         let existing: HashSet<String> = self.session(session).expect("exists").urls().into_iter().map(String::from).collect();
         let mut entries = Vec::new();
+        let rules = AutoRules::new(&self.auto_rules);
+        let placer = Placer::new(&self.workspaces);
         for u in urls.iter().filter(|u| !existing.contains(*u)) {
             let mut e = TabEntry { id: self.alloc_id(), url: u.clone(), created_at: now, ..Default::default() };
-            self.apply_auto_rules(&mut e);
-            self.place_entry(&mut e);
+            rules.apply(&mut e);
+            placer.place(&mut e);
             entries.push(e);
         }
         let added = entries.iter().map(|e| e.id).collect();
@@ -582,10 +604,11 @@ impl AppState {
             let id = self.create_session(&name, now);
             // Workspace ids of another installation mean nothing here.
             let mut entries: Vec<TabEntry> = s.entries.iter().map(|e| self.fresh_entry(e)).collect();
+            let placer = Placer::new(&self.workspaces);
             for e in &mut entries {
                 e.workspace = None;
                 e.workspace_manual = false;
-                self.place_entry(e);
+                placer.place(e);
             }
             for snap in &mut s.snapshots {
                 snap.id = self.alloc_id();

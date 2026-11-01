@@ -149,6 +149,11 @@ pub struct TabsView {
     /// The rows in the order drawn (this frame, and the last one for Shift-click ranges).
     order: Vec<EntryRef>,
     prev_order: Vec<EntryRef>,
+    /// The rule being typed, checked: how many saved tabs it matches, or why it's invalid.
+    rule_check: Option<((RuleKind, String, u64), Result<usize, String>)>,
+    /// The open workspace's tabs: (closed ones in the viewed session, loaded, all), for
+    /// (workspace, viewed session, state generation).
+    ws_counts: Option<((Id, Id, u64), (Vec<EntryRef>, usize, usize))>,
 }
 
 impl TabsView {
@@ -626,26 +631,37 @@ impl TabsView {
                         self.opts.workspaces = [ws.id].into();
                         self.show_filters = true;
                     }
-                    let closed: Vec<EntryRef> = cx
-                        .state
-                        .session(cx.viewed)
-                        .map(|s| {
-                            s.entries
-                                .iter()
-                                .filter(|e| e.workspace == Some(ws.id) && !e.is_open())
-                                .map(|e| EntryRef { session: s.id, entry: e.id })
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let key = (ws.id, cx.viewed, super::state_generation());
+                    if self.ws_counts.as_ref().is_none_or(|(k, _)| *k != key) {
+                        let closed: Vec<EntryRef> = cx
+                            .state
+                            .session(cx.viewed)
+                            .map(|s| {
+                                s.entries
+                                    .iter()
+                                    .filter(|e| e.workspace == Some(ws.id) && !e.is_open())
+                                    .map(|e| EntryRef { session: s.id, entry: e.id })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let all = cx.state.workspace_entries(ws.id).len();
+                        let loaded = cx
+                            .state
+                            .sessions
+                            .iter()
+                            .flat_map(|s| &s.entries)
+                            .filter(|e| e.workspace == Some(ws.id) && e.is_open() && !e.discarded)
+                            .count();
+                        self.ws_counts = Some((key, (closed, loaded, all)));
+                    }
+                    let (closed, loaded, all) = self.ws_counts.as_ref().map_or((&[][..], 0, 0), |(_, (c, l, a))| (&c[..], *l, *a));
                     if ui
                         .add_enabled(!closed.is_empty(), egui::Button::new(format!("⤓ Open its closed tabs ({})", closed.len())))
                         .on_hover_text("Open its tabs of this session that aren't open, unloaded and in the background (they load when you select them)")
                         .clicked()
                     {
-                        acts.send(Command::OpenEntries { entries: closed, discarded: true });
+                        acts.send(Command::OpenEntries { entries: closed.to_vec(), discarded: true });
                     }
-                    let tabs = cx.state.workspace_entries(ws.id);
-                    let loaded = tabs.iter().filter_map(|r| cx.state.entry(*r)).filter(|e| e.is_open() && !e.discarded).count();
                     if ui
                         .add_enabled(loaded > 0, egui::Button::new(format!("💤 Hibernate its tabs ({loaded})")))
                         .on_hover_text("Unload its open tabs in every session (active, pinned and playing tabs are skipped)")
@@ -672,8 +688,7 @@ impl TabsView {
                         acts.confirm(
                             format!(
                                 "Delete the workspace \"{}\"? Its {} tab(s) stay in their sessions, without a workspace.",
-                                ws.name,
-                                tabs.len()
+                                ws.name, all
                             ),
                             Command::DeleteWorkspace { id: ws.id },
                         );
@@ -686,7 +701,12 @@ impl TabsView {
         let p = theme::palette(ui);
         let rule = self.rule_kind.build(&self.rule_value);
         let empty = self.rule_value.trim().is_empty();
-        let compiled = if empty { None } else { Some(rule.compile()) };
+        let key = (self.rule_kind, self.rule_value.clone(), super::state_generation());
+        if !empty && self.rule_check.as_ref().is_none_or(|(k, _)| *k != key) {
+            let check = rule.compile().map(|c| cx.state.sessions.iter().flat_map(|s| &s.entries).filter(|e| c.matches(e)).count());
+            self.rule_check = Some((key, check));
+        }
+        let compiled = if empty { None } else { self.rule_check.as_ref().map(|(_, c)| c.clone()) };
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt(("rule-kind", ws.id)).selected_text(self.rule_kind.label()).width(150.0).show_ui(ui, |ui| {
                 for k in RuleKind::ALL {
@@ -728,8 +748,7 @@ impl TabsView {
             Some(Err(e)) => {
                 ui.label(RichText::new(e).small().color(p.danger));
             }
-            Some(Ok(c)) => {
-                let n = cx.state.sessions.iter().flat_map(|s| &s.entries).filter(|e| c.matches(e)).count();
+            Some(Ok(n)) => {
                 ui.label(RichText::new(format!("Matches {n} saved tab(s) right now")).small().color(p.muted));
             }
             None => {}
