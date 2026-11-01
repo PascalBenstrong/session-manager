@@ -414,6 +414,8 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             }
         }
         Event::TabRemoved { tab_id, window_closing } => {
+            OPENED.with(|o| o.borrow_mut().remove(&tab_id));
+            STREAM_RELOADED.with(|r| r.borrow_mut().remove(&tab_id));
             if with_state(|s| s.on_tab_removed(tab_id, window_closing)) {
                 // A closing window removes all its tabs: saved together.
                 if window_closing {
@@ -1386,6 +1388,8 @@ async fn sync_tab_strip() -> Result<(), String> {
             tab_strip::title_preface(current)
         });
         let windows: std::collections::BTreeSet<TabId> = tabs.iter().map(|t| t.window_id).collect();
+        // Closed windows are forgotten.
+        TITLES.with(|t| t.borrow_mut().retain(|w, _| windows.contains(w)));
         for w in windows {
             // Windows start without a preface; only touch them once there is one.
             let last = TITLES.with(|t| t.borrow().get(&w).cloned()).unwrap_or_default();
