@@ -1409,8 +1409,9 @@ impl InspectorView {
         let hits = ads::providers(&self.url, &signals);
         ui.label(
             RichText::new(
-                "Ad networks this page uses, from the scripts, frames and requests of all its frames, its ad slots, and \
-                 the tabs it opened. Block a network on this site, or everywhere.",
+                "Ad networks this page uses, from the scripts, frames and requests of all its frames, the ad code written \
+                 into it (inline scripts and encoded tags), its ad slots, and the tabs it opened. Block a network on this \
+                 site, or everywhere.",
             )
             .small()
             .color(p.muted),
@@ -1419,7 +1420,13 @@ impl InspectorView {
         let rules = state.map(|s| s.block_rules.as_slice()).unwrap_or_default();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if hits.is_empty() {
-                empty_state(ui, "✨", "No ads found", "No known ad network shows up in this page's scripts, frames or requests.");
+                empty_state(
+                    ui,
+                    "✨",
+                    "No ads found",
+                    "No known ad network is named in this page's scripts, frames, requests or inline code. Ads that load a \
+                     little later: ⟳ Refresh reads the page again.",
+                );
             }
             let mut category = None;
             for h in &hits {
@@ -1451,7 +1458,15 @@ impl InspectorView {
                     if h.category == AdCategory::Suspected {
                         badge(ui, "by its name", false);
                     } else if !h.known {
-                        badge(ui, "unknown network", false);
+                        // An unnamed network: say what gave its host away.
+                        let why = if h.signals.iter().any(|s| s.kind == "inline") {
+                            "from page code"
+                        } else if h.signals.iter().any(|s| matches!(s.kind.as_str(), "script" | "iframe" | "request")) {
+                            "ad tag"
+                        } else {
+                            "unknown network"
+                        };
+                        badge(ui, why, false);
                     }
                     ui.label(RichText::new(h.summary()).small().color(p.muted));
                 });
@@ -1494,7 +1509,7 @@ impl InspectorView {
                 egui::CollapsingHeader::new(RichText::new("What gave it away").small()).id_salt(("ad", &h.name)).show(ui, |ui| {
                     for s in &h.signals {
                         ui.horizontal(|ui| {
-                            badge(ui, if s.kind == "popup" { "tab" } else { &s.kind }, s.kind == "popup");
+                            badge(ui, if s.kind == "popup" { "tab" } else if s.kind == "inline" { "code" } else { &s.kind }, s.kind == "popup");
                             if s.kind == "slot" {
                                 let selector = s.detail.split(" × ").next().unwrap_or("").to_string();
                                 ui.label(RichText::new(&s.detail).monospace().small());
@@ -1503,6 +1518,13 @@ impl InspectorView {
                                     self.select_first_match = true;
                                     self.ask(json!({ "op": "query", "selector": selector }), |r| Reply::Query(parse(r)));
                                 }
+                            } else if s.kind == "inline" {
+                                // The ad code itself: a line of it here, all of it on hover.
+                                let one_line = s.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+                                let excerpt: String = one_line.chars().take(160).collect();
+                                let full: String = s.detail.chars().take(4000).collect();
+                                ui.add(egui::Label::new(RichText::new(excerpt).monospace().small()).truncate().selectable(true))
+                                    .on_hover_text(full);
                             } else {
                                 let l = ui
                                     .add(egui::Label::new(RichText::new(&s.url).monospace().small()).truncate().selectable(true))

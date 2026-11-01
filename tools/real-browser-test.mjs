@@ -235,6 +235,7 @@ async function inspectorExtras(evalExt, evalPage, tabId, urls, frameUrls = urls,
   check('frames in the tree carry their URL (open in a new tab)', frame.src.includes('ad.html?frame'), frame.src);
   const signals = await json(`smPlatform.collectAdSignals(${T}, ['ins.adsbygoogle'])`);
   check('the ads view finds the ad slot and the scripts', signals.some((s) => s.kind === 'slot') && signals.some((s) => s.kind === 'script'));
+  check('the ads view reads the ad code written into the page', signals.some((s) => s.kind === 'inline' && /popunder/.test(s.detail)));
   const [player] = await json(`smPlatform.inspect(${T}, { op: 'query', selector: '#player' })`);
   const shot = await json(`(async () => {
     const tab = await (globalThis.browser ?? chrome).tabs.get(${T});

@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.8.4. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.9.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -66,7 +66,7 @@ Version: 0.8.4. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Network: a recorder in the page's own world (web/net-recorder.js; injected on demand, and registered at document start for the sites of recording tabs; a per-tab sessionStorage flag keeps it to the recording tab) wraps fetch, XMLHttpRequest, WebSocket and sendBeacon and reports requests, responses (text bodies up to 256 KB) and WebSocket messages to the inspector content script through a per-session random event name. The log keeps 5000 entries, apart per document (src/netlog.rs). Sockets opened before recording are picked up when the page sends on them.
 - Replay (one or a list, with a pause): XHR through a new request carrying the original's handlers and listeners, so the page's code runs again; received WebSocket messages re-dispatched to the socket; sent messages, fetch and beacons sent again. Replays are recorded and linked to the original. Requests of earlier pages in the tab are sent again from what was recorded (URL, method, headers, text body).
 - Throttling: rules (site, URL glob, optional method, delay, and a tab or every tab) applied by the background to every request of the site's pages, also after reloads. Rules of a tab are kept for the browser session (storage.session) and removed with the tab; rules of every tab are kept (storage.local). Settings: delay of new rules, pause between replays, scope of new rules, record when the view opens, keep the log across reloads. Firefox: a blocking webRequest listener that answers after the delay. Chrome: the debugger (a required permission: Chrome does not allow it to be optional) is attached to tabs of throttled sites; Fetch interception continues matching requests after the delay.
-- Ads: scripts, frames, requests and ad slots of every frame, and the tabs the page opened, matched against a catalogue of ad networks (src/ads.rs); unknown third-party hosts named like ad servers are listed as possible ad hosts. Script and close-tab rules in one click.
+- Ads: scripts, frames, requests and ad slots of every frame, the ad tags written into the page (inline scripts, decoded base64 payloads) and the tabs the page opened, matched against a catalogue of ad networks (src/ads.rs). Unknown third-party hosts named like ad servers, self-hosted ad-tag shapes, ad-server frames, direct-link redirects and video ad requests are listed as possible ad hosts. Script and close-tab rules in one click.
 - Open frame in new tab: a browser context menu item on frames.
 - Elements: an element picker (hover highlights, click selects), a lazily loaded DOM tree (including open shadow roots), CSS selector search, and for the selected element its path, a unique selector, size and position, attributes, computed style (filterable), text and HTML; scroll into view and delete.
 - Media & frames: the URLs of videos, audio, sources, subtitle tracks, posters, iframes, frames, embeds, objects and scripts in every frame, and media requests from the network log (the streams behind blob: videos), grouped by element type and searchable; copy, open, and block a script.

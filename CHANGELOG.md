@@ -2,6 +2,17 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.9.0] - 2026-11-01
+
+### New
+- Inspector, Ads: the ad networks a page writes into its own code are found now, not only the ones behind the scripts and frames it loads. Inline ad tags and base64-encoded ad payloads are read, and the networks they name are listed (Monetag, AdMaven, PopAds, ExoClick's PopMagic, AdWheel…), with the tag hosts they build.
+- Inspector, Ads: third-party tag hosts that do not name a network are listed by what they are — the `/<token>/<zone>` shape of self-hosted pop-under tags, `/tag.min.js` and `/popunder1000.js` tag libraries, `/iframe/<hex>` banner frames, `/go/<id>?subid=…` direct-link redirects and VAST video ad requests — so a page like a streaming site no longer looks ad-free just because its ad tags come from throwaway domains.
+
+### Improved
+- Inspector, Ads: more of the networks these sites use are recognised, including their newer tag domains: Monetag's `llvpn.com`, AdMaven's CloudFront tags (by their `rzqfd` / `zgiqd` zone parameter), PopAds' `predictivadnetwork(s).com` and `displayvertising.com`, ExoClick's `exacdn.com` (PopMagic), AdWheel's `animeapp.org`, Adsterra's `highperformanceformat.com` and `effectivecreativeformat.com`, HilltopAds' `humbleparticular.com`, and OnClickA, RichAds and AdCash's tag domains.
+- Inspector, Ads: on shared hosts (CloudFront and other CDNs) a blocking rule names the tag's own host instead of the whole CDN. An unnamed host's badge says where it was found ("ad tag", "from page code").
+- Inspector, Ads: the empty state points at ⟳ Refresh, which reads the page again for ads that load after it (late tags, or on a click).
+
 ## [0.8.4] - 2026-11-01
 
 ### New

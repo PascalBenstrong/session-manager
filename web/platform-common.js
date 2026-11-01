@@ -78,18 +78,24 @@ function collectPageResources() {
 
 /**
  * Runs in every frame of an inspected page (scripting.executeScript): what can give away
- * the ads it runs — script and frame URLs, every request, and elements matching
- * `slotSelectors` (ad slots, reported as "selector × count").
+ * the ads it runs — script and frame URLs, every request, elements matching
+ * `slotSelectors` (ad slots, reported as "selector × count"), and the ad code written into
+ * the page itself (inline scripts, and payloads kept base64-encoded), where the ad
+ * networks are often named even though nothing points at them from a URL.
  */
 function collectAdSignals(slotSelectors) {
   const items = [];
   const seen = new Set();
   const add = (kind, url, detail = '') => {
-    if (url && seen.has(url)) return;
-    if (url) seen.add(url);
+    const key = `${kind}\n${url}\n${detail}`;
+    if (seen.has(key)) return;
+    seen.add(key);
     items.push({ kind, url: String(url || ''), detail: String(detail || '') });
   };
-  for (const s of document.querySelectorAll('script[src]')) add('script', s.src);
+  for (const s of document.querySelectorAll('script[src]')) {
+    const attrs = [...s.attributes].filter((a) => a.name.startsWith('data-') && a.value).map((a) => `${a.name}="${a.value}"`).join(' ');
+    add('script', s.src, attrs);
+  }
   for (const f of document.querySelectorAll('iframe, frame')) if (/^https?:/.test(f.src)) add('iframe', f.src, f.title || f.name);
   for (const r of performance.getEntriesByType('resource')) add('request', r.name, r.initiatorType);
   for (const sel of slotSelectors) {
@@ -100,6 +106,48 @@ function collectAdSignals(slotSelectors) {
       // Not a selector this browser knows.
     }
     if (n) add('slot', '', `${sel} × ${n}`);
+  }
+
+  // Inline code. Only what looks like an ad tag is sent on, cut short: the inspector
+  // matches the network names and tag URLs in it (src/ads.rs).
+  const AD = /(ads?bygoogle|monetag|adsterra|propeller|hilltopads|popads|popcash|juicyads|exoclick|popmagic|adcash|admaven|ad-maven|onclicka|onclckvd|richads|mgid|taboola|outbrain|prebid|aniview|primis|teads|spotx|adnxs|doubleclick|googlesyndication|data-zone|zone[_ -]?id|popunder|interstitial|tag\.min\.js|animeapp|ag_custom_domain|rzqfd|zgiqd|preroll)/i;
+  const CODE = /[<>{}\[\]]|=>|\bfunction\b|\bvar\b|\blet\b|\bconst\b/;
+  const MAX = 50000; // characters of inline code per frame
+  let sent = 0;
+  const inline = (text, keep) => {
+    const t = String(text || '');
+    if (!t || sent >= MAX || t.length < 16) return;
+    const hit = AD.exec(t);
+    if (!hit && !keep) return;
+    // Keep the part around the ad marker (a long script can hold it in the middle).
+    const from = hit ? Math.max(0, hit.index - 600) : 0;
+    const part = t.slice(from, from + Math.min(4000, MAX - sent));
+    sent += part.length;
+    add('inline', location.href, part);
+  };
+  // Ad tags are often kept encoded (base64 in a config or a script block): decode what
+  // decodes into markup or an ad tag, and look inside that too (a couple of levels).
+  let attempts = 0;
+  const decode = (text, depth) => {
+    for (const m of String(text).matchAll(/[A-Za-z0-9+/_-]{60,6000}={0,2}/g)) {
+      if (attempts++ > 60) return;
+      let d;
+      try {
+        d = atob(m[0].replace(/-/g, '+').replace(/_/g, '/'));
+      } catch {
+        continue;
+      }
+      if (!d || !/[\x20-\x7e]/.test(d)) continue;
+      if (!AD.test(d) && !/https?:\/\/|<(iframe|script)\b/i.test(d)) continue;
+      inline(d, true);
+      if (depth < 2) decode(d, depth + 1);
+    }
+  };
+  for (const s of document.querySelectorAll('script:not([src])')) {
+    const t = s.textContent || '';
+    if (t.length < 16) continue;
+    if (AD.test(t)) inline(t);
+    if (t.length >= 64 && t.length < 400000 && CODE.test(t)) decode(t, 0);
   }
   return { frameUrl: location.href, items };
 }
