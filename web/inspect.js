@@ -267,14 +267,30 @@
   let detailsChanged = false;
   let flush = 0;
   const known = (n) => n && ids.get(n);
+  const onlyOurs = (list) => {
+    for (const n of list) if (!ours(n) && !mine.has(n)) return false;
+    return true;
+  };
+  // Ids of nodes gone from the page are forgotten now and then (when there are many more).
+  let pruned = 0;
+  const prune = () => {
+    if (nodes.size < pruned * 2 + 1000) return;
+    for (const [id, ref] of nodes) if (!ref.deref()) nodes.delete(id);
+    for (const id of listed) if (!nodes.has(id)) listed.delete(id);
+    pruned = nodes.size;
+  };
   const observer = new MutationObserver((records) => {
     for (const r of records) {
-      const moved = [...r.addedNodes, ...r.removedNodes];
-      if (ours(r.target) || mine.has(r.target.parentNode) || (moved.length && moved.every((n) => ours(n) || mine.has(n)))) continue;
+      // What the inspector shows first (most changes are elsewhere), then whether it's ours.
       const owner = r.type === 'childList' ? r.target : r.target.parentNode;
       const id = known(owner);
-      if (id && listed.has(id)) changed.add(id);
-      if (selected && (selected === r.target || selected.contains(r.target))) detailsChanged = true;
+      const inList = id && listed.has(id);
+      const inSelected = selected && (selected === r.target || selected.contains(r.target));
+      if (!inList && !inSelected) continue;
+      if (ours(r.target) || mine.has(r.target.parentNode)) continue;
+      if (r.type === 'childList' && (r.addedNodes.length || r.removedNodes.length) && onlyOurs(r.addedNodes) && onlyOurs(r.removedNodes)) continue;
+      if (inList) changed.add(id);
+      if (inSelected) detailsChanged = true;
     }
     if ((changed.size || detailsChanged) && !flush) {
       flush = setTimeout(() => {
@@ -282,6 +298,7 @@
         post({ changed: [...changed], details: detailsChanged, title: document.title });
         changed.clear();
         detailsChanged = false;
+        prune();
       }, 250);
     }
   });
