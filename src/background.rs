@@ -1217,10 +1217,6 @@ async fn enforce_media() {
 
 // ---------------------------------------------------------------- tab strip
 
-fn workspace_of(s: &AppState, t: &BrowserTab) -> Option<Id> {
-    s.entry_for_tab(t.id).and_then(|e| e.workspace)
-}
-
 /// Debounced [`sync_tab_strip`]; a run asked for while one runs follows it.
 /// Saves the state soon, once for all the changes made meanwhile (for frequent changes
 /// that don't need saving right away).
@@ -1271,14 +1267,12 @@ async fn sync_tab_strip() -> Result<(), String> {
 
     // Hide first: switching away from a hidden tab changes which group is collapsed.
     if ui.hide_inactive && caps.hide_tabs && caps.hide_tabs_allowed {
-        let (current, tracked) = with_state(|s| {
-            // Only tabs we track: tabs hidden by other extensions are not ours to show.
-            let tracked: Vec<BrowserTab> = tabs.iter().filter(|t| s.locate_tab(t.id).is_some()).cloned().collect();
-            (s.active_workspace, tracked)
-        });
         let plan = STATE.with(|s| {
             let s = s.borrow();
-            tab_strip::plan_visibility(current, &tracked, |t| workspace_of(&s, t))
+            let by_tab = s.entries_by_tab();
+            // Only tabs we track: tabs hidden by other extensions are not ours to show.
+            let tracked: Vec<BrowserTab> = tabs.iter().filter(|t| by_tab.contains_key(&t.id)).cloned().collect();
+            tab_strip::plan_visibility(s.active_workspace, &tracked, |t| by_tab.get(&t.id).and_then(|e| e.workspace))
         });
         if !plan.is_empty() {
             pf::show_tabs(&plan.show).await?;
@@ -1304,7 +1298,9 @@ async fn sync_tab_strip() -> Result<(), String> {
         let last = GROUPS_COLLAPSED_FOR.with(|c| c.borrow().clone());
         let plan = STATE.with(|s| {
             let s = s.borrow();
-            tab_strip::plan_groups(&s.workspaces, &tabs, &groups, |t| workspace_of(&s, t), ui.collapse_inactive.then_some(&last))
+            let by_tab = s.entries_by_tab();
+            let workspace_of = |t: &BrowserTab| by_tab.get(&t.id).and_then(|e| e.workspace);
+            tab_strip::plan_groups(&s.workspaces, &tabs, &groups, workspace_of, ui.collapse_inactive.then_some(&last))
         });
         for g in &plan.groups {
             let id = match g.group {
@@ -1345,7 +1341,10 @@ async fn sync_tab_strip() -> Result<(), String> {
 /// Shows the tabs hidden for workspaces (when hiding is turned off, or no workspace is current).
 async fn show_workspace_tabs() {
     let ids: Vec<TabId> = match pf::query_tabs().await {
-        Ok(tabs) => with_state(|s| tabs.iter().filter(|t| t.hidden && s.locate_tab(t.id).is_some()).map(|t| t.id).collect()),
+        Ok(tabs) => with_state(|s| {
+            let by_tab = s.entries_by_tab();
+            tabs.iter().filter(|t| t.hidden && by_tab.contains_key(&t.id)).map(|t| t.id).collect()
+        }),
         Err(e) => return log(&format!("could not query tabs: {e}")),
     };
     if let Err(e) = pf::show_tabs(&ids).await {
@@ -1359,7 +1358,8 @@ async fn organize_tabs(key: OrganizeKey, native_groups: bool) -> Result<usize, S
     let tabs = pf::query_tabs().await?;
     let plans = STATE.with(|s| {
         let s = s.borrow();
-        organize::plan(key, &tabs, |id| s.entry_for_tab(id))
+        let by_tab = s.entries_by_tab();
+        organize::plan(key, &tabs, |id| by_tab.get(&id).copied())
     });
     // While workspaces are shown as tab groups, those are the only groups we make.
     let use_groups = native_groups && CAPS.with(|c| c.borrow().tab_groups) && !with_state(|s| s.settings.browser_ui.tab_groups);

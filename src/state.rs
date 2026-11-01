@@ -1,7 +1,7 @@
 //! Pure state transitions on [`AppState`]: tab tracking, reconciliation and edits.
 //! The background script drives these from browser events; they never touch the browser.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +83,18 @@ impl AppState {
 
     pub fn entry_for_tab(&self, tab_id: TabId) -> Option<&TabEntry> {
         self.locate_tab(tab_id).and_then(|r| self.entry(r))
+    }
+
+    /// The entry of each open tab ([`AppState::entry_for_tab`] for all of them at once),
+    /// for code that looks up many tabs.
+    pub fn entries_by_tab(&self) -> HashMap<TabId, &TabEntry> {
+        let mut map = HashMap::new();
+        for e in self.sessions.iter().flat_map(|s| &s.entries) {
+            if let Some(t) = e.tab_id {
+                map.entry(t).or_insert(e);
+            }
+        }
+        map
     }
 
     /// Applies enabled auto rules (tags + group if none) to an entry.
@@ -758,6 +770,32 @@ mod tests {
         assert_eq!(last.tab_id, Some(1));
         assert_eq!(last.group.as_deref(), Some("Dev"));
         assert!(last.tags.contains("code"));
+    }
+
+    #[test]
+    fn entries_by_tab_matches_lookups() {
+        let mut s = AppState::default();
+        let same = |s: &AppState| {
+            let map = s.entries_by_tab();
+            let open = s.sessions.iter().flat_map(|x| &x.entries).filter_map(|e| e.tab_id).collect::<HashSet<_>>();
+            assert_eq!(map.len(), open.len());
+            for t in open.into_iter().chain([99]) {
+                assert_eq!(map.get(&t).map(|e| e.id), s.entry_for_tab(t).map(|e| e.id));
+            }
+        };
+        s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
+        s.on_tab_upsert(&tab(2, "https://b.com"), 1.0);
+        same(&s);
+        s.on_tab_removed(1, false);
+        same(&s);
+        let other = s.create_session("Other", 0.0);
+        s.session_mut(other).unwrap().entries.push(TabEntry { id: 500, url: "https://c.com".into(), ..Default::default() });
+        s.on_tab_upsert(&tab(3, "https://c.com"), 1.0);
+        s.link_tab(EntryRef { session: other, entry: 500 }, &tab(3, "https://c.com"));
+        same(&s);
+        assert_eq!(s.entries_by_tab()[&3].id, 500);
+        s.on_tab_removed(2, true);
+        same(&s);
     }
 
     #[test]
