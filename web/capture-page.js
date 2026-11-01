@@ -239,8 +239,12 @@
     addEventListener('message', (e) => {
       const token = e.data && e.data.smCaptureLocate;
       if (typeof token !== 'string' || !token.startsWith('sm-cap-')) return;
-      const frame = deepAll('iframe, frame').find((f) => f.contentWindow === e.source);
-      if (frame) located.set(token, new WeakRef(frame));
+      const known = located.get(token)?.deref();
+      const frame = known && known.isConnected && known.contentWindow === e.source ? known : deepAll('iframe, frame').find((f) => f.contentWindow === e.source);
+      if (!frame) return;
+      located.set(token, new WeakRef(frame));
+      // Found: the frame can stop asking.
+      e.source.postMessage({ smCaptureLocated: token }, '*');
     });
   }
 
@@ -301,6 +305,13 @@
       // Only a frame right inside the top one can be placed; deeper ones record the tab.
       const token = `sm-cap-${crypto.randomUUID()}`;
       const greet = () => parent.postMessage({ smCaptureLocate: token }, '*');
+      const answered = (e) => {
+        if (e.source !== parent || !e.data || e.data.smCaptureLocated !== token) return;
+        clearInterval(session.greet);
+        session.greet = 0;
+        removeEventListener('message', answered);
+      };
+      addEventListener('message', answered);
       greet();
       session.greet = setInterval(greet, 2000);
       return { token, nested: window.parent !== window.top };
