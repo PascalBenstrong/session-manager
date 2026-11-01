@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.10.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.11.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -31,9 +31,9 @@ Version: 0.10.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Deleting a workspace keeps its tabs, without a workspace.
 
 ## Workspaces in the browser
-- Optionally mirror workspaces as native tab groups (title = icon and name, the workspace's color), in every window. Moving a tab into a workspace's group (in the same window) puts it in that workspace; moving it out takes it out. Tabs without a workspace keep their own groups. Optionally collapse the groups of workspaces other than the active tab's.
+- Optionally mirror workspaces as native tab groups (title = icon and name, the workspace's color), in every window. Moving a tab into a workspace's group (in the same window) puts it in that workspace; moving it out takes it out. Tabs without a workspace keep their own groups. Optionally collapse the groups of workspaces other than the active tab's, when the current workspace changes (groups the user expands or collapses meanwhile stay so).
 - One workspace is current: the workspace of the tab last used, or the one switched to. Switching goes to the workspace's most recently used tab. New tabs can join the current workspace.
-- The sidebar's tabs can be taken out of their workspace, moved to another, closed, or (saved ones) deleted, from buttons and a right-click menu.
+- The sidebar's tabs can be taken out of their workspace, moved to another, closed (removed, or kept as saved tabs in their session and workspace), or (saved ones) deleted, from buttons and a right-click menu.
 - A browser sidebar (Firefox) / side panel (Chrome) lists the window's tabs by workspace, with a workspace switcher, new tabs per workspace, drag and drop between workspaces, and optionally the active session's saved tabs.
 - Firefox: optionally hide the tabs of other workspaces than the current one (tabs without a workspace and pinned tabs always show), using the optional `tabHide` permission, which is requested when the option is turned on. Optionally show the current workspace in the window title.
 - Firefox: a guide in Settings explains how to hide Firefox's horizontal tab bar with `userChrome.css`: the `about:config` preference to change (`toolkit.legacyUserProfileCustomizations.stylesheets` = `true`), where the file goes, and the stylesheet (copy or download). It opens the pages it mentions where Firefox allows that, and copies their address otherwise.
@@ -46,6 +46,7 @@ Version: 0.10.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Optionally allow media to play only in the active tab (of each window), or in at most N background tabs besides the active ones. When there are more, the least recently used background tabs are paused.
 - Media paused this way resumes when its tab becomes active (configurable).
 - Only video counts by default; audio can be included. Picture-in-picture video can keep playing.
+- Stopped streams: a tab's streams can be stopped (a button over playing videos, the sidebar, the popup) and resumed. Stopping pauses its media and holds back its media data (by URL: stream manifests, segments, media files; or by response content type). Firefox: blocking webRequest listeners answer when resumed. Chrome: declarativeNetRequest session rules block them. On resume, live streams seek to the live edge, and a page whose playback doesn't recover is reloaded (at most once a minute). A new page in the tab starts with its data flowing. Optionally, a low-resolution loop of the video's last frames (resolution, frame count) shows over the stopped video.
 
 ## Page guards
 - Guards run inside pages (the page's own world, at document start, in every frame) before the pages' own scripts. Each can be turned on or off, and a list of sites (with subdomains) is left alone.

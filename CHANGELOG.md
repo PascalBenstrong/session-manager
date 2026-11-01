@@ -2,6 +2,19 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.11.0] - 2026-11-01
+
+### New
+- Stop a live stream to save data: ⏸ *Stop stream* on a playing video (shown when you hover it), next to its tab in the sidebar and the popup, or in the tab's menu. Its videos pause and its video and audio data is held back until you resume it (▶). In Firefox the requests wait, so the player doesn't see an error; Chrome blocks them, and the page reloads if the player doesn't recover when you resume. A live stream resumes at its live edge.
+- ⏸ in the sidebar's footer stops the streams of every background tab at once; the tab you're using keeps playing.
+- Optionally, a stopped video shows a low-resolution loop of its last frames (Settings → *Stopped streams*: resolution and number of frames). It's only a picture, kept in the page's memory: no data.
+- Close a tab but keep it: 💾 next to a tab in the sidebar (or *Close, keep saved* in its menu) closes it, and it stays in its session and workspace as a saved tab.
+
+### Fixed
+- *Remove debugger traps* could stop pages from working, e.g. a video player that never started: code that names `debugger` as a property (`{ debugger: 1 }`) was changed into code that doesn't run. Only `debugger` statements are removed now, and code that would only run unchanged is left as it is.
+- With *Collapse the other workspaces*, a workspace's tab group you expanded collapsed again a moment later. Groups now collapse when you switch to another workspace, and otherwise stay as you leave them.
+- The sidebar shows which tabs play media (🔊) also when the media limit is off.
+
 ## [0.10.0] - 2026-11-01
 
 ### New

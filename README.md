@@ -119,9 +119,9 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
 - **Search** across all workspaces (the default), only some (*In: workspaces* in the search options ⚙, or *Search in this workspace*), or with `ws:name` in the query.
 
 **Workspaces in the browser** (Settings → *Workspaces in the browser*)
-- **As tab groups:** each workspace's tabs sit in a native tab group titled with its icon and name, in its color (Chrome, Edge, Firefox 139+). Drag a tab into a workspace's group to move it there, or out of the group to take it out. *Collapse the other workspaces* keeps only the current workspace's group open.
+- **As tab groups:** each workspace's tabs sit in a native tab group titled with its icon and name, in its color (Chrome, Edge, Firefox 139+). Drag a tab into a workspace's group to move it there, or out of the group to take it out. *Collapse the other workspaces* collapses the other groups when you switch workspaces; a group you expand stays open.
 - **Current workspace:** the workspace of the tab you use. Switch with the pills in the sidebar, ⇄ on a workspace header, or *Switch to it* in its settings. Optionally, new tabs join it.
-- **Sidebar:** Firefox's sidebar or Chrome's side panel shows the window's tabs by workspace, with a workspace switcher, ＋ new tab per workspace, drag and drop, and (with *Saved*) the session's closed tabs. On a tab, ◌ takes it out of its workspace, 🗙 closes it and 🗑 deletes a saved one; right-click for these and to move it to another workspace. Open it with **Alt+Shift+W**, ◨ in the popup, or the button in Settings.
+- **Sidebar:** Firefox's sidebar or Chrome's side panel shows the window's tabs by workspace, with a workspace switcher, ＋ new tab per workspace, drag and drop, and (with *Saved*) the session's closed tabs. On a tab, ◌ takes it out of its workspace, 💾 closes it but keeps it saved, 🗙 closes and removes it, 🗑 deletes a saved one, and ⏸ stops its stream; right-click for these and to move it to another workspace. Open it with **Alt+Shift+W**, ◨ in the popup, or the button in Settings.
 - **Hide other workspaces (Firefox):** only the current workspace's tabs (plus pinned tabs and tabs without a workspace) stay in the tab bar. Firefox asks for the "Hide and show browser tabs" permission when you turn it on. Optionally the window title starts with the workspace.
 - **Hide Firefox's tab bar:** Settings has a step-by-step userChrome.css guide. It names the preference to set in `about:config` (`toolkit.legacyUserProfileCustomizations.stylesheets` → `true`), tells you where the file goes, and lets you copy or download the stylesheet. Firefox doesn't let extensions open `about:config` / `about:support`, so their buttons copy the address when the page can't be opened.
 
@@ -158,6 +158,11 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
 - *Only in the active tab*: background tabs that start playing video are paused.
 - *Limit background tabs*: at most N background tabs play besides the active one(s). The least recently used are paused first.
 - Paused media resumes when you switch back to its tab. Options: include audio-only media, and keep picture-in-picture videos playing.
+
+**Stopped streams** (to save data)
+- ⏸ *Stop stream* on a playing video (shown on hover), next to its tab in the sidebar and the popup, or in the tab's menu: its videos pause and its media data (stream manifests and segments, media files) is held back until you resume it. ⏸ in the sidebar's footer stops every background tab's streams.
+- Firefox holds the requests (the player just waits); Chrome blocks them (session rules), and reloads the page if the player doesn't recover on resume. Live streams resume at their live edge. The page can't play a stopped video by itself; the player's own play button resumes it.
+- Optional replay (Settings → *Stopped streams*): a low-resolution loop of the video's last frames over it while stopped, from memory.
 
 **Tab list look** (the *View* menu above the list): group by workspace, domain, host, group, tag or nothing; compact one-line rows; show or hide tag and group chips. The choice is saved.
 
