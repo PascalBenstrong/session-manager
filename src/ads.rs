@@ -437,13 +437,15 @@ pub fn providers(page_url: &str, signals: &[AdSignal]) -> Vec<ProviderHit> {
         // Ad tags written into the page's code: the networks it names, and the tag hosts
         // and frames it builds (also after decoding an encoded payload).
         if s.kind == "inline" {
-            for (name, domains) in inline_matches(&s.detail, &site) {
+            let code = plain_code(&s.detail);
+            let urls = urls_in(&code);
+            for (name, domains) in inline_matches(&code, &urls, &site) {
                 let category = provider_named(name).map_or(Suspected, |p| p.category);
                 let hit = hit(&mut hits, name.to_string(), category, true);
                 hit.domains.extend(domains);
                 hit.signals.push(s.clone());
             }
-            for (name, category, domains) in inline_tags(&s.detail, &site) {
+            for (name, category, domains) in inline_tags(&urls, &site) {
                 let hit = hit(&mut hits, name, category, false);
                 hit.domains.extend(domains);
                 hit.signals.push(s.clone());
@@ -510,9 +512,9 @@ fn hit<'a>(hits: &'a mut BTreeMap<String, ProviderHit>, name: String, category: 
 /// (an ad blocker's list, a comment) is not taken for one that runs it.
 const TAG_MARKERS: &[&str] = &["http", ".js", "src=", "createelement", "window.open", "data-zone", "atob", "<iframe", "<script"];
 
-/// Networks named in a piece of page code, with the hosts of their tags found in it.
-fn inline_matches(text: &str, site: &str) -> BTreeMap<&'static str, BTreeSet<String>> {
-    let text = plain_code(text);
+/// Networks named in a piece of page code (as [`plain_code`], with its [`urls_in`]), with the
+/// hosts of their tags found in it.
+fn inline_matches(text: &str, urls: &[String], site: &str) -> BTreeMap<&'static str, BTreeSet<String>> {
     let lower = text.to_ascii_lowercase();
     let mut named: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     if !TAG_MARKERS.iter().any(|m| lower.contains(m)) {
@@ -525,8 +527,8 @@ fn inline_matches(text: &str, site: &str) -> BTreeMap<&'static str, BTreeSet<Str
             named.entry(p.name).or_default();
         }
     }
-    for u in urls_in(&text) {
-        let host = url::host(&u);
+    for u in urls {
+        let host = url::host(u);
         if host.is_empty() {
             continue;
         }
@@ -534,7 +536,7 @@ fn inline_matches(text: &str, site: &str) -> BTreeMap<&'static str, BTreeSet<Str
         if domain == site {
             continue;
         }
-        if let Some(p) = provider_for_url(&u) {
+        if let Some(p) = provider_for_url(u) {
             named.entry(p.name).or_default().insert(domain);
         }
     }
@@ -542,20 +544,19 @@ fn inline_matches(text: &str, site: &str) -> BTreeMap<&'static str, BTreeSet<Str
 }
 
 /// Third-party tag hosts and frames built by a piece of page code that no catalogue entry
-/// names: self-hosted pop-under tags and ad-server frames.
-fn inline_tags(text: &str, site: &str) -> Vec<(String, AdCategory, BTreeSet<String>)> {
-    let text = plain_code(text);
+/// names (from the [`urls_in`] it): self-hosted pop-under tags and ad-server frames.
+fn inline_tags(urls: &[String], site: &str) -> Vec<(String, AdCategory, BTreeSet<String>)> {
     let mut tags: BTreeMap<String, (AdCategory, BTreeSet<String>)> = BTreeMap::new();
-    for u in urls_in(&text) {
-        let host = url::host(&u);
+    for u in urls {
+        let host = url::host(u);
         if host.is_empty() {
             continue;
         }
         let domain = blockable_domain(&host);
-        if domain == site || provider_for_url(&u).is_some() {
+        if domain == site || provider_for_url(u).is_some() {
             continue;
         }
-        let category = if let Some(category) = ad_url_shape(&u) {
+        let category = if let Some(category) = ad_url_shape(u) {
             category
         } else if suspect_host(&host) {
             Suspected
@@ -576,7 +577,16 @@ fn plain_code(text: &str) -> String {
 fn urls_in(text: &str) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     let mut rest = text;
-    while let Some(start) = ["http://", "https://", "//"].iter().filter_map(|p| rest.find(p)).min() {
+    // Each "//", with the "http:" or "https:" right before it.
+    while let Some(slashes) = rest.find("//") {
+        let before = &rest[..slashes];
+        let start = if before.ends_with("https:") {
+            slashes - 6
+        } else if before.ends_with("http:") {
+            slashes - 5
+        } else {
+            slashes
+        };
         let tail = &rest[start..];
         let end = tail.find(|c: char| c.is_whitespace() || "\"'<>`()[]{}|".contains(c)).unwrap_or(tail.len());
         let url = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
@@ -614,6 +624,53 @@ mod tests {
 
     fn inline(code: &str) -> AdSignal {
         AdSignal { kind: "inline".into(), detail: code.into(), ..Default::default() }
+    }
+
+    /// [`urls_in`] as it was: the first of the three prefixes, looked for again each time.
+    fn urls_in_reference(text: &str) -> Vec<String> {
+        let mut out: BTreeSet<String> = BTreeSet::new();
+        let mut rest = text;
+        while let Some(start) = ["http://", "https://", "//"].iter().filter_map(|p| rest.find(p)).min() {
+            let tail = &rest[start..];
+            let end = tail.find(|c: char| c.is_whitespace() || "\"'<>`()[]{}|".contains(c)).unwrap_or(tail.len());
+            let url = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
+            if url.len() > 8 {
+                if url.starts_with("//") {
+                    out.insert(format!("https:{url}"));
+                } else {
+                    out.insert(url.to_string());
+                }
+            }
+            rest = &tail[end..];
+        }
+        out.into_iter().collect()
+    }
+
+    #[test]
+    fn urls_in_big_script() {
+        let mut script = String::new();
+        let mut i = 0;
+        while script.len() < 500 * 1024 {
+            let piece = match i % 7 {
+                0 => format!("var a{i}='https://cdn{i}.example.com/tag.js?x={i}';"),
+                1 => format!("s.src=\"//ads{i}.example.net/p/{i}\";"),
+                2 => format!("fetch(`http://api.example.org/v{i}/items`).then(r=>r.json());"),
+                3 => "// a comment, then a///triple and http:/ /not one\n".to_string(),
+                4 => format!("x=\"https:https://twice{i}.example.com/\";y='http://';"),
+                5 => format!("é ü ✓ {i} hTTp://upper{i}.example.com/ ftp://f{i}.example.com/a/b."),
+                _ => format!("if(a<b){{w.open('https://pop{i}.example.com/?q=1&r=2');}}"),
+            };
+            script.push_str(&piece);
+            i += 1;
+        }
+        let found = urls_in(&script);
+        assert_eq!(found, urls_in_reference(&script));
+        assert!(found.len() > 1000);
+        assert!(found.contains(&"https://cdn0.example.com/tag.js?x=0".to_string()));
+        assert!(found.contains(&"https://ads1.example.net/p/1".to_string()));
+        // A prefix that never appears doesn't make every step look through the rest again.
+        let plain = "x".repeat(500 * 1024) + " https://end.example.com/";
+        assert_eq!(urls_in(&plain), vec!["https://end.example.com/".to_string()]);
     }
 
     #[test]
