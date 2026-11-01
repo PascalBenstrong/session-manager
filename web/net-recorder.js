@@ -41,20 +41,39 @@
 
   const BODY_CAP = 256 * 1024;
   const KEEP = 1000; // requests and messages kept for replays
+  const KEEP_BYTES = 32 * 1024 * 1024; // their bodies and messages, in all
+  const FRAME_KEEP_MAX = 64 * 1024; // binary messages larger than this aren't kept
   let channel = null;
   let recording = true;
   const buffer = [];
   let nextId = 1;
+  // About how much memory a body or message holds.
+  const sizeOf = (b) => {
+    if (b == null) return 0;
+    if (typeof b === 'string') return b.length * 2;
+    if (b instanceof Blob) return b.size;
+    if (b instanceof ArrayBuffer || ArrayBuffer.isView(b)) return b.byteLength;
+    return 0;
+  };
   // id -> what a replay needs (insertion order: oldest first).
   const kept = new Map();
-  const keep = (id, v) => {
+  let keptBytes = 0;
+  const keep = (id, v, bytes = 0) => {
+    v.bytes = bytes;
     kept.set(id, v);
-    if (kept.size > KEEP) kept.delete(kept.keys().next().value);
+    keptBytes += bytes;
+    while (kept.size > KEEP || (keptBytes > KEEP_BYTES && kept.size > 1)) {
+      const [oldest, k] = kept.entries().next().value;
+      kept.delete(oldest);
+      keptBytes -= k.bytes;
+    }
   };
   // The request being replayed (its new record says so).
   let replaying = 0;
   // A recorded request of an earlier page being sent again (its record says so).
   let resending = false;
+  // Whether a new request is recorded (otherwise the wrappers stay out of the way).
+  const active = () => recording || replaying !== 0 || resending;
 
   const emit = (rec) => {
     if (!recording && !rec.replayOf && !rec.resent && !rec.update) return;
@@ -99,6 +118,7 @@
 
   const nativeFetch = window.fetch;
   intercept(window, 'fetch', (t, self, args) => {
+    if (!active()) return Reflect.apply(t, self, args);
     const id = nextId++;
     const replayOf = replaying;
     const [input, init] = args;
@@ -120,7 +140,7 @@
     } catch {}
     const [text, note] = typeof body === 'string' && body === '[request body]' ? [null, 'request body'] : describe(body);
     const streamed = typeof ReadableStream !== 'undefined' && body instanceof ReadableStream;
-    keep(id, { kind: 'fetch', input: input instanceof Request ? input.clone() : input, init });
+    keep(id, { kind: 'fetch', input: input instanceof Request ? input.clone() : input, init }, sizeOf(init && init.body));
     emit({ id, kind: 'fetch', method, url, reqHeaders: headers, reqBody: text, reqBodyNote: note, start: now(), stack: stack(), replayOf, resent: resending, replayable: !streamed });
     const p = Reflect.apply(t, self, args);
     Reflect.apply(then, p, [
@@ -170,6 +190,10 @@
   const replayOfXhr = new WeakMap();
   const HANDLERS = ['onreadystatechange', 'onloadstart', 'onprogress', 'onload', 'onloadend', 'onerror', 'onabort', 'ontimeout'];
   intercept(XHR, 'open', (t, self, args) => {
+    if (!active() && !replayOfXhr.has(self)) {
+      xhrMeta.delete(self);
+      return Reflect.apply(t, self, args);
+    }
     xhrMeta.set(self, { method: String(args[0] || 'GET').toUpperCase(), url: args[1], async: args.length < 3 || !!args[2], user: args[3], password: args[4], headers: [] });
     return Reflect.apply(t, self, args);
   });
@@ -188,7 +212,7 @@
       url = new URL(url, location.href).href;
     } catch {}
     const [text, note] = describe(m.body);
-    keep(id, { kind: 'xhr', xhr: self, meta: m });
+    keep(id, { kind: 'xhr', xhr: self, meta: m }, sizeOf(m.body));
     emit({ id, kind: 'xhr', method: m.method, url, reqHeaders: m.headers, reqBody: text, reqBodyNote: note, start: now(), stack: stack(), replayOf, replayable: true });
     Reflect.apply(addListener, self, [
       'loadend',
@@ -201,9 +225,20 @@
           .split(/[\r\n]+/)
           .filter(Boolean)
           .map((l) => [l.slice(0, l.indexOf(':')).trim(), l.slice(l.indexOf(':') + 1).trim()]);
+        // A replay needs only these, not the request (and its response).
+        const k = kept.get(id);
+        if (k && k.xhr === self) {
+          const snap = { withCredentials: self.withCredentials, responseType: self.responseType, timeout: self.timeout };
+          for (const h of HANDLERS) snap[h] = self[h];
+          xhrListeners.set(snap, (xhrListeners.get(self) || []).slice());
+          k.xhr = snap;
+        }
         try {
           const rt = self.responseType;
+          // Too big to show: not turned into text just to be cut.
+          const huge = +self.getResponseHeader('content-length') > BODY_CAP * 4;
           if (rt === '' || rt === 'text') done.resBody = clip(self.responseText);
+          else if ((rt === 'json' || rt === 'document') && huge) done.resBodyNote = `${rt}, ${+self.getResponseHeader('content-length')} bytes`;
           else if (rt === 'json') done.resBody = clip(stringify(self.response));
           else if (rt === 'document' && self.response) done.resBody = clip(new XMLSerializer().serializeToString(self.response));
           else done.resBodyNote = `${rt}${self.response && self.response.byteLength != null ? `, ${self.response.byteLength} bytes` : ''}`;
@@ -265,13 +300,15 @@
       new Proxy(NativeWS, {
         construct(t, args, nt) {
           const ws = Reflect.construct(t, args, nt);
-          adopt(ws, args[1], false);
+          // Made while not recording: adopted when the page sends on it while recording.
+          if (active()) adopt(ws, args[1], false);
           return ws;
         },
       }),
       NativeWS,
     );
     intercept(NativeWS.prototype, 'send', (t, self, args) => {
+      if (!active()) return Reflect.apply(t, self, args);
       if (!sockets.has(self)) adopt(self, null, true);
       frame(self, 'out', args[0], replaying);
       return Reflect.apply(t, self, args);
@@ -279,24 +316,27 @@
   }
   const frame = (ws, dir, data, replayOf) => {
     const socket = sockets.get(ws);
-    if (!socket) return;
+    if (!socket || (!recording && !replayOf)) return;
     const id = nextId++;
     const [text, note] = describe(data);
-    keep(id, { kind: 'frame', ws, dir, data });
-    emit({ id, kind: 'frame', socket, dir, method: dir === 'in' ? '↓' : '↑', url: ws.url, reqBody: text, reqBodyNote: note, start: now(), end: now(), replayOf: replayOf || 0, replayable: true });
+    const bytes = sizeOf(data);
+    const keepIt = typeof data === 'string' || bytes <= FRAME_KEEP_MAX;
+    if (keepIt) keep(id, { kind: 'frame', ws, dir, data }, bytes);
+    emit({ id, kind: 'frame', socket, dir, method: dir === 'in' ? '↓' : '↑', url: ws.url, reqBody: text, reqBodyNote: note, start: now(), end: now(), replayOf: replayOf || 0, replayable: keepIt });
   };
 
   // ---------------------------------------------------------------- sendBeacon
 
   if (navigator.sendBeacon) {
     intercept(Navigator.prototype, 'sendBeacon', (t, self, args) => {
+      if (!active()) return Reflect.apply(t, self, args);
       const id = nextId++;
       const [text, note] = describe(args[1]);
       let url = String(args[0]);
       try {
         url = new URL(url, location.href).href;
       } catch {}
-      keep(id, { kind: 'beacon', url: args[0], data: args[1] });
+      keep(id, { kind: 'beacon', url: args[0], data: args[1] }, sizeOf(args[1]));
       const ok = Reflect.apply(t, self, args);
       emit({ id, kind: 'beacon', method: 'POST', url, reqBody: text, reqBodyNote: note, start: now(), end: now(), status: ok ? 0 : -1, statusText: ok ? 'queued' : 'refused', stack: stack(), replayOf: replaying, resent: resending, replayable: true });
       return ok;
@@ -386,7 +426,10 @@
     }
     if (c.cmd === 'start') recording = true;
     else if (c.cmd === 'stop') recording = false;
-    else if (c.cmd === 'clear') kept.clear();
+    else if (c.cmd === 'clear') {
+      kept.clear();
+      keptBytes = 0;
+    }
     else if (c.cmd === 'replay') replay(c.ids || [], Math.max(0, +c.gap || 0));
   };
   // The content script says hello with the channel name; we answer on it, then send what
