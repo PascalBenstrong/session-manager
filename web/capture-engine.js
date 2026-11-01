@@ -484,7 +484,7 @@ async function cropToElement(r, stream, o) {
     if ('where' in m) where = m.where;
   };
   conn.on(onWhere);
-  r.cleanup.push(() => conn.off(onWhere));
+  r.cleanup.push(() => conn.off(onWhere), () => conn.send('unwatch'));
   const w = await conn.call('watchRect', { id: o.el });
   if (o.frame !== 0) {
     if (w.nested) throw new Error('the video is in a frame inside another frame');
@@ -493,7 +493,7 @@ async function cropToElement(r, stream, o) {
       if ('frame' in m) frameBox = m.frame;
     };
     top.on(onFrame);
-    r.cleanup.push(() => top.off(onFrame));
+    r.cleanup.push(() => top.off(onFrame), () => top.send('unwatch'));
     await top.call('watchFrame', { token: w.token });
   }
   for (let i = 0; i < 40 && !(where && frameBox && frameBox.box); i++) await sleep(50);

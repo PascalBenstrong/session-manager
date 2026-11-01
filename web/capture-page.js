@@ -265,8 +265,17 @@
     return { x: r.x + (r.width - w) / 2, y: r.y + (r.height - h) / 2, width: w, height: h };
   };
 
+  // Stops following (and greeting the top frame).
+  function unwatch(session) {
+    cancelAnimationFrame(session.follow);
+    clearInterval(session.followTimer);
+    clearInterval(session.greet);
+    session.follow = session.followTimer = session.greet = 0;
+  }
+
   // Reports where `measure()` is whenever it changes.
   function follow(session, port, measure, key) {
+    unwatch(session);
     let last = '';
     const tick = () => {
       let v = null;
@@ -387,6 +396,7 @@
       },
       watchRect: (o) => watchRect(port, session, o),
       watchFrame: (o) => watchFrame(port, session, o),
+      unwatch: () => unwatch(session),
       fetch: (o) => void fetchFor(port, session, o),
       cancel: ({ req }) => session.fetches.get(req)?.abort(),
     };
@@ -403,9 +413,7 @@
     port.onDisconnect.addListener(() => {
       if (session.recorder && session.recorder.state !== 'inactive') session.recorder.stop();
       finish(session);
-      cancelAnimationFrame(session.follow);
-      clearInterval(session.followTimer);
-      clearInterval(session.greet);
+      unwatch(session);
       for (const c of session.fetches.values()) c.abort();
     });
   });
