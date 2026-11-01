@@ -29,17 +29,22 @@ async function attachThrottle(tabId, url) {
   await api.debugger.sendCommand({ tabId }, 'Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
 }
 
+// Attaches to (or detaches from) a tab as its rules say.
+async function syncTabThrottle(tab) {
+  const url = tab.url || tab.pendingUrl || '';
+  const want = /^https?:|^file:/.test(url) && wantsThrottle(url, tab.id);
+  if (want && !tabUrls.has(tab.id)) await attachThrottle(tab.id, url).catch((e) => console.warn('[session-manager] throttle', e));
+  else if (!want && tabUrls.has(tab.id)) {
+    tabUrls.delete(tab.id);
+    await api.debugger.detach({ tabId: tab.id }).catch(() => {});
+  } else if (want) tabUrls.set(tab.id, url);
+}
+
 async function syncThrottle() {
   if (!api.debugger) return;
-  for (const tab of await api.tabs.query({})) {
-    const url = tab.url || tab.pendingUrl || '';
-    const want = /^https?:|^file:/.test(url) && wantsThrottle(url, tab.id);
-    if (want && !tabUrls.has(tab.id)) await attachThrottle(tab.id, url).catch((e) => console.warn('[session-manager] throttle', e));
-    else if (!want && tabUrls.has(tab.id)) {
-      tabUrls.delete(tab.id);
-      await api.debugger.detach({ tabId: tab.id }).catch(() => {});
-    } else if (want) tabUrls.set(tab.id, url);
-  }
+  // No rules and nothing attached: nothing to do in any tab.
+  if (!throttleRules.some((r) => r.enabled) && !tabUrls.size) return;
+  for (const tab of await api.tabs.query({})) await syncTabThrottle(tab);
 }
 
 async function loadThrottle() {
@@ -57,7 +62,8 @@ installPlatform(api, {
     api.tabs.onUpdated.addListener((tabId, change, tab) => {
       if (change.url || change.status === 'loading') {
         if (tabUrls.has(tabId)) tabUrls.set(tabId, tab.url || tabUrls.get(tabId));
-        syncThrottle().catch(() => {});
+        // Only this tab changed.
+        if (tab && (tabUrls.has(tabId) || throttleRules.some((r) => r.enabled))) syncTabThrottle(tab).catch(() => {});
       }
     });
     api.tabs.onRemoved.addListener((tabId) => tabUrls.delete(tabId));

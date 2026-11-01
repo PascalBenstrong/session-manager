@@ -1317,6 +1317,14 @@ fn schedule_strip_sync() {
 async fn sync_tab_strip() -> Result<(), String> {
     let ui = with_state(|s| s.settings.browser_ui);
     let caps = CAPS.with(|c| c.borrow().clone());
+    // Nothing shown in the tab strip (and no title preface to set or take back): the tabs
+    // needn't even be read.
+    let preface = caps.title_preface
+        && (with_state(|s| s.active_workspace.is_some() && ui.show_in_title)
+            || TITLES.with(|t| t.borrow().values().any(|v| !v.is_empty())));
+    if !(ui.hide_inactive && caps.hide_tabs && caps.hide_tabs_allowed) && !(ui.tab_groups && caps.tab_groups) && !preface {
+        return Ok(());
+    }
     let mut tabs = pf::query_tabs().await?;
     let mut opened = false;
 
