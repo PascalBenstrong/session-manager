@@ -10,7 +10,6 @@ export function tabOut(t) {
     index: t.index,
     url: t.url || t.pendingUrl || '',
     title: t.title || '',
-    favIconUrl: t.favIconUrl || null,
     pinned: !!t.pinned,
     active: !!t.active,
     discarded: !!t.discarded,
@@ -1115,7 +1114,7 @@ export function installPlatform(api, overrides = {}) {
           .then(() => api.action?.setBadgeBackgroundColor({ color: '#7c6cf6' }))
           .catch(() => {});
       });
-      const TRACKED = ['url', 'title', 'favIconUrl', 'pinned', 'discarded', 'groupId'];
+      const TRACKED = ['url', 'title', 'pinned', 'discarded', 'groupId'];
       const withGroup = (tab) => tabOutWithGroup(api, tab);
       api.runtime.onStartup?.addListener(() => fire({ type: 'browserStartup' }));
       api.tabs.onCreated.addListener((tab) => fireInOrder(async () => ({ type: 'tabCreated', tab: await withGroup(tab) })));

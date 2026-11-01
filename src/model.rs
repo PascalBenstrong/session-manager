@@ -377,7 +377,6 @@ pub struct BrowserTab {
     pub index: i64,
     pub url: String,
     pub title: String,
-    pub fav_icon_url: Option<String>,
     pub pinned: bool,
     pub active: bool,
     pub discarded: bool,
