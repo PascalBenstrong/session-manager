@@ -2,6 +2,12 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.11.1] - 2026-11-01
+
+### Improved
+- Uses less CPU and memory while you browse. Playback changes (previews, ads), title and icon updates and tab switches are saved together at most once a second instead of one by one, so open sidebars and popups update less often. Changes you see (navigating, moving a tab to a workspace, switching workspaces) are still saved right away.
+- The *Stop stream* button costs nothing on pages without a playing video, and the replay of stopped streams copies at most 10 frames a second, only of the biggest playing video and only while its tab is shown.
+
 ## [0.11.0] - 2026-11-01
 
 ### New

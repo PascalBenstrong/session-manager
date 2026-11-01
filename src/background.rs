@@ -42,6 +42,8 @@ thread_local! {
     /// When this background instance started.
     static STARTED_AT: Cell<f64> = const { Cell::new(0.0) };
     static STRIP_GENERATION: Cell<u32> = const { Cell::new(0) };
+    /// A save is scheduled (see schedule_persist).
+    static PERSIST_PENDING: Cell<bool> = const { Cell::new(false) };
     /// A tab strip sync is running / another one was asked for meanwhile.
     static STRIP_RUNNING: Cell<bool> = const { Cell::new(false) };
     static STRIP_AGAIN: Cell<bool> = const { Cell::new(false) };
@@ -288,8 +290,19 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             if url_changed && prevent_duplicate(&tab, now).await {
                 return Ok(JsValue::UNDEFINED);
             }
-            if with_state(|s| s.on_tab_upsert(&tab, now)) {
-                persist().await;
+            let workspace = |s: &AppState| s.locate_tab(tab.id).and_then(|r| s.entry(r)).map(|e| e.workspace);
+            let (changed, moved) = with_state(|s| {
+                let before = workspace(s);
+                let changed = s.on_tab_upsert(&tab, now);
+                (changed, changed && workspace(s) != before)
+            });
+            if changed {
+                if url_changed || moved {
+                    persist().await;
+                } else {
+                    // Titles, icons, loading: frequent, saved together.
+                    schedule_persist();
+                }
                 if url_changed {
                     schedule_auto_organize();
                 }
@@ -303,8 +316,16 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             sync_stream_holds().await;
         }
         Event::TabActivated { tab_id } => {
-            if with_state(|s| s.on_tab_activated(tab_id, now)) {
+            let (changed, switched) = with_state(|s| {
+                let before = s.active_workspace;
+                let changed = s.on_tab_activated(tab_id, now);
+                (changed, s.active_workspace != before)
+            });
+            // A new current workspace shows right away; the time of use can wait.
+            if switched {
                 persist().await;
+            } else if changed {
+                schedule_persist();
             }
             enforce_media().await;
             schedule_strip_sync();
@@ -324,7 +345,8 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
             // Tracked also without the media limit: the sidebar shows it, and stops streams.
             let report = MediaReport { playing, video, pip };
             if with_state(|s| s.media.report(tab_id, frame_id, report, now)) {
-                persist().await;
+                // Playback changes often (previews, ads): saved at most once a second.
+                schedule_persist();
                 enforce_media().await;
             }
         }
@@ -1085,10 +1107,11 @@ async fn sync_stream_config() {
 /// Pauses background media beyond the limit, and resumes media we paused in tabs that
 /// became active again.
 async fn enforce_media() {
-    let (settings, media) = with_state(|s| (s.settings.media, s.media.clone()));
-    if !settings.enabled() || media.is_empty() {
+    let settings = with_state(|s| s.settings.media);
+    if !settings.enabled() || with_state(|s| s.media.is_empty()) {
         return;
     }
+    let media = with_state(|s| s.media.clone());
     let tabs = match pf::query_tabs().await {
         Ok(t) => t,
         Err(e) => return log(&format!("could not query tabs: {e}")),
@@ -1114,6 +1137,19 @@ fn workspace_of(s: &AppState, t: &BrowserTab) -> Option<Id> {
 }
 
 /// Debounced [`sync_tab_strip`]; a run asked for while one runs follows it.
+/// Saves the state soon, once for all the changes made meanwhile (for frequent changes
+/// that don't need saving right away).
+fn schedule_persist() {
+    if PERSIST_PENDING.with(|p| p.replace(true)) {
+        return;
+    }
+    spawn_local(async {
+        pf::sleep(1000).await;
+        PERSIST_PENDING.with(|p| p.set(false));
+        persist().await;
+    });
+}
+
 fn schedule_strip_sync() {
     if STRIP_RUNNING.with(|r| r.get()) {
         STRIP_AGAIN.with(|a| a.set(true));

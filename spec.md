@@ -2,7 +2,7 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.11.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.11.1. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
@@ -46,7 +46,7 @@ Version: 0.11.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Optionally allow media to play only in the active tab (of each window), or in at most N background tabs besides the active ones. When there are more, the least recently used background tabs are paused.
 - Media paused this way resumes when its tab becomes active (configurable).
 - Only video counts by default; audio can be included. Picture-in-picture video can keep playing.
-- Stopped streams: a tab's streams can be stopped (a button over playing videos, the sidebar, the popup) and resumed. Stopping pauses its media and holds back its media data (by URL: stream manifests, segments, media files; or by response content type). Firefox: blocking webRequest listeners answer when resumed. Chrome: declarativeNetRequest session rules block them. On resume, live streams seek to the live edge, and a page whose playback doesn't recover is reloaded (at most once a minute). A new page in the tab starts with its data flowing. Optionally, a low-resolution loop of the video's last frames (resolution, frame count) shows over the stopped video.
+- Stopped streams: a tab's streams can be stopped (a button over playing videos, the sidebar, the popup) and resumed. Stopping pauses its media and holds back its media data (by URL: stream manifests, segments, media files; or by response content type). Firefox: blocking webRequest listeners answer when resumed. Chrome: declarativeNetRequest session rules block them. On resume, live streams seek to the live edge, and a page whose playback doesn't recover is reloaded (at most once a minute). A new page in the tab starts with its data flowing. Optionally, a low-resolution loop of the video's last frames (resolution, frame count; copied at most 10 times a second, from the biggest playing video of a frame, while its tab is shown) shows over the stopped video.
 
 ## Page guards
 - Guards run inside pages (the page's own world, at document start, in every frame) before the pages' own scripts. Each can be turned on or off, and a list of sites (with subdomains) is left alone.

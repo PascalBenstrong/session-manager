@@ -14,6 +14,10 @@
   const elements = () => document.querySelectorAll('video, audio');
   const isPlaying = (m) => !m.paused && !m.ended;
   const isVideo = (m) => m instanceof HTMLVideoElement;
+  // Videos playing in this frame (kept from their events: nothing to look up otherwise).
+  const playingVideos = new Set();
+  document.addEventListener('playing', (e) => isVideo(e.target) && playingVideos.add(e.target), true);
+  for (const type of ['pause', 'ended', 'emptied']) document.addEventListener(type, (e) => playingVideos.delete(e.target), true);
 
   function message(msg) {
     try {
@@ -251,6 +255,8 @@
   addEventListener(
     'pointermove',
     (e) => {
+      // Nothing to do in pages (and frames) without a playing or stopped video.
+      if (!playingVideos.size && !stoppedByUs.size) return;
       pointer = [e.clientX, e.clientY];
       if (!frame) frame = requestAnimationFrame(hoverCheck);
     },
@@ -260,8 +266,8 @@
     frame = 0;
     if (!pointer) return;
     const [x, y] = pointer;
-    for (const v of document.querySelectorAll('video')) {
-      if (!candidate(v)) continue;
+    for (const v of new Set([...playingVideos, ...stoppedByUs])) {
+      if (!isVideo(v) || !v.isConnected || !candidate(v)) continue;
       const r = rectOf(v);
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return showOver(v, !stopped);
     }
@@ -288,6 +294,10 @@
     }
     if (config.replay) for (const v of document.querySelectorAll('video')) if (isPlaying(v)) capture(v);
   }
+  // A video that's done (emptied) lets its frames go.
+  document.addEventListener('emptied', (e) => capturing.delete(e.target) && rings.delete(e.target), true);
+  // Copies: at most 10 a second, of the biggest playing video of the frame, while shown.
+  const REPLAY_GAP_MS = 100;
   try {
     const got = api.storage && api.storage.local.get('smStreamConfig');
     if (got && got.then) got.then((r) => r && r.smStreamConfig && applyConfig(r.smStreamConfig)).catch(() => {});
@@ -300,12 +310,14 @@
   function capture(v) {
     if (capturing.has(v) || !v.requestVideoFrameCallback) return;
     capturing.add(v);
-    const ring = { frames: [], next: 0 };
+    const ring = { frames: [], next: 0, last: 0 };
     rings.set(v, ring);
     const grab = (now) => {
       if (!capturing.has(v) || !config.replay) return capturing.delete(v);
       try {
-        if (v.videoWidth && v.videoHeight && bigEnough(rectOf(v))) {
+        const due = now - ring.last >= REPLAY_GAP_MS && !document.hidden;
+        if (due && v.videoWidth && v.videoHeight && bigEnough(rectOf(v)) && (playingVideos.size < 2 || mainVideo([...playingVideos]) === v)) {
+          ring.last = now;
           const h = Math.min(config.replayHeight, v.videoHeight);
           const w = Math.max(1, Math.round((v.videoWidth * h) / v.videoHeight));
           const n = config.replayFrames;
@@ -357,7 +369,7 @@
         ctx.fillRect(0, 0, replayCanvas.width, replayCanvas.height);
         ctx.drawImage(f, (replayCanvas.width - w) / 2, (replayCanvas.height - h) / 2, w, h);
         i++;
-        replayTimer = setTimeout(draw, step);
+        replayTimer = setTimeout(draw, document.hidden ? 1000 : step);
       };
       draw();
     } catch {}
