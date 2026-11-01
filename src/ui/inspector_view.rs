@@ -570,7 +570,10 @@ impl InspectorView {
         if !self.restored || key == self.saved {
             return;
         }
-        let wait = 400.0 - (pf::now() - self.last_save);
+        // While recording, the log changes all the time: saving it (up to 800 requests) is
+        // done less often then.
+        let gap = if (key.1, key.2) == (self.saved.1, self.saved.2) { 2000.0 } else { 400.0 };
+        let wait = gap - (pf::now() - self.last_save);
         if wait > 0.0 {
             self.ctx.request_repaint_after(std::time::Duration::from_millis(wait as u64 + 1));
             return;

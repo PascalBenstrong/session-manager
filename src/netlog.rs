@@ -3,13 +3,20 @@
 //! partial updates with the same id (`"update": true`). Throttle rules are applied by the
 //! background (`throttleRuleFor` in `web/platform-common.js`, which this module mirrors).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Entries kept (oldest dropped first).
 pub const MAX_ENTRIES: usize = 5000;
+
+/// Request and response bodies kept in all, in bytes (those of the oldest entries are
+/// dropped first).
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The note of a body dropped to keep the log within [`MAX_BODY_BYTES`].
+const BODY_DROPPED: &str = "not kept (the log keeps only the latest bodies)";
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
@@ -129,9 +136,14 @@ impl NetEntry {
 /// The records of a page, merged by id, in the order they started.
 #[derive(Default)]
 pub struct NetLog {
+    /// The records as received, without their bodies (those are only in `entries`).
     raw: HashMap<u64, Map<String, Value>>,
-    pub entries: Vec<NetEntry>,
+    pub entries: VecDeque<NetEntry>,
+    /// Where each entry is, counting the ones dropped (`base` of them so far).
     index: HashMap<u64, usize>,
+    base: usize,
+    /// The size of the bodies in `entries`.
+    body_bytes: usize,
     /// Replays finished (the recorder reports each "replay all").
     pub replays_done: usize,
     /// Bumped on every change to the entries.
@@ -144,7 +156,7 @@ impl NetLog {
     }
 
     pub fn get(&self, id: u64) -> Option<&NetEntry> {
-        self.index.get(&id).map(|i| &self.entries[*i])
+        self.index.get(&id).map(|i| &self.entries[*i - self.base])
     }
 
     /// Adds the records of a page's `doc`ument (1, 2... for each page loaded in the tab):
@@ -176,6 +188,7 @@ impl NetLog {
                 continue;
             }
             let update = rec.remove("update").and_then(|v| v.as_bool()).unwrap_or(false);
+            let bodies = [rec.remove("reqBody"), rec.remove("resBody")];
             let merged = match self.raw.get_mut(&id) {
                 Some(m) => {
                     m.extend(rec);
@@ -189,46 +202,83 @@ impl NetLog {
             };
             let Ok(mut entry) = serde_json::from_value::<NetEntry>(Value::Object(merged)) else { continue };
             entry.search = format!("{} {} {} {} {}", entry.url, entry.method, entry.kind, entry.status, entry.mime).to_lowercase();
+            let old = self.index.get(&id).map(|i| &mut self.entries[*i - self.base]);
+            let [req, res] = bodies;
+            // A body comes once; updates without it keep it.
+            let (old_req, old_res) = match old {
+                Some(o) => {
+                    self.body_bytes -= body_len(o);
+                    (o.req_body.take(), o.res_body.take())
+                }
+                None => (None, None),
+            };
+            entry.req_body = match req {
+                Some(v) => v.as_str().map(String::from),
+                None => old_req,
+            };
+            entry.res_body = match res {
+                Some(v) => v.as_str().map(String::from),
+                None => old_res,
+            };
+            self.body_bytes += body_len(&entry);
             match self.index.get(&id) {
-                Some(i) => self.entries[*i] = entry,
+                Some(i) => self.entries[*i - self.base] = entry,
                 None => {
-                    self.index.insert(id, self.entries.len());
-                    self.entries.push(entry);
+                    self.index.insert(id, self.base + self.entries.len());
+                    self.entries.push_back(entry);
                 }
             }
         }
-        if self.entries.len() > MAX_ENTRIES {
-            let drop = self.entries.len() - MAX_ENTRIES;
-            for e in self.entries.drain(..drop) {
-                self.raw.remove(&e.id);
-            }
-            self.index = self.entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+        while self.entries.len() > MAX_ENTRIES {
+            let Some(e) = self.entries.pop_front() else { break };
+            self.base += 1;
+            self.body_bytes -= body_len(&e);
+            self.raw.remove(&e.id);
+            self.index.remove(&e.id);
         }
+        // Over the budget: the oldest bodies go first.
+        let mut bytes = self.body_bytes;
+        for e in self.entries.iter_mut() {
+            if bytes <= MAX_BODY_BYTES {
+                break;
+            }
+            for (body, note) in [(&mut e.req_body, &mut e.req_body_note), (&mut e.res_body, &mut e.res_body_note)] {
+                if let Some(b) = body.take() {
+                    bytes -= b.len();
+                    if note.is_empty() {
+                        *note = BODY_DROPPED.into();
+                    }
+                }
+            }
+        }
+        self.body_bytes = bytes;
     }
 
     /// The latest `limit` records (bodies cut to `body_cap` characters), to restore the
     /// log later with [`NetLog::import`].
     pub fn export(&self, limit: usize, body_cap: usize) -> Vec<Value> {
         let from = self.entries.len().saturating_sub(limit);
-        self.entries[from..]
-            .iter()
-            .filter_map(|e| self.raw.get(&e.id))
-            .map(|m| {
+        self.entries
+            .range(from..)
+            .filter_map(|e| self.raw.get(&e.id).map(|m| (e, m)))
+            .map(|(e, m)| {
                 let mut m = m.clone();
-                for key in ["reqBody", "resBody"] {
-                    if let Some(Value::String(b)) = m.get_mut(key)
-                        && b.len() > body_cap
-                    {
+                for (key, body) in [("reqBody", &e.req_body), ("resBody", &e.res_body)] {
+                    let Some(b) = body else { continue };
+                    let b = if b.len() > body_cap {
                         let mut cut = body_cap;
                         while !b.is_char_boundary(cut) {
                             cut -= 1;
                         }
-                        b.truncate(cut);
-                        b.push_str(
-                            "
+                        format!(
+                            "{}
 … (cut when the inspector was restored)",
-                        );
-                    }
+                            &b[..cut]
+                        )
+                    } else {
+                        b.clone()
+                    };
+                    m.insert(key.into(), Value::String(b));
                 }
                 Value::Object(m)
             })
@@ -262,6 +312,10 @@ impl NetLog {
             .map(|(i, _)| i)
             .collect()
     }
+}
+
+fn body_len(e: &NetEntry) -> usize {
+    e.req_body.as_ref().map_or(0, String::len) + e.res_body.as_ref().map_or(0, String::len)
 }
 
 /// Requests of a site's pages held back before they go out (after reloads too).
@@ -462,6 +516,22 @@ mod tests {
         assert!(log.get(5).is_none() && log.get(11).is_some());
         log.apply(vec![json!({ "update": true, "id": 12, "status": 204 })]);
         assert_eq!(log.get(12).unwrap().status, 204);
+    }
+
+    #[test]
+    fn bodies_bounded() {
+        let mut log = NetLog::default();
+        let body = "x".repeat(MAX_BODY_BYTES / 4);
+        log.apply((1..=6).map(|i| json!({ "id": i, "kind": "fetch", "url": "u", "resBody": body })).collect());
+        let kept: Vec<bool> = log.entries.iter().map(|e| e.res_body.is_some()).collect();
+        assert_eq!(kept, vec![false, false, true, true, true, true]);
+        assert_eq!(log.entries[0].res_body_note, BODY_DROPPED);
+        assert_eq!(log.body_bytes, 4 * body.len());
+        // Updates keep the body, or replace it.
+        log.apply(vec![json!({ "update": true, "id": 6, "status": 200 }), json!({ "update": true, "id": 5, "resBody": "y" })]);
+        assert_eq!(log.get(6).unwrap().res_body.as_ref().map(String::len), Some(body.len()));
+        assert_eq!((log.get(6).unwrap().status, log.get(5).unwrap().res_body.as_deref()), (200, Some("y")));
+        assert_eq!(log.body_bytes, 3 * body.len() + 1);
     }
 
     #[test]
