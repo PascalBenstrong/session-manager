@@ -2,7 +2,7 @@
 //! ↑/↓ to move, Enter (or click) to jump to a tab, Esc to close. Also clears the
 //! cookies / site data of the current tab or of any open tab in the list.
 
-use std::collections::HashMap;
+use std::rc::Rc;
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Key, Layout, Margin, Modifiers, RichText, Sense, Stroke, UiBuilder};
 
@@ -26,7 +26,13 @@ pub struct MiniView {
     /// Reload a tab after clearing its site data, so the page reflects it.
     reload_after_clean: bool,
     search: Search,
+    /// The tabs listed (positions in the state's sessions, sorted) and how many there are in
+    /// all, for (state generation, all sessions, viewed session, search results).
+    listed: super::Cached<(u64, bool, Id, Option<u64>), Rc<Listed>>,
 }
+
+/// Where the tabs listed are in the state's sessions (sorted), and how many there are in all.
+type Listed = (Vec<(usize, usize)>, usize);
 
 impl Default for MiniView {
     fn default() -> Self {
@@ -37,6 +43,7 @@ impl Default for MiniView {
             focused_once: false,
             reload_after_clean: true,
             search: Search::local(),
+            listed: None,
         }
     }
 }
@@ -46,21 +53,40 @@ impl MiniView {
         let p = theme::palette(ui);
         let (hits, error) = self.search.run(ui.ctx(), cx.state, &self.query, &SearchOptions::default(), None);
 
-        let mut owner: HashMap<Id, Id> = HashMap::new();
-        let mut matched: Vec<&TabEntry> = Vec::new();
-        let mut total = 0;
-        for s in cx.state.sessions.iter().filter(|s| self.all_sessions || s.id == cx.viewed) {
-            for e in &s.entries {
-                total += 1;
-                owner.insert(e.id, s.id);
-                if hits.contains(e.id) {
-                    matched.push(e);
+        let sessions = &cx.state.sessions;
+        let key = (super::state_generation(), self.all_sessions, cx.viewed, hits.version());
+        let listed = match &self.listed {
+            Some((k, listed)) if *k == key => listed.clone(),
+            _ => {
+                let mut rows: Vec<(usize, usize)> = Vec::new();
+                let mut total = 0;
+                for (si, s) in sessions.iter().enumerate().filter(|(_, s)| self.all_sessions || s.id == cx.viewed) {
+                    for (ei, e) in s.entries.iter().enumerate() {
+                        total += 1;
+                        if hits.contains(e.id) {
+                            rows.push((si, ei));
+                        }
+                    }
                 }
+                // Open tabs first, then most recently used.
+                let at = |&(si, ei): &(usize, usize)| &sessions[si].entries[ei];
+                rows.sort_by(|a, b| {
+                    let (a, b) = (at(a), at(b));
+                    b.is_open().cmp(&a.is_open()).then(b.last_accessed.total_cmp(&a.last_accessed))
+                });
+                let listed = Rc::new((rows, total));
+                self.listed = Some((key, listed.clone()));
+                listed
             }
-        }
-        // Open tabs first, then most recently used.
-        matched.sort_by(|a, b| b.is_open().cmp(&a.is_open()).then(b.last_accessed.total_cmp(&a.last_accessed)));
-        let entry_ref = |e: &TabEntry| EntryRef { session: owner[&e.id], entry: e.id };
+        };
+        let (rows, total) = (&listed.0, listed.1);
+        let matched: Vec<(EntryRef, &TabEntry)> = rows
+            .iter()
+            .map(|&(si, ei)| {
+                let (s, e) = (&sessions[si], &sessions[si].entries[ei]);
+                (EntryRef { session: s.id, entry: e.id }, e)
+            })
+            .collect();
 
         // Keyboard navigation (consumed before the text field sees the keys).
         let (down, up, enter, escape) = ui.input_mut(|i| {
@@ -79,8 +105,8 @@ impl MiniView {
             self.selected = self.selected.saturating_sub(1);
         }
         self.selected = self.selected.min(matched.len().saturating_sub(1));
-        if enter && let Some(e) = matched.get(self.selected) {
-            acts.open_and_close(entry_ref(e));
+        if enter && let Some((r, _)) = matched.get(self.selected) {
+            acts.open_and_close(*r);
         }
         if escape {
             acts.close_popup();
@@ -135,8 +161,7 @@ impl MiniView {
                 }
                 return;
             }
-            for (i, e) in matched.iter().enumerate() {
-                let r = entry_ref(e);
+            for (i, &(r, e)) in matched.iter().enumerate() {
                 let session_name = self.all_sessions.then(|| cx.state.session(r.session).map(|s| s.name.as_str()).unwrap_or(""));
                 let resp = row(ui, cx, e, r, i == self.selected, session_name, self.reload_after_clean, acts);
                 if i == self.selected && moved {

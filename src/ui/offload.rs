@@ -62,14 +62,23 @@ pub async fn parse_import(text: String) -> Result<Imported, String> {
 pub enum Hits<'a> {
     /// No search: every entry.
     All,
-    Only(&'a HashSet<Id>),
+    /// These entries; the number changes whenever the results do.
+    Only(&'a HashSet<Id>, u64),
 }
 
 impl Hits<'_> {
     pub fn contains(&self, id: Id) -> bool {
         match self {
             Hits::All => true,
-            Hits::Only(ids) => ids.contains(&id),
+            Hits::Only(ids, _) => ids.contains(&id),
+        }
+    }
+
+    /// What identifies these results: they're the same while it is.
+    pub fn version(&self) -> Option<u64> {
+        match self {
+            Hits::All => None,
+            Hits::Only(_, v) => Some(*v),
         }
     }
 }
@@ -85,6 +94,8 @@ pub struct Search {
     /// What the results shown are for.
     shown: Option<SearchRequest>,
     ids: HashSet<Id>,
+    /// Bumped whenever `ids` change.
+    version: u64,
     /// Sent to the worker, not answered yet.
     asked: Option<SearchRequest>,
     answer: Answer,
@@ -146,12 +157,13 @@ impl Search {
                 self.show(req, ids);
             }
         }
-        (Hits::Only(&self.ids), error)
+        (Hits::Only(&self.ids, self.version), error)
     }
 
     fn show(&mut self, req: SearchRequest, ids: HashSet<Id>) {
         self.shown = Some(req);
         self.ids = ids;
+        self.version += 1;
     }
 
     fn ask(&mut self, ctx: &egui::Context, state: &AppState, req: SearchRequest) {
