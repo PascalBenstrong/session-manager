@@ -1297,7 +1297,6 @@ fn persist_soon() {
 }
 
 /// Debounced [`sync_tab_strip`]; a run asked for while one runs follows it.
-
 fn schedule_strip_sync() {
     if STRIP_RUNNING.with(|r| r.get()) {
         STRIP_AGAIN.with(|a| a.set(true));

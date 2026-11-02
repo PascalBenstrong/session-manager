@@ -183,12 +183,18 @@ impl Actions {
     }
 }
 
+/// Something computed from inputs `K`, kept until they change.
+pub(crate) type Cached<K, V> = Option<(K, V)>;
+
+/// Duplicates found in the state shown, by scope and options.
+type DuplicatesFound = Vec<((Scope, DedupeOptions), Rc<Vec<DuplicateGroup>>)>;
+
 thread_local! {
     /// Bumped whenever another state is shown (its revision can stay the same: replies to
     /// commands carry changes not saved yet). Keys what is computed from the state.
     static STATE_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// Duplicates found in the state shown, by scope and options (see [`duplicates`]).
-    static DUPLICATES: RefCell<(u64, Vec<((Scope, DedupeOptions), Rc<Vec<DuplicateGroup>>)>)> = const { RefCell::new((0, Vec::new())) };
+    static DUPLICATES: RefCell<(u64, DuplicatesFound)> = const { RefCell::new((0, Vec::new())) };
 }
 
 /// The generation of the state shown (see `STATE_GENERATION`).
@@ -987,7 +993,7 @@ impl App {
         let wide = !self.popup && ui.available_width() >= WIDE_LAYOUT;
 
         if self.popup || self.sidebar {
-            let acts = if self.popup { self.popup_ui(ui, &state, &session) } else { self.sidebar_ui(ui, &state) };
+            let acts = if self.popup { self.popup_ui(ui, &state, session) } else { self.sidebar_ui(ui, &state) };
             self.apply(acts);
             self.confirm_modal(ui);
             self.toast(&ui.ctx().clone(), dark);
@@ -1004,9 +1010,9 @@ impl App {
             egui::Panel::top("header")
                 .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 24, right: 24, top: 18, bottom: 10 }))
                 .show_separator_line(false)
-                .show(ui, |ui| self.session_header(ui, &state, &session));
+                .show(ui, |ui| self.session_header(ui, &state, session));
         } else {
-            egui::Panel::top("header").frame(chrome).show(ui, |ui| self.compact_header(ui, &state, &session));
+            egui::Panel::top("header").frame(chrome).show(ui, |ui| self.compact_header(ui, &state, session));
         }
 
         let mut acts = Actions::default();

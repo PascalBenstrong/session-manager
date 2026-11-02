@@ -213,7 +213,7 @@ pub struct InspectorView {
     res_groups: Option<(String, Rc<ResourceGroups>)>,
     ads: Option<Rc<Vec<AdSignal>>>,
     /// The ad networks found, for (the page, the state revision).
-    ad_hits: Option<((String, Option<u64>), Rc<Vec<ProviderHit>>)>,
+    ad_hits: super::Cached<(String, Option<u64>), Rc<Vec<ProviderHit>>>,
     source: Option<Rc<Vec<String>>>,
     source_query: String,
     /// The source lines matching `source_query`.

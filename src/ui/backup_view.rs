@@ -52,7 +52,7 @@ pub struct BackupView {
     csv_cache: Option<(String, usize, transfer::UrlList)>,
     /// Tabs added and removed since each snapshot (they don't change once taken), for
     /// (session, state generation).
-    snapshot_diffs: Option<((Id, u64), HashMap<Id, (usize, usize)>)>,
+    snapshot_diffs: super::Cached<(Id, u64), HashMap<Id, (usize, usize)>>,
     parsed_for: String,
     parsed: Option<Result<Imported, String>>,
     /// Numbers the texts sent to the worker: only the answer for the latest one is kept.

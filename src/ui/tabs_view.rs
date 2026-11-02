@@ -151,13 +151,16 @@ pub struct TabsView {
     order: Vec<EntryRef>,
     prev_order: Vec<EntryRef>,
     /// The rule being typed, checked: how many saved tabs it matches, or why it's invalid.
-    rule_check: Option<((RuleKind, String, u64), Result<usize, String>)>,
+    rule_check: super::Cached<(RuleKind, String, u64), Result<usize, String>>,
     /// The open workspace's tabs: (closed ones in the viewed session, loaded, all), for
     /// (workspace, viewed session, state generation).
-    ws_counts: Option<((Id, Id, u64), (Vec<EntryRef>, usize, usize))>,
+    ws_counts: super::Cached<(Id, Id, u64), WorkspaceCounts>,
     /// The session of each entry listed, for (state generation, all sessions, viewed session).
-    owners: Option<((u64, bool, Id), Rc<HashMap<Id, Id>>)>,
+    owners: super::Cached<(u64, bool, Id), Rc<HashMap<Id, Id>>>,
 }
+
+/// A workspace's tabs: the closed ones in the viewed session, how many are loaded, and all.
+type WorkspaceCounts = (Vec<EntryRef>, usize, usize);
 
 impl TabsView {
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
