@@ -2,6 +2,20 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.11.5] - 2026-11-02
+
+### Changed
+- The manager, sidebar, popup and inspector use less CPU and memory with many tabs: they no longer copy all your sessions, or redo searches, duplicate checks and sorting, on every redraw.
+- Closing or opening many tabs at once saves once instead of once per tab.
+- The inspector's Network view stays fast with thousands of requests. Very long bodies, and very long HTML or text in the Elements view, show their first 50 KB (copying still gives all of it). The log keeps the latest 64 MB of bodies; older ones are dropped, with a note.
+- The network recorder does no work while it isn't recording, and keeps a bounded amount for replays (binary WebSocket messages over 64 KB can't be replayed).
+- Firefox: script files pass through the debugger filter as they load, instead of being held until their last byte.
+- Cookie cleanup rules that run "whenever a new value is set" cost almost nothing when there are none.
+
+### Fixed
+- Cropped tab recordings, frames in pages and the inspector's highlight kept running work in the page after they were done.
+- Replaying a stopped stream only copies frames of live streams, not of every playing video.
+
 ## [0.11.4] - 2026-11-01
 
 ### Changed
