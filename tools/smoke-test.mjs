@@ -12,7 +12,7 @@ const browserName = process.argv[2] || 'firefox';
 const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', browserName);
 
 const {
-  api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, titlePrefaces, contentScripts, dnr,
+  api, tabs, cookies, storage, alarms, removedSiteData, reloaded, pageScripts, tabMessages, groups, titlePrefaces, contentScripts, dnr,
   createdWindows, requestListeners, headerListeners, dnrSession, filters, ev, clone,
 } = createMockBrowser();
 globalThis.browser = api;
@@ -337,28 +337,58 @@ await step('prevent duplicates: switch to the open copy, adopt the unloaded one'
   await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, prevent_duplicates: false } });
 });
 
-await step('clear cookies & site data of the current tab / a given tab', async () => {
+await step('clear the whole site of the current tab / a given tab, inside its open tabs too', async () => {
   for (const t of tabs.values()) t.active = false;
   const cur = await api.tabs.create({ url: 'https://www.shop.example/cart', active: true });
+  const sameSite = await api.tabs.create({ url: 'https://m.shop.example/item' });
+  const asleep = await api.tabs.create({ url: 'https://shop.example/' });
+  tabs.get(asleep.id).discarded = true;
   const other = await api.tabs.create({ url: 'https://news.example/' });
   cookies.push(
     { name: 'sid', domain: '.shop.example', path: '/', secure: true },
     { name: 'pref', domain: 'www.shop.example', path: '/', secure: true },
+    { name: 'm', domain: 'm.shop.example', path: '/', secure: true },
+    { name: 'ad', domain: 'ads.example', path: '/', secure: true, partitionKey: { topLevelSite: 'https://shop.example' } },
     { name: 'n', domain: 'news.example', path: '/', secure: true },
   );
-  const r = await send({ cmd: 'ClearTabData', tab: null, data_types: { cookies: true, cache: true, localStorage: true, indexedDb: true, serviceWorkers: true }, reload: true });
-  assert.equal(r.report.cookies_removed, 2);
-  assert.deepEqual(r.report.hosts, ['www.shop.example']);
+  const all = { cookies: true, cache: true, localStorage: true, indexedDb: true, serviceWorkers: true };
+  reloaded.length = 0;
+  pageScripts.length = 0;
+  const r = await send({ cmd: 'ClearTabData', tab: null, data_types: all, reload: true });
+  assert.ok(r.ok, r.error);
+  assert.equal(r.report.cookies_removed, 4, 'the site, its subdomains and its third-party cookies');
+  assert.ok(r.report.hosts.includes('shop.example') && r.report.hosts.includes('m.shop.example') && r.report.hosts.includes('www.shop.example'));
+  assert.ok(!r.report.hosts.some((h) => h.includes('news')));
   assert.ok(cookies.some((c) => c.name === 'n'), 'other sites untouched');
-  assert.deepEqual(reloaded, [cur.id]);
-  assert.equal(stored().cleanup_log[0].label, 'Tab: www.shop.example');
+  // Loaded tabs of the site: locked in the page's world, cleared, then reloaded.
+  const scripted = (func) => pageScripts.filter((s) => s.func === func).map((s) => s.tabId).sort();
+  assert.deepEqual(scripted('lockFrameData'), [cur.id, sameSite.id].sort());
+  assert.ok(pageScripts.filter((s) => s.func === 'lockFrameData').every((s) => s.world === 'MAIN'));
+  assert.deepEqual(scripted('clearFrameData'), [cur.id, sameSite.id].sort());
+  assert.ok(pageScripts.filter((s) => s.func === 'clearFrameData').every((s) => s.world === 'ISOLATED' && s.args[0].localStorage));
+  assert.deepEqual(reloaded.sort(), [cur.id, sameSite.id].sort());
+  assert.equal(r.report.pages_cleared, 2);
+  assert.equal(r.report.pages_reloaded, 2);
+  assert.equal(stored().cleanup_log[0].label, 'Site: shop.example');
 
-  // a specific tab, cookies only, no reload
+  // a specific tab, cookies only, no reload: cleared inside, nothing locked or reloaded
   const before = removedSiteData.length;
+  pageScripts.length = 0;
   const r2 = await send({ cmd: 'ClearTabData', tab: other.id, data_types: { cookies: true, cache: false, localStorage: false, indexedDb: false, serviceWorkers: false }, reload: false });
   assert.equal(r2.report.cookies_removed, 1);
   assert.equal(removedSiteData.length, before, 'no site data removal for cookies only');
-  assert.deepEqual(reloaded, [cur.id]);
+  assert.deepEqual(reloaded.sort(), [cur.id, sameSite.id].sort());
+  assert.deepEqual(pageScripts.map((s) => [s.tabId, s.func]), [[other.id, 'clearFrameData']]);
+
+  // a manual "all domains" run clears inside every loaded web page, without reloading
+  pageScripts.length = 0;
+  const r3 = await send({ cmd: 'RunCleanup', label: 'All domains', spec: { target: 'AllDomains', data_types: all, exclude: [] } });
+  assert.ok(r3.ok, r3.error);
+  assert.ok(pageScripts.every((s) => s.func === 'clearFrameData'));
+  assert.ok([cur.id, sameSite.id, other.id].every((id) => pageScripts.some((s) => s.tabId === id)));
+  assert.ok(!pageScripts.some((s) => s.tabId === asleep.id), 'hibernated tabs are left asleep');
+  assert.deepEqual(reloaded.sort(), [cur.id, sameSite.id].sort());
+  await api.tabs.remove([sameSite.id, asleep.id]);
 
   const internal = await api.tabs.create({ url: 'about:blank' });
   const bad = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'ClearTabData', tab: internal.id, data_types: {}, reload: false })));

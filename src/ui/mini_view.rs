@@ -8,7 +8,7 @@ use eframe::egui::{self, Align, Color32, CursorIcon, Key, Layout, Margin, Modifi
 
 use super::offload::Search;
 use super::theme;
-use super::widgets::{ChipKind, avatar, chip, empty_state, icon_button, status_dot, tab_state_color, ws_color};
+use super::widgets::{ChipKind, avatar, chip, empty_state, icon_button, primary_button, status_dot, tab_state_color, ws_color};
 use super::{Actions, ViewCtx};
 use crate::cleanup::DataTypes;
 use crate::hibernate::HibernateTarget;
@@ -112,6 +112,24 @@ impl MiniView {
             acts.close_popup();
         }
 
+        // One click: the current tab's whole site, in all its open tabs.
+        ui.horizontal(|ui| {
+            let reload = if self.reload_after_clean { " and reloads its tabs" } else { "" };
+            if ui
+                .add(primary_button(ui, "🧹 Clear this site's data"))
+                .on_hover_text(format!(
+                    "Removes the cookies, local & session storage, IndexedDB, cache and service workers of the                      current tab's site and all its subdomains, also from inside its open tabs{reload}.                      You will be logged out of it.
+
+More options: 🧹 at the top."
+                ))
+                .clicked()
+            {
+                acts.send(Command::ClearTabData { tab: None, data_types: DataTypes::default(), reload: self.reload_after_clean });
+            }
+            ui.checkbox(&mut self.reload_after_clean, "Reload").on_hover_text("Reload the site's tabs afterwards, so nothing the page still holds in memory is saved again");
+        });
+        ui.add_space(6.0);
+
         // Search field.
         egui::Frame::new()
             .fill(p.input)
@@ -185,7 +203,9 @@ impl MiniView {
                 ui.label(RichText::new("Current tab").small().color(p.muted));
                 if ui
                     .button("Clear cookies & site data")
-                    .on_hover_text("Cookies, cache, localStorage, IndexedDB and service workers of the tab's site")
+                    .on_hover_text(
+                        "Cookies, cache, local & session storage, IndexedDB and service workers of the tab's site and its subdomains",
+                    )
                     .clicked()
                 {
                     clean(acts, None, "the current tab's site", DataTypes::default(), self.reload_after_clean);
@@ -196,7 +216,7 @@ impl MiniView {
                     ui.close();
                 }
                 ui.separator();
-                ui.checkbox(&mut self.reload_after_clean, "Reload the tab afterwards");
+                ui.checkbox(&mut self.reload_after_clean, "Reload the site's tabs afterwards");
                 ui.label(RichText::new("Hover an open tab in the list and click 🧹 to clean its site.").small().color(p.muted));
             })
             .0
@@ -272,8 +292,8 @@ fn row(
                         acts.send(Command::StopStream { tab: tab_id, stop: !stopped });
                     }
                 }
-                if icon_button(ui, "🧹", "Clear this site's cookies & data").clicked() {
-                    clean(acts, Some(tab_id), &host, DataTypes::default(), reload_after_clean);
+                if icon_button(ui, "🧹", "Clear this site's cookies & data (with its subdomains)").clicked() {
+                    clean(acts, Some(tab_id), &crate::url::registrable_domain(&host), DataTypes::default(), reload_after_clean);
                 }
             } else if icon_button(ui, "⤓", "Open in background without loading").clicked() {
                 acts.send(Command::OpenEntry { entry: r, discarded: true });

@@ -92,7 +92,9 @@ impl CleanupView {
     }
 
     fn quick_actions(&mut self, ui: &mut egui::Ui, acts: &mut Actions) {
-        let subtitle = "Remove cookies, cache and site storage in one click. You will be logged out of affected sites.";
+        let subtitle = "Remove cookies, cache and site storage in one click. You will be logged out of affected sites. \
+                        Open tabs of those sites are cleared from inside too (session storage included); reload them so \
+                        nothing a page still holds in memory is saved again.";
         section_card(ui, "Quick clean-up", subtitle, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -151,7 +153,7 @@ impl CleanupView {
                     } else {
                         "This browser can only clear the cache for all domains at once; per-site cache clearing is skipped"
                     });
-                    ui.checkbox(&mut self.types.local_storage, "Local storage");
+                    ui.checkbox(&mut self.types.local_storage, "Local & session storage");
                     ui.checkbox(&mut self.types.indexed_db, "IndexedDB");
                     ui.checkbox(&mut self.types.service_workers, "Service workers");
                 });

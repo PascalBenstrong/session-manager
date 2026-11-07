@@ -200,10 +200,12 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
   - **CSV / TSV:** a file with a header row is read as a table; pick the column that holds the URLs (each column shows how many URLs it has, and the best one is chosen first). Quoted fields, commas inside them and semicolon- or tab-separated files work.
 
 **Cookies and site data**
-- Clean cookies, cache, localStorage, IndexedDB and service workers for:
+- Clean cookies, cache, local & session storage, IndexedDB and service workers for:
+  - the current tab's whole site (with its subdomains): one click on *🧹 Clear this site's data* in the popup
   - a host, domain (including subdomains), URL prefix, glob or regex
   - all open tabs
   - all domains
+- Manual clean-ups also clear storage from inside the open tabs of the sites cleaned (all frames). This reaches session storage, `window.name` and embedded frames' partitioned storage, which `browsingData` can't. A partitioned cookie goes with the site it was set under. Cleaning a site from the popup first stops its tabs from saving, then reloads them, so a page can't write back what it holds in memory.
 - A *keep* list protects domains from cleaning.
 - Saved rules can run on a timer (`alarms`) and/or delete matching cookies as soon as a site sets them.
 - A log records recent clean-ups.

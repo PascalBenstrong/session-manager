@@ -139,6 +139,8 @@ extern "C" {
     fn js_remove_cookie(c: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = removeSiteData)]
     fn js_remove_site_data(hosts: JsValue, types: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = clearPageData)]
+    fn js_clear_page_data(tabs: JsValue, types: JsValue, lock: bool) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = storageGet)]
     fn js_storage_get(key: &str) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = storageSet)]
@@ -616,6 +618,22 @@ pub async fn remove_site_data(hosts: Option<&[String]>, types: &DataTypes) -> Re
         None => JsValue::NULL,
     };
     call_as(js_remove_site_data(hosts, to_js(types))).await
+}
+
+/// How clearing site data from inside open pages went.
+#[derive(Deserialize, Default, Debug)]
+#[serde(default)]
+pub struct PageClear {
+    pub cleared: usize,
+    /// Tabs that couldn't be scripted (browser pages, the add-on store...).
+    pub failed: usize,
+    pub error: Option<String>,
+}
+
+/// Clears the site data of open tabs from inside their pages (every frame). With `lock`,
+/// the pages are first stopped from saving any more: reload them right after.
+pub async fn clear_page_data(tabs: &[TabId], types: &DataTypes, lock: bool) -> Result<PageClear> {
+    call_as(js_clear_page_data(to_js(tabs), to_js(types), lock)).await
 }
 
 // ---- storage ----

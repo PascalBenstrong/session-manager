@@ -138,6 +138,83 @@ export function streamBlockRules(tabIds) {
 }
 
 /**
+ * Runs in the page's own world, in every frame (scripting.executeScript), right before its
+ * site data is cleared and it is reloaded: stops the page from saving what it holds in
+ * memory (a counter, say) again in the meantime, e.g. from its unload handlers. Each step
+ * is on its own: a page that broke one of these APIs doesn't stop the others.
+ */
+function lockFrameData(types) {
+  const refuse = () => {
+    throw new DOMException('Site data is being cleared', 'SecurityError');
+  };
+  const refuseAsync = () => Promise.reject(new DOMException('Site data is being cleared', 'SecurityError'));
+  const steps = [
+    () => types.localStorage && (Storage.prototype.setItem = function () {}),
+    () => types.localStorage && (window.name = ''),
+    () => types.cookies && Object.defineProperty(Document.prototype, 'cookie', { configurable: true, get: () => '', set() {} }),
+    () => types.indexedDb && (IDBFactory.prototype.open = refuse),
+    () => types.cache && globalThis.CacheStorage && (CacheStorage.prototype.open = refuseAsync),
+    () => types.serviceWorkers && globalThis.ServiceWorkerContainer && (ServiceWorkerContainer.prototype.register = refuseAsync),
+  ];
+  for (const step of steps) {
+    try {
+      step();
+    } catch {}
+  }
+  return true;
+}
+
+/**
+ * Runs in every frame of a page (scripting.executeScript, isolated world, so the page's own
+ * overrides don't get in the way): clears the frame's storage from inside. This reaches what
+ * browsingData can't: sessionStorage, and the storage of frames from other sites, which
+ * browsers keep apart per site of the tab. Never throws, and gives up on a step after 3 s.
+ */
+async function clearFrameData(types) {
+  const settle = (job) =>
+    Promise.race([Promise.resolve().then(job).catch(() => {}), new Promise((resolve) => setTimeout(resolve, 3000))]);
+  const jobs = [];
+  if (types.localStorage) {
+    jobs.push(settle(() => localStorage.clear()), settle(() => sessionStorage.clear()), settle(() => (window.name = '')));
+  }
+  if (types.indexedDb) {
+    jobs.push(
+      settle(async () => {
+        const dbs = await indexedDB.databases();
+        await Promise.all(
+          dbs
+            .filter((d) => d && d.name)
+            .map(
+              (d) =>
+                new Promise((resolve) => {
+                  // Blocked: the page still has it open; it goes once the page reloads.
+                  const req = indexedDB.deleteDatabase(d.name);
+                  req.onsuccess = req.onerror = req.onblocked = () => resolve();
+                }),
+            ),
+        );
+      }),
+    );
+  }
+  if (types.cache) {
+    jobs.push(
+      settle(async () => {
+        for (const key of await caches.keys()) await caches.delete(key);
+      }),
+    );
+  }
+  if (types.serviceWorkers) {
+    jobs.push(
+      settle(async () => {
+        for (const reg of await navigator.serviceWorker.getRegistrations()) await reg.unregister();
+      }),
+    );
+  }
+  await Promise.all(jobs);
+  return true;
+}
+
+/**
  * Runs in every frame of an inspected page (scripting.executeScript): the URLs of its
  * videos, audio, frames, embeds and scripts, and of media requests in its network log.
  */
@@ -1032,6 +1109,31 @@ export function installPlatform(api, overrides = {}) {
       if (c.storeId) details.storeId = c.storeId;
       if (c.partitionKey) details.partitionKey = c.partitionKey;
       await api.cookies.remove(details);
+    },
+
+    /**
+     * Clears the site data of open tabs from inside their pages (every frame), first
+     * stopping them from saving any more when `lock` (they are reloaded right after).
+     * Tabs that can't be scripted (browser pages, the add-on store) are counted, never thrown.
+     */
+    async clearPageData(tabIds, types, lock) {
+      let cleared = 0;
+      let failed = 0;
+      let error = null;
+      const one = async (tabId) => {
+        const target = { tabId, allFrames: true };
+        try {
+          if (lock) await api.scripting.executeScript({ target, world: 'MAIN', injectImmediately: true, func: lockFrameData, args: [types] });
+          await api.scripting.executeScript({ target, injectImmediately: true, func: clearFrameData, args: [types] });
+          cleared++;
+        } catch (e) {
+          failed++;
+          error ??= String(e && e.message ? e.message : e);
+        }
+      };
+      // A few at a time: "all domains" can mean hundreds of tabs.
+      for (let i = 0; i < tabIds.length; i += 8) await Promise.all(tabIds.slice(i, i + 8).map(one));
+      return { cleared, failed, error };
     },
 
     /** hosts: string[] or null (= all sites). Returns warnings. Browser specific. */

@@ -44,7 +44,7 @@ impl DataTypes {
             v.push("cache");
         }
         if self.local_storage {
-            v.push("localStorage");
+            v.push("local & session storage");
         }
         if self.indexed_db {
             v.push("IndexedDB");
@@ -133,6 +133,13 @@ impl Cookie {
         let path = if self.path.is_empty() { "/" } else { &self.path };
         format!("{scheme}://{}{path}", self.host())
     }
+
+    /// For a partitioned cookie (set by a frame of another site, kept under the site of
+    /// the tab): the host of that tab's site.
+    pub fn top_level_host(&self) -> Option<String> {
+        let site = self.partition_key.as_ref()?.get("topLevelSite")?.as_str()?;
+        Some(url::host(site)).filter(|h| !h.is_empty())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -163,13 +170,43 @@ pub struct CleanupReport {
     pub hosts: Vec<String>,
     pub all_sites: bool,
     pub warnings: Vec<String>,
+    /// Open tabs whose storage was also cleared from inside the page.
+    pub pages_cleared: usize,
+    /// Open tabs reloaded afterwards.
+    pub pages_reloaded: usize,
 }
 
 impl CleanupReport {
     pub fn summary(&self) -> String {
         let sites = if self.all_sites { "all sites".to_string() } else { format!("{} site(s)", self.hosts.len()) };
-        format!("{}: {} cookie(s) removed, site data cleared for {}", self.label, self.cookies_removed, sites)
+        let mut s = format!("{}: {} cookie(s) removed, site data cleared for {}", self.label, self.cookies_removed, sites);
+        match (self.pages_cleared, self.pages_reloaded) {
+            (0, 0) => {}
+            (n, 0) => s.push_str(&format!(", and inside {n} open tab(s)")),
+            (n, r) => s.push_str(&format!(", and inside {n} open tab(s); {r} reloaded")),
+        }
+        s
     }
+}
+
+/// A cleanup of a whole site: the registrable domain of `page_url` and all its subdomains
+/// (`www.shop.example.co.uk` -> `example.co.uk`), like "this site" in the browser.
+pub fn site_spec(page_url: &str, data_types: DataTypes) -> Result<(String, CleanupSpec), String> {
+    if !is_web_page(page_url) {
+        return Err("this page has no site data to clean".into());
+    }
+    let site = url::registrable_domain(&url::host(page_url));
+    let spec = CleanupSpec {
+        target: CleanupTarget::Pattern(SitePattern::new(crate::pattern::PatternKind::Domain, &site)),
+        data_types,
+        exclude: Vec::new(),
+    };
+    Ok((site, spec))
+}
+
+/// Whether the page can hold site data we can clear from inside it (web pages only).
+pub fn is_web_page(page_url: &str) -> bool {
+    matches!(url::scheme(page_url).as_str(), "http" | "https") && !url::host(page_url).is_empty()
 }
 
 /// Matcher built from a spec, reusable for single-cookie checks (on-set trigger).
@@ -213,8 +250,21 @@ impl SpecMatcher {
         hit && !self.exclude.iter().any(|p| p.matches(host, url))
     }
 
+    /// A cookie is targeted by its own domain, or, when partitioned, by the site it was
+    /// set under (third-party cookies of a site go with it). Exclusions apply to both.
     pub fn matches_cookie(&self, c: &Cookie) -> bool {
-        self.matches(&c.host(), &c.url())
+        let host = c.host();
+        if self.matches(&host, &c.url()) {
+            return true;
+        }
+        let Some(top) = c.top_level_host() else { return false };
+        self.matches(&top, &format!("https://{top}/")) && !self.exclude.iter().any(|p| p.matches(&host, &c.url()))
+    }
+
+    /// Whether an open page belongs to the targeted sites (its storage can be cleared
+    /// from inside it too).
+    pub fn covers_page(&self, page_url: &str) -> bool {
+        is_web_page(page_url) && self.matches(&url::host(page_url), page_url)
     }
 
     fn is_unfiltered(&self) -> bool {
@@ -339,6 +389,56 @@ mod tests {
         let p = plan(&spec, &cookies(), &[], &[]).unwrap();
         assert_eq!(p.cookies.len(), 1);
         assert_eq!(p.site_data_hosts.unwrap(), vec!["other.org".to_string()]);
+    }
+
+    #[test]
+    fn whole_site() {
+        let (site, spec) = site_spec("https://www.shop.example.co.uk/cart?x=1", DataTypes::default()).unwrap();
+        assert_eq!(site, "example.co.uk");
+        let cookies = vec![
+            cookie("a", ".example.co.uk"),
+            cookie("b", "m.example.co.uk"),
+            cookie("c", "other.org"),
+            cookie("d", "notexample.co.uk"),
+            // Set by an ad frame while on the site: kept under the site's partition.
+            Cookie { partition_key: Some(serde_json::json!({ "topLevelSite": "https://example.co.uk" })), ..cookie("e", "ads.net") },
+            Cookie { partition_key: Some(serde_json::json!({ "topLevelSite": "https://other.org" })), ..cookie("f", "ads.net") },
+        ];
+        let p = plan(&spec, &cookies, &["https://login.example.co.uk/".into()], &["www.shop.example.co.uk".into()]).unwrap();
+        assert_eq!(p.cookies.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a", "b", "e"]);
+        assert_eq!(
+            p.site_data_hosts.unwrap(),
+            vec!["example.co.uk".to_string(), "login.example.co.uk".into(), "m.example.co.uk".into(), "www.shop.example.co.uk".into()]
+        );
+
+        let m = SpecMatcher::new(&spec, &[]).unwrap();
+        assert!(m.covers_page("https://www.shop.example.co.uk/"));
+        assert!(m.covers_page("http://example.co.uk/a"));
+        assert!(!m.covers_page("https://other.org/"));
+        assert!(!m.covers_page("about:blank"));
+
+        for bad in ["about:blank", "chrome://settings", "moz-extension://x/popup.html", "file:///C:/a.html", "", "not a url", "https://"] {
+            assert!(site_spec(bad, DataTypes::default()).is_err(), "{bad}");
+        }
+        assert_eq!(site_spec("http://localhost:3000/", DataTypes::default()).unwrap().0, "localhost");
+        assert_eq!(site_spec("http://192.168.1.4/", DataTypes::default()).unwrap().0, "192.168.1.4");
+    }
+
+    #[test]
+    fn partitioned_cookies_respect_exclusions_and_odd_keys() {
+        let spec = CleanupSpec {
+            target: CleanupTarget::Pattern(SitePattern::new(PatternKind::Domain, "example.com")),
+            exclude: vec![SitePattern::new(PatternKind::Domain, "keep.net")],
+            ..Default::default()
+        };
+        let m = SpecMatcher::new(&spec, &[]).unwrap();
+        let part = |domain: &str, key: serde_json::Value| Cookie { partition_key: Some(key), ..cookie("x", domain) };
+        assert!(m.matches_cookie(&part("ads.net", serde_json::json!({ "topLevelSite": "https://example.com" }))));
+        assert!(!m.matches_cookie(&part("keep.net", serde_json::json!({ "topLevelSite": "https://example.com" }))));
+        // Partition keys we don't understand never match (and never fail).
+        for key in [serde_json::json!({}), serde_json::json!(null), serde_json::json!("x"), serde_json::json!({ "topLevelSite": 5 })] {
+            assert!(!m.matches_cookie(&part("ads.net", key)));
+        }
     }
 
     #[test]

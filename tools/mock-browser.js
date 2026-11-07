@@ -12,6 +12,8 @@ export function createMockBrowser() {
   const alarms = new Map();
   const removedSiteData = [];
   const reloaded = [];
+  /** Site data cleared from inside pages: { tabId, world, func, args }. */
+  const pageScripts = [];
   const tabMessages = [];
   const groups = new Map();
   let nextGroupId = 100;
@@ -129,7 +131,14 @@ export function createMockBrowser() {
       async unregisterContentScripts({ ids }) {
         for (const id of ids) contentScripts.splice(contentScripts.findIndex((s) => s.id === id), 1);
       },
-      async executeScript({ files, func }) {
+      async executeScript({ target, files, func, args, world }) {
+        // Clearing / locking site data: recorded, never run here (it would clear this page's).
+        if (func && /^(lock|clear)FrameData$/.test(func.name)) {
+          if (!tabs.has(target.tabId)) throw new Error(`No tab with id: ${target.tabId}`);
+          if (!/^https?:/.test(tabs.get(target.tabId).url)) throw new Error('Missing host permission for the tab');
+          pageScripts.push({ tabId: target.tabId, world: world ?? 'ISOLATED', func: func.name, args: clone(args) });
+          return [{ frameId: 0, result: true }];
+        }
         // Preview: run in this page (as the inspected tab's top frame).
         if (files) for (const f of files) await import(new URL(`../web/${f}`, import.meta.url).href);
         return func ? [{ frameId: 0, result: func() }] : [{ frameId: 0, result: undefined }];
@@ -221,7 +230,7 @@ export function createMockBrowser() {
     },
   };
   return {
-    api, tabs, cookies, storage, alarms, removedSiteData, reloaded, tabMessages, groups, granted, titlePrefaces, contentScripts,
+    api, tabs, cookies, storage, alarms, removedSiteData, reloaded, pageScripts, tabMessages, groups, granted, titlePrefaces, contentScripts,
     dnr: () => dnrRules, dnrSession: () => dnrSessionRules, headerListeners, createdWindows, requestListeners, filters, ev, clone,
   };
 }

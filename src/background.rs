@@ -513,7 +513,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         }
         Event::Alarm { name } => {
             if let Some(id) = name.strip_prefix(ALARM_PREFIX).and_then(|s| s.parse::<Id>().ok())
-                && let Err(e) = run_rule(id).await
+                && let Err(e) = run_rule(id, InPages::Skip).await
             {
                 log(&format!("scheduled cleanup failed: {e}"));
             }
@@ -953,7 +953,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok("")
         }
         Command::RunCleanup { label, spec } => {
-            let report = run_cleanup(&label, &spec).await?;
+            let report = run_cleanup(&label, &spec, InPages::Clear).await?;
             with_state(|s| s.push_cleanup_report(report.clone()));
             persist().await;
             Ok(Response { ok: true, info: Some(report.summary()), report: Some(report), ..Default::default() })
@@ -988,7 +988,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok("Cleanup rule deleted")
         }
         Command::RunCleanupRule { id } => {
-            let report = run_rule(id).await?;
+            let report = run_rule(id, InPages::Clear).await?;
             Ok(Response { ok: true, info: Some(report.summary()), report: Some(report), ..Default::default() })
         }
         Command::CreateSnapshot { session, name } => {
@@ -1064,15 +1064,14 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok(info)
         }
         Command::ClearTabData { tab, data_types, reload } => {
+            // The whole site (all its subdomains), in every open tab of it: a page left
+            // running would save what it holds in memory again.
             let tab = pf::get_tab(tab).await?;
-            let host = crate::url::display_host(&tab.url);
-            let spec = CleanupSpec { target: CleanupTarget::Pages(vec![tab.url.clone()]), data_types, exclude: Vec::new() };
-            let report = run_cleanup(&format!("Tab: {host}"), &spec).await?;
+            let (site, spec) = cleanup::site_spec(&tab.url, data_types)?;
+            let pages = if reload { InPages::ClearAndReload } else { InPages::Clear };
+            let report = run_cleanup(&format!("Site: {site}"), &spec, pages).await?;
             with_state(|s| s.push_cleanup_report(report.clone()));
             persist().await;
-            if reload {
-                pf::reload_tab(tab.id).await?;
-            }
             Ok(Response { ok: true, info: Some(report.summary()), report: Some(report), ..Default::default() })
         }
         Command::ClearCleanupLog => {
@@ -1482,17 +1481,53 @@ fn schedule_auto_organize() {
 
 // ---------------------------------------------------------------- cleanup
 
-async fn run_cleanup(label: &str, spec: &CleanupSpec) -> Result<CleanupReport, String> {
+/// What a cleanup does in the open tabs of the sites it cleans.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InPages {
+    /// Nothing (scheduled cleanups: no scripts in every tab every few minutes).
+    Skip,
+    /// Also clear their storage from inside (sessionStorage, frames of other sites).
+    Clear,
+    /// Stop them from saving, clear from inside, clean, then reload them, so nothing they
+    /// held in memory comes back.
+    ClearAndReload,
+}
+
+async fn run_cleanup(label: &str, spec: &CleanupSpec, pages: InPages) -> Result<CleanupReport, String> {
     let cookies = pf::get_all_cookies().await?;
-    let open_urls: Vec<String> = pf::query_tabs().await?.into_iter().map(|t| t.url).collect();
+    let tabs = pf::query_tabs().await?;
+    let open_urls: Vec<String> = tabs.iter().map(|t| t.url.clone()).collect();
     let known = with_state(|s| s.known_hosts());
     let plan = cleanup::plan(spec, &cookies, &open_urls, &known)?;
 
-    let (removed, mut warnings) = pf::remove_cookies(&plan.cookies).await;
+    let mut warnings = Vec::new();
+    let mut pages_cleared = 0;
+    let page_tabs: Vec<TabId> = if pages == InPages::Skip {
+        Vec::new()
+    } else {
+        let m = SpecMatcher::new(spec, &open_urls)?;
+        tabs.iter().filter(|t| !t.discarded && m.covers_page(&t.url)).map(|t| t.id).collect()
+    };
+    if !page_tabs.is_empty() {
+        match pf::clear_page_data(&page_tabs, &plan.data_types, pages == InPages::ClearAndReload).await {
+            Ok(r) => {
+                pages_cleared = r.cleared;
+                if r.failed > 0 {
+                    let why = r.error.map(|e| format!(" ({e})")).unwrap_or_default();
+                    warnings.push(format!("{} tab(s) could not be cleared from inside the page{why}", r.failed));
+                }
+            }
+            Err(e) => warnings.push(format!("open tabs could not be cleared from inside the page: {e}")),
+        }
+    }
+
+    let (removed, cookie_warnings) = pf::remove_cookies(&plan.cookies).await;
+    warnings.extend(cookie_warnings);
     let mut report = CleanupReport {
         at: pf::now(),
         label: if label.is_empty() { spec.target.describe() } else { label.to_string() },
         cookies_removed: removed,
+        pages_cleared,
         ..Default::default()
     };
     match &plan.site_data_hosts {
@@ -1506,13 +1541,21 @@ async fn run_cleanup(label: &str, spec: &CleanupSpec) -> Result<CleanupReport, S
         }
         Some(_) => {}
     }
+    if pages == InPages::ClearAndReload {
+        for id in page_tabs {
+            match pf::reload_tab(id).await {
+                Ok(()) => report.pages_reloaded += 1,
+                Err(e) => warnings.push(format!("tab {id} could not be reloaded: {e}")),
+            }
+        }
+    }
     report.warnings = warnings;
     Ok(report)
 }
 
-async fn run_rule(id: Id) -> Result<CleanupReport, String> {
+async fn run_rule(id: Id, pages: InPages) -> Result<CleanupReport, String> {
     let rule = with_state(|s| s.cleanup_rules.iter().find(|r| r.id == id).cloned()).ok_or("no such cleanup rule")?;
-    let report = run_cleanup(&rule.name, &rule.spec).await?;
+    let report = run_cleanup(&rule.name, &rule.spec, pages).await?;
     with_state(|s| {
         if let Some(r) = s.cleanup_rules.iter_mut().find(|r| r.id == id) {
             r.last_run = Some(report.at);
