@@ -859,8 +859,11 @@ impl TabsView {
                         if !self.query.is_empty() && icon_button(ui, "🗙", "Clear search").clicked() {
                             self.query.clear();
                         }
+                        // A fixed id: the clear button appears before it once something is
+                        // typed, which would change its automatic id and drop the focus.
                         ui.add(
                             egui::TextEdit::singleline(&mut self.query)
+                                .id_salt("tabs-search")
                                 .hint_text("Search tabs — host:  tag:  group:  ws:  is:hibernated  idle:1h  /regex/  -not")
                                 .frame(egui::Frame::NONE)
                                 .desired_width(ui.available_width())
