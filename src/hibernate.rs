@@ -32,12 +32,13 @@ impl AppState {
     }
 
     /// Marks tabs as hibernated right away (the browser's update events follow).
-    pub fn mark_discarded(&mut self, ids: &[TabId]) -> bool {
+    pub fn mark_discarded(&mut self, ids: &[TabId], now: f64) -> bool {
         let ids: HashSet<TabId> = ids.iter().copied().collect();
         let mut changed = false;
         for e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()) {
             if e.tab_id.is_some_and(|t| ids.contains(&t)) && !e.discarded {
                 e.discarded = true;
+                e.unloaded_at = now;
                 changed = true;
             }
         }
@@ -86,12 +87,12 @@ mod tests {
         let mut s = AppState::default();
         s.on_tab_upsert(&tab(1), 1.0);
         s.on_tab_upsert(&tab(2), 1.0);
-        s.on_tab_removed(2, true);
+        s.on_tab_removed(2, true, 1.0);
         let sid = s.active_session;
         assert_eq!(s.hibernate_tabs(&HibernateTarget::Session(sid)), Some([1].into()));
         assert_eq!(s.hibernate_tabs(&HibernateTarget::All), None);
-        assert!(s.mark_discarded(&[1]));
+        assert!(s.mark_discarded(&[1], 2.0));
         assert!(s.entry_for_tab(1).unwrap().is_hibernated());
-        assert!(!s.mark_discarded(&[1]));
+        assert!(!s.mark_discarded(&[1], 2.0));
     }
 }

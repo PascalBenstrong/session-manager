@@ -178,6 +178,7 @@ impl AppState {
             if url_changed || group_changed {
                 self.place_entry(&mut e);
             }
+            e.stamp(before.is_open(), before.is_loaded(), now);
             let changed = e != before;
             *self.entry_mut(r).expect("located") = e;
             return changed;
@@ -207,12 +208,12 @@ impl AppState {
     }
 
     /// A browser tab was closed.
-    pub fn on_tab_removed(&mut self, tab_id: TabId, window_closing: bool) -> bool {
+    pub fn on_tab_removed(&mut self, tab_id: TabId, window_closing: bool, now: f64) -> bool {
         self.ignored_tab_ids.remove(&tab_id);
         let media = self.media.forget_tab(tab_id) | self.pending_workspace.remove(&tab_id).is_some();
         let Some(r) = self.locate_tab(tab_id) else { return media };
         if window_closing && self.settings.keep_tabs_on_window_close {
-            keep_closed(self.entry_mut(r).expect("located"));
+            keep_closed(self.entry_mut(r).expect("located"), now);
         } else if let Some(s) = self.session_mut(r.session) {
             s.entries.retain(|e| e.id != r.entry);
         }
@@ -253,7 +254,7 @@ impl AppState {
     }
 
     /// Links a tab we opened for an entry.
-    pub fn link_tab(&mut self, r: EntryRef, tab: &BrowserTab) {
+    pub fn link_tab(&mut self, r: EntryRef, tab: &BrowserTab, now: f64) {
         // If the creation event already auto-added this tab as a new entry, drop that duplicate.
         if let Some(dup) = self.locate_tab(tab.id)
             && dup != r
@@ -262,10 +263,12 @@ impl AppState {
             s.entries.retain(|e| e.id != dup.entry);
         }
         if let Some(e) = self.entry_mut(r) {
+            let (was_open, was_loaded) = (e.is_open(), e.is_loaded());
             e.tab_id = Some(tab.id);
             e.window_id = Some(tab.window_id);
             e.discarded = tab.discarded;
             e.browser_group = tab.group_title.clone();
+            e.stamp(was_open, was_loaded, now);
         }
     }
 
@@ -277,18 +280,15 @@ impl AppState {
         for s in &mut self.sessions {
             for e in &mut s.entries {
                 if let Some(id) = e.tab_id {
+                    let was_loaded = e.is_loaded();
                     match by_id.get(&id) {
                         Some(t) if t.url == e.url && !linked.contains(&id) => {
                             linked.insert(id);
                             e.discarded = t.discarded;
                             e.browser_group = t.group_title.clone();
+                            e.stamp(true, was_loaded, now);
                         }
-                        _ => {
-                            e.tab_id = None;
-                            e.window_id = None;
-                            e.discarded = false;
-                            e.browser_group = None;
-                        }
+                        _ => keep_closed(e, now),
                     }
                 }
             }
@@ -302,7 +302,7 @@ impl AppState {
             if linked.contains(&t.id) || self.ignored_tab_ids.contains(&t.id) {
                 continue;
             }
-            if !self.link_by_url(t) {
+            if !self.link_by_url(t, now) {
                 self.on_tab_upsert(t, now);
             }
         }
@@ -310,7 +310,7 @@ impl AppState {
 
     /// Links a not yet tracked tab to an unlinked entry with the same URL, preferring the
     /// active session (a tab the browser restored after a restart). Returns true if linked.
-    pub fn link_by_url(&mut self, t: &BrowserTab) -> bool {
+    pub fn link_by_url(&mut self, t: &BrowserTab, now: f64) -> bool {
         if t.url.is_empty() || self.locate_tab(t.id).is_some() || self.ignored_tab_ids.contains(&t.id) {
             return false;
         }
@@ -332,6 +332,7 @@ impl AppState {
         e.window_id = Some(t.window_id);
         e.discarded = t.discarded;
         e.browser_group = t.group_title.clone();
+        e.stamp(false, false, now);
         true
     }
 
@@ -396,13 +397,13 @@ impl AppState {
 
     /// Closes entries' tabs but keeps the entries, as saved (closed) tabs in their session
     /// and workspace. Returns the tab ids to close; their removal is then not news.
-    pub fn close_entries(&mut self, refs: &[EntryRef]) -> Vec<TabId> {
+    pub fn close_entries(&mut self, refs: &[EntryRef], now: f64) -> Vec<TabId> {
         let mut tabs = Vec::new();
         for r in refs {
             if let Some(e) = self.entry_mut(*r)
                 && let Some(t) = e.tab_id
             {
-                keep_closed(e);
+                keep_closed(e, now);
                 tabs.push(t);
             }
         }
@@ -657,15 +658,21 @@ pub fn entry_from_tab(id: Id, tab: &BrowserTab, now: f64) -> TabEntry {
         browser_group: tab.group_title.clone(),
         workspace: None,
         workspace_manual: false,
+        opened_at: now,
+        closed_at: 0.0,
+        loaded_at: if tab.discarded { 0.0 } else { now },
+        unloaded_at: 0.0,
     }
 }
 
 /// The tab of an entry is gone, but the entry stays as a saved (closed) tab.
-fn keep_closed(e: &mut TabEntry) {
+fn keep_closed(e: &mut TabEntry, now: f64) {
+    let (was_open, was_loaded) = (e.is_open(), e.is_loaded());
     e.tab_id = None;
     e.window_id = None;
     e.discarded = false;
     e.browser_group = None;
+    e.stamp(was_open, was_loaded, now);
 }
 
 #[cfg(test)]
@@ -676,6 +683,37 @@ mod tests {
 
     fn tab(id: TabId, url: &str) -> BrowserTab {
         BrowserTab { id, window_id: 1, url: url.into(), title: format!("T{id}"), ..Default::default() }
+    }
+
+    #[test]
+    fn records_open_close_load_and_unload_times() {
+        let mut s = AppState::default();
+        s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
+        let e = s.entry_for_tab(1).unwrap();
+        assert_eq!((e.created_at, e.opened_at, e.loaded_at, e.closed_at, e.unloaded_at), (1.0, 1.0, 1.0, 0.0, 0.0));
+        // Hibernated by the browser, then woken up.
+        s.on_tab_upsert(&BrowserTab { discarded: true, ..tab(1, "https://a.com") }, 2.0);
+        assert_eq!(s.entry_for_tab(1).unwrap().unloaded_at, 2.0);
+        s.on_tab_upsert(&tab(1, "https://a.com"), 3.0);
+        assert_eq!(s.entry_for_tab(1).unwrap().loaded_at, 3.0);
+        // Closed but kept, then reopened unloaded.
+        let r = s.locate_tab(1).unwrap();
+        s.on_tab_removed(1, true, 4.0);
+        let e = s.entry(r).unwrap();
+        assert_eq!((e.closed_at, e.unloaded_at, e.opened_at), (4.0, 4.0, 1.0));
+        s.link_tab(r, &BrowserTab { discarded: true, ..tab(2, "https://a.com") }, 5.0);
+        let e = s.entry(r).unwrap();
+        assert_eq!((e.opened_at, e.loaded_at), (5.0, 3.0));
+        // Unchanged state stamps nothing.
+        s.on_tab_upsert(&BrowserTab { discarded: true, ..tab(2, "https://a.com") }, 6.0);
+        let e = s.entry(r).unwrap();
+        assert_eq!((e.opened_at, e.loaded_at, e.closed_at, e.unloaded_at), (5.0, 3.0, 4.0, 4.0));
+        // The browser restarts: the tab is gone, then restored with a new id.
+        s.reconcile(&[], 7.0);
+        assert_eq!(s.entry(r).unwrap().closed_at, 7.0);
+        s.reconcile(&[tab(3, "https://a.com")], 8.0);
+        let e = s.entry(r).unwrap();
+        assert_eq!((e.opened_at, e.loaded_at), (8.0, 8.0));
     }
 
     #[test]
@@ -691,10 +729,10 @@ mod tests {
         assert!(s.on_tab_upsert(&tab(2, "https://c.com"), 3.0));
         assert_eq!(s.active().entries.len(), 2);
         // closing removes it
-        assert!(s.on_tab_removed(1, false));
+        assert!(s.on_tab_removed(1, false, 1.0));
         assert_eq!(s.active().entries.len(), 1);
         // window closing keeps it unloaded
-        assert!(s.on_tab_removed(2, true));
+        assert!(s.on_tab_removed(2, true, 1.0));
         assert_eq!(s.active().entries.len(), 1);
         assert!(!s.active().entries[0].is_open());
     }
@@ -716,15 +754,15 @@ mod tests {
         s.on_tab_upsert(&tab(2, "https://b.com"), 1.0);
         let r = s.locate_tab(1).unwrap();
         s.entry_mut(r).unwrap().workspace = Some(7);
-        assert_eq!(s.close_entries(&[r]), vec![1]);
+        assert_eq!(s.close_entries(&[r], 1.0), vec![1]);
         // The browser then reports the tab closed: the entry stays, saved.
-        s.on_tab_removed(1, false);
+        s.on_tab_removed(1, false, 1.0);
         let e = s.entry_mut(r).unwrap();
         assert!(!e.is_open() && e.window_id.is_none());
         assert_eq!((e.url.as_str(), e.workspace), ("https://a.com", Some(7)));
         assert_eq!(s.active().entries.len(), 2);
         // Already closed: nothing to close.
-        assert!(s.close_entries(&[r]).is_empty());
+        assert!(s.close_entries(&[r], 1.0).is_empty());
     }
 
     #[test]
@@ -738,7 +776,7 @@ mod tests {
         assert_eq!(s.session(first).unwrap().entries.len(), 1);
         assert_eq!(s.session(second).unwrap().entries.len(), 1);
         // closing a tab of an inactive session still removes it there
-        s.on_tab_removed(1, false);
+        s.on_tab_removed(1, false, 1.0);
         assert!(s.session(first).unwrap().entries.is_empty());
     }
 
@@ -747,8 +785,8 @@ mod tests {
         let mut s = AppState::default();
         s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
         s.on_tab_upsert(&tab(2, "https://b.com"), 1.0);
-        s.on_tab_removed(1, true);
-        s.on_tab_removed(2, true);
+        s.on_tab_removed(1, true, 1.0);
+        s.on_tab_removed(2, true, 1.0);
         // browser restart: new ids
         s.reconcile(&[tab(10, "https://b.com"), tab(11, "https://new.com")], 5.0);
         let e = &s.active().entries;
@@ -764,15 +802,15 @@ mod tests {
         let other = s.create_session("Other", 0.0);
         s.set_active(other).unwrap();
         s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
-        s.on_tab_removed(1, true);
+        s.on_tab_removed(1, true, 1.0);
         s.set_active(s.sessions[0].id).unwrap();
         // tab restored after a restart lands in its saved entry, not as a new one
-        assert!(s.link_by_url(&tab(20, "https://a.com")));
+        assert!(s.link_by_url(&tab(20, "https://a.com"), 1.0));
         assert_eq!(s.session(other).unwrap().entries[0].tab_id, Some(20));
         assert!(s.active().entries.is_empty());
         // already linked / no saved entry
-        assert!(!s.link_by_url(&tab(20, "https://a.com")));
-        assert!(!s.link_by_url(&tab(21, "https://a.com")));
+        assert!(!s.link_by_url(&tab(20, "https://a.com"), 1.0));
+        assert!(!s.link_by_url(&tab(21, "https://a.com"), 1.0));
     }
 
     #[test]
@@ -809,15 +847,15 @@ mod tests {
         s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
         s.on_tab_upsert(&tab(2, "https://b.com"), 1.0);
         same(&s);
-        s.on_tab_removed(1, false);
+        s.on_tab_removed(1, false, 1.0);
         same(&s);
         let other = s.create_session("Other", 0.0);
         s.session_mut(other).unwrap().entries.push(TabEntry { id: 500, url: "https://c.com".into(), ..Default::default() });
         s.on_tab_upsert(&tab(3, "https://c.com"), 1.0);
-        s.link_tab(EntryRef { session: other, entry: 500 }, &tab(3, "https://c.com"));
+        s.link_tab(EntryRef { session: other, entry: 500 }, &tab(3, "https://c.com"), 1.0);
         same(&s);
         assert_eq!(s.entries_by_tab()[&3].id, 500);
-        s.on_tab_removed(2, true);
+        s.on_tab_removed(2, true, 1.0);
         same(&s);
     }
 
@@ -828,7 +866,7 @@ mod tests {
         s.session_mut(other).unwrap().entries.push(TabEntry { id: 500, url: "https://a.com".into(), ..Default::default() });
         // creation event raced ahead and auto-added the tab to the active session
         s.on_tab_upsert(&tab(7, "https://a.com"), 1.0);
-        s.link_tab(EntryRef { session: other, entry: 500 }, &tab(7, "https://a.com"));
+        s.link_tab(EntryRef { session: other, entry: 500 }, &tab(7, "https://a.com"), 1.0);
         assert!(s.active().entries.is_empty());
         assert_eq!(s.session(other).unwrap().entries[0].tab_id, Some(7));
     }
@@ -841,7 +879,7 @@ mod tests {
         s.on_tab_upsert(&tab(2, "https://b.com"), 1.0);
         let snap = s.create_snapshot(sid, "v1", false, 2.0).unwrap();
         // the session changes
-        s.on_tab_removed(1, false);
+        s.on_tab_removed(1, false, 1.0);
         s.on_tab_upsert(&tab(3, "https://c.com"), 3.0);
 
         // merge: only a.com comes back

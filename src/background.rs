@@ -378,7 +378,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 // A tab the browser restores: give it back its saved entry rather than
                 // adding a copy, and wait for the restore to finish before de-duplicating.
                 schedule_startup_dedupe();
-                if with_state(|s| s.link_by_url(&tab)) {
+                if with_state(|s| s.link_by_url(&tab, now)) {
                     schedule_persist();
                     return Ok(JsValue::UNDEFINED);
                 }
@@ -426,7 +426,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         Event::TabRemoved { tab_id, window_closing } => {
             OPENED.with(|o| o.borrow_mut().remove(&tab_id));
             STREAM_RELOADED.with(|r| r.borrow_mut().remove(&tab_id));
-            if with_state(|s| s.on_tab_removed(tab_id, window_closing)) {
+            if with_state(|s| s.on_tab_removed(tab_id, window_closing, now)) {
                 // A closing window removes all its tabs: saved together.
                 if window_closing {
                     schedule_persist();
@@ -552,7 +552,7 @@ async fn prevent_duplicate(tab: &BrowserTab, now: f64) -> bool {
         _ => {
             // The page is saved but unloaded: let this tab become that entry.
             with_state(|s| {
-                s.link_tab(existing, tab);
+                s.link_tab(existing, tab, now);
                 s.on_tab_upsert(tab, now);
             });
             persist().await;
@@ -749,7 +749,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok(format!("Removed {} tab(s) from session", entries.len()))
         }
         Command::CloseEntries { entries } => {
-            let tabs = with_state(|s| s.close_entries(&entries));
+            let tabs = with_state(|s| s.close_entries(&entries, pf::now()));
             persist().await;
             pf::remove_tabs(&tabs).await?;
             ok(format!("Closed {} tab(s), kept in the session", tabs.len()))
@@ -1126,7 +1126,7 @@ async fn open_entries(id: Id, only: Option<&[Id]>, discarded: bool, new_window: 
         let opts = CreateTab { url, title, active: false, discarded, pinned: *pinned, window_id: window.as_ref().map(|w| w.window_id) };
         match pf::create_tab(&opts).await {
             Ok(tab) => {
-                with_state(|s| s.link_tab(EntryRef { session: id, entry: *entry }, &tab));
+                with_state(|s| s.link_tab(EntryRef { session: id, entry: *entry }, &tab, pf::now()));
                 opened += 1;
             }
             Err(e) => errors.push(format!("{url}: {e}")),
@@ -1153,8 +1153,10 @@ async fn open_entry(r: EntryRef, discarded: bool) -> Result<(), String> {
                 log(&format!("tab {tab_id} could not be focused ({err}); reopening"));
                 with_state(|s| {
                     if let Some(e) = s.entry_mut(r) {
+                        let was_loaded = e.is_loaded();
                         e.tab_id = None;
                         e.window_id = None;
+                        e.stamp(true, was_loaded, pf::now());
                     }
                 });
                 false
@@ -1166,7 +1168,7 @@ async fn open_entry(r: EntryRef, discarded: bool) -> Result<(), String> {
         let _opening = OpeningGuard::new();
         let opts = CreateTab { url: &e.url, title: &e.title, active: !discarded, discarded, pinned: e.pinned, window_id: None };
         let tab = pf::create_tab(&opts).await?;
-        with_state(|s| s.link_tab(r, &tab));
+        with_state(|s| s.link_tab(r, &tab, pf::now()));
         if !discarded {
             pf::focus_tab(tab.id).await?;
         }
@@ -1192,7 +1194,7 @@ async fn hibernate_tabs(target: &HibernateTarget, force: bool) -> Result<Respons
         return ok(format!("No tabs to hibernate ({skipped} and tabs already hibernated are skipped)"));
     }
     let result = pf::discard_tabs(&ids).await?;
-    if with_state(|s| s.mark_discarded(&result.discarded)) {
+    if with_state(|s| s.mark_discarded(&result.discarded, pf::now())) {
         persist().await;
     }
     let mut info = format!("Hibernated {} tab(s)", result.discarded.len());

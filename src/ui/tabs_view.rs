@@ -15,7 +15,7 @@ use super::widgets::{
 use super::{Actions, ViewCtx};
 use crate::dedupe::Scope;
 use crate::hibernate::HibernateTarget;
-use crate::model::{EntryRef, Id, TabEntry, TabGrouping, TabId};
+use crate::model::{EntryRef, Id, TabEntry, TabGrouping, TabId, TabSort, sort_entries, time_ago};
 use crate::organize::group_entries;
 use crate::pattern::{PatternKind, SitePattern};
 use crate::platform as pf;
@@ -157,7 +157,16 @@ pub struct TabsView {
     ws_counts: super::Cached<(Id, Id, u64), WorkspaceCounts>,
     /// The session of each entry listed, for (state generation, all sessions, viewed session).
     owners: super::Cached<(u64, bool, Id), Rc<HashMap<Id, Id>>>,
+    /// The tabs listed (positions in the state's sessions, in the chosen order) and how many
+    /// there are in all, for (state generation, all sessions, viewed session, search
+    /// results, sort, oldest first).
+    listed: super::Cached<ListedKey, Rc<Listed>>,
 }
+
+/// Where the tabs listed are in the state's sessions (in order), and how many there are in all.
+type Listed = (Vec<(usize, usize)>, usize);
+/// (state generation, all sessions, viewed session, search results, sort, oldest first).
+type ListedKey = (u64, bool, Id, Option<u64>, TabSort, bool);
 
 /// A workspace's tabs: the closed ones in the viewed session, how many are loaded, and all.
 type WorkspaceCounts = (Vec<EntryRef>, usize, usize);
@@ -191,16 +200,29 @@ impl TabsView {
                 owner
             }
         };
-        let mut matched: Vec<&TabEntry> = Vec::new();
-        let mut total = 0;
-        for s in state.sessions.iter().filter(|s| self.all_sessions || s.id == cx.viewed) {
-            for e in &s.entries {
-                total += 1;
-                if hits.contains(e.id) {
-                    matched.push(e);
+        let look = state.settings.tab_list;
+        let key = (super::state_generation(), self.all_sessions, cx.viewed, hits.version(), look.sort, look.oldest_first);
+        let listed = match &self.listed {
+            Some((k, listed)) if *k == key => listed.clone(),
+            _ => {
+                let mut rows: Vec<(usize, usize)> = Vec::new();
+                let mut total = 0;
+                for (si, s) in state.sessions.iter().enumerate().filter(|(_, s)| self.all_sessions || s.id == cx.viewed) {
+                    for (ei, e) in s.entries.iter().enumerate() {
+                        total += 1;
+                        if hits.contains(e.id) {
+                            rows.push((si, ei));
+                        }
+                    }
                 }
+                sort_entries(&mut rows, look.sort, look.oldest_first, |&(si, ei)| &state.sessions[si].entries[ei]);
+                let listed = Rc::new((rows, total));
+                self.listed = Some((key, listed.clone()));
+                listed
             }
-        }
+        };
+        let total = listed.1;
+        let matched: Vec<&TabEntry> = listed.0.iter().map(|&(si, ei)| &state.sessions[si].entries[ei]).collect();
         let session_names: HashMap<Id, &str> = state.sessions.iter().map(|s| (s.id, s.name.as_str())).collect();
         let rc = RowCtx { owner: &owner, session_names: &session_names, playing: &playing };
         let refs = rc.refs(&matched);
@@ -910,13 +932,31 @@ impl TabsView {
     fn view_menu(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         let p = theme::palette(ui);
         let mut look = cx.state.settings.tab_list;
-        ui.menu_button(format!("View: {} ▾", look.grouping.label().to_lowercase()), |ui| {
+        let mut title = format!("View: {}", look.grouping.label().to_lowercase());
+        if look.sort != TabSort::Session {
+            title.push_str(&format!(" · {}", look.sort.label().to_lowercase()));
+        }
+        ui.menu_button(format!("{title} ▾"), |ui| {
             ui.set_min_width(200.0);
             ui.label(RichText::new("Group tabs by").small().color(p.muted));
             for g in TabGrouping::ALL {
                 if ui.radio(look.grouping == g, g.label()).clicked() {
                     look.grouping = g;
                 }
+            }
+            ui.separator();
+            ui.label(RichText::new("Sort tabs by").small().color(p.muted));
+            for s in TabSort::ALL {
+                if ui.radio(look.sort == s, s.label()).on_hover_text(s.hint()).clicked() {
+                    look.sort = s;
+                }
+            }
+            if look.sort != TabSort::Session {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut look.oldest_first, false, "Newest first");
+                    ui.selectable_value(&mut look.oldest_first, true, "Oldest first");
+                });
+                ui.label(RichText::new("Tabs without that time are listed last.").small().color(p.muted));
             }
             ui.separator();
             ui.checkbox(&mut look.compact, "Compact rows");
@@ -1329,6 +1369,12 @@ impl TabsView {
             }
             if e.pinned {
                 meta.push_str("  ·  pinned");
+            }
+            if look.sort != TabSort::Session {
+                let at = e.time_of(look.sort);
+                if at > 0.0 {
+                    meta.push_str(&format!("  ·  {} {}", look.sort.verb(), time_ago(pf::now() - at)));
+                }
             }
             if let Some(n) = self.all_sessions.then(|| rc.session_names[&r.session]) {
                 meta.push_str(&format!("  ·  {n}"));
