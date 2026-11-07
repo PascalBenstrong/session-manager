@@ -2,6 +2,15 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.12.0] - 2026-11-07
+
+### New
+- Sort tabs by time: *View* → *Sort tabs by* lists each section by when tabs were last used, first opened, last opened, closed, loaded (opened or woken from hibernation) or unloaded (hibernated or closed), newest or oldest first. Rows show the time, e.g. "opened 3 h ago". Tabs open before this version get these times the next time they're opened, closed, hibernated or woken.
+- Search by time: `used:`, `added:`, `opened:`, `closed:`, `loaded:` and `unloaded:` take how long ago (`opened:2h`, `closed:>1w`, `used:1d..1w`), a calendar period (`today`, `yesterday`, `week`, `lastweek`, `month`, `lastmonth`, `year`, `lastyear`) or dates in your local time (`2026-11-01`, `2026-11`, `<2026-11-01`, `2026-11-01..2026-11-05`). Weeks start on Monday. Durations, including `idle:`, also take months (`mo`) and years (`y`).
+
+### Fixed
+- The search field in *Tabs* lost focus when you typed the first letter.
+
 ## [0.11.5] - 2026-11-02
 
 ### Changed
