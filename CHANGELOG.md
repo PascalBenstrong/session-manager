@@ -2,6 +2,16 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.14.0] - 2026-11-07
+
+### New
+- Stop a site from saving data: *🚫 Stop it saving data* in the popup (next to *Clear this site's data*). The site and its subdomains can still be used, but forget everything when their pages close or reload:
+  - their local and session storage, and the cookies their scripts set, last only as long as the page;
+  - the cookies the server sends, and those other sites set while you're on it, are removed as they arrive;
+  - IndexedDB, offline caches and service workers are refused.
+
+  What the site saved before is cleared and its tabs reload. *✅ Let it save data* undoes it. The sites are listed in *Cookies & site data*, where you can also add one by name.
+
 ## [0.13.0] - 2026-11-07
 
 ### New
