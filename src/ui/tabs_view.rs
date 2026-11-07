@@ -34,6 +34,13 @@ Negate:   -term   (e.g. -tag:done)\n\
 State:    is:open  is:unloaded  is:hibernated  is:playing  is:pinned\n\
           is:grouped  is:ungrouped  is:tagged  is:duplicate\n\
 Idle:     idle:30m  idle:2h  idle:1d   (not used for that long)\n\
+Times:    used:  added:  opened:  closed:  loaded:  unloaded:\n\
+          opened:2h  (in the last 2 h)   closed:>1w  (over a week ago)\n\
+          used:1d..1w  (between a day and a week ago)\n\
+          added:today  yesterday  week  lastweek  month  lastmonth  year\n\
+          opened:2026-11-01   opened:2026-11   opened:<2026-11-01   opened:>=2026-11\n\
+          closed:2026-11-01..2026-11-05   loaded:2026-11..\n\
+          (units: s m h d w mo y; local dates; weeks start on Monday)\n\
 \n\
 Example:  ws:work host:^docs -is:unloaded \"release notes\"";
 

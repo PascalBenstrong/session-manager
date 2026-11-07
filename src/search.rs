@@ -13,7 +13,22 @@
 //! | `/re(gex)?/`      | regular expression                                 |
 //! | `-term`           | negation                                           |
 //! | `is:open` `is:unloaded` `is:pinned` `is:grouped` `is:ungrouped` `is:tagged` `is:duplicate` `is:hibernated` `is:playing` | state filters |
-//! | `idle:30m`        | not used for 30 minutes (`s`, `m`, `h`, `d`)       |
+//! | `idle:30m`        | not used for 30 minutes (`s`, `m`, `h`, `d`, `w`, `mo`, `y`) |
+//! | `opened:2h`       | time filter (see below): `used:`, `added:`, `opened:`, `closed:`, `loaded:`, `unloaded:` |
+//!
+//! Time filter values:
+//!
+//! | value                          | meaning                                        |
+//! |--------------------------------|------------------------------------------------|
+//! | `2h`, `<2h`                    | within the last 2 hours                        |
+//! | `>1w`                          | more than a week ago                           |
+//! | `1d..1w`                       | between a day and a week ago                   |
+//! | `today` `yesterday` `week` `lastweek` `month` `lastmonth` `year` `lastyear` | that calendar period (weeks start on Monday) |
+//! | `2026-11-01`, `2026-11`, `2026` | that day, month or year (local time)           |
+//! | `<2026-11-01`, `>=2026-11`     | before / after (`<=`, `>=`: including it)      |
+//! | `2026-11-01..2026-11-05`, `2026-11..`, `..lastweek` | from the start of one to the end of the other; a missing side is open |
+//!
+//! A tab without that time (e.g. never closed) matches no time filter.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -21,7 +36,7 @@ use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::dedupe::{Scope, duplicate_ids};
-use crate::model::{AppState, Id, TabEntry, TabId};
+use crate::model::{AppState, Id, TabEntry, TabId, TabSort};
 use crate::pattern::glob_to_regex;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -135,6 +150,45 @@ enum Matcher {
     Flag(Flag),
     /// Not used for at least this many milliseconds.
     Idle(f64),
+    /// One of the entry's times is in a span.
+    Time(TabSort, Span),
+}
+
+/// When a time filter matches, resolved against the current time ([`Span::resolve`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Span {
+    /// Between `min` and `max` milliseconds ago.
+    Ago { min: f64, max: f64 },
+    /// From `from` to `to` (each open if `None`).
+    Range { from: Option<Edge>, to: Option<Edge> },
+}
+
+/// One side of a [`Span::Range`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Edge {
+    /// This long ago (ms).
+    Ago(f64),
+    Start(Period),
+    End(Period),
+}
+
+/// A local calendar period.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Period {
+    /// Days since 1970-01-01.
+    Day(i64),
+    Month(i64, u32),
+    Year(i64),
+    /// The current day / week / month / year, or one `back` of them before it.
+    Current(Unit, i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Day,
+    Week,
+    Month,
+    Year,
 }
 
 #[derive(Debug, Clone)]
@@ -156,8 +210,10 @@ pub struct Query {
     workspace_names: HashMap<Id, String>,
     /// Tabs playing media (for `is:playing`), supplied by the caller.
     playing: HashSet<TabId>,
-    /// Current time in ms (for `idle:`), supplied by the caller.
+    /// Current time in ms (for `idle:` and time filters), supplied by the caller.
     now: f64,
+    /// Local time minus UTC, in minutes (for dates in time filters), supplied by the caller.
+    utc_offset_min: f64,
 }
 
 /// A search over every entry of a state, as run by a page or by the worker (see
@@ -168,8 +224,11 @@ pub struct SearchRequest {
     pub opts: SearchOptions,
     /// Where `is:duplicate` looks for duplicates; `None`: it matches nothing.
     pub duplicates: Option<Scope>,
-    /// For `idle:` (0 when the query doesn't use it).
+    /// For `idle:` and time filters (0 when the query doesn't use them).
     pub now: f64,
+    /// Local time minus UTC, in minutes (for dates in time filters). Optional: UTC if missing.
+    #[serde(default)]
+    pub utc_offset_min: f64,
     /// The revision of the state searched.
     pub revision: u64,
 }
@@ -178,7 +237,7 @@ pub struct SearchRequest {
 pub fn matching_ids(state: &AppState, req: &SearchRequest) -> Result<HashSet<Id>, String> {
     let names = state.workspaces.iter().map(|w| (w.id, w.name.clone())).collect();
     let playing = state.media.playing.iter().map(|p| p.tab_id).collect();
-    let mut query = Query::parse(&req.query, &req.opts)?.with_context(names, playing, req.now);
+    let mut query = Query::parse(&req.query, &req.opts)?.with_context(names, playing, req.now).with_utc_offset(req.utc_offset_min);
     if let Some(scope) = req.duplicates
         && query.wants_duplicates()
     {
@@ -220,6 +279,11 @@ impl Query {
                     terms.push(Term { field, matcher: Matcher::Idle(ms), negate });
                     continue;
                 }
+                if let Some(which) = time_field(prefix) {
+                    let span = parse_span(rest).map_err(|e| format!("{prefix}:{rest}: {e}"))?;
+                    terms.push(Term { field, matcher: Matcher::Time(which, span), negate });
+                    continue;
+                }
                 if let Some(f) = Field::from_prefix(prefix) {
                     field = f;
                     tok = rest;
@@ -258,13 +322,19 @@ impl Query {
         self
     }
 
+    /// Local time minus UTC, in minutes: where days start for dates in time filters.
+    pub fn with_utc_offset(mut self, minutes: f64) -> Self {
+        self.utc_offset_min = minutes;
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty() && self.groups.is_empty() && self.workspaces.is_empty()
     }
 
-    /// Whether the result depends on the current time (`idle:`).
+    /// Whether the result depends on the current time (`idle:`, time filters).
     pub fn uses_time(&self) -> bool {
-        self.terms.iter().any(|t| matches!(t.matcher, Matcher::Idle(_)))
+        self.terms.iter().any(|t| matches!(t.matcher, Matcher::Idle(_) | Matcher::Time(..)))
     }
 
     pub fn matches(&self, e: &TabEntry) -> bool {
@@ -293,6 +363,11 @@ impl Query {
         }
         if let Matcher::Idle(ms) = t.matcher {
             return self.now > 0.0 && self.now - e.last_accessed.max(e.created_at) >= ms;
+        }
+        if let Matcher::Time(which, span) = t.matcher {
+            let at = e.time_of(which);
+            let (from, to) = span.resolve(self.now, self.utc_offset_min * MINUTE);
+            return self.now > 0.0 && at > 0.0 && from <= at && at < to;
         }
         let check = |s: &str| self.text_matches(&t.matcher, s);
         match t.field {
@@ -326,12 +401,190 @@ impl Query {
                     MatchMode::Glob | MatchMode::Regex => unreachable!("compiled to Pattern"),
                 }
             }
-            Matcher::Flag(_) | Matcher::Idle(_) => false,
+            Matcher::Flag(_) | Matcher::Idle(_) | Matcher::Time(..) => false,
         }
     }
 }
 
-/// `90s`, `30m`, `2h`, `1d` (a bare number means minutes) -> milliseconds.
+const MINUTE: f64 = 60_000.0;
+const DAY: f64 = 86_400_000.0;
+
+/// The entry time a `field:` prefix filters on.
+fn time_field(prefix: &str) -> Option<TabSort> {
+    Some(match prefix.to_ascii_lowercase().as_str() {
+        "used" | "accessed" => TabSort::LastUsed,
+        "added" | "created" | "first" => TabSort::Added,
+        "opened" => TabSort::Opened,
+        "closed" => TabSort::Closed,
+        "loaded" => TabSort::Loaded,
+        "unloaded" => TabSort::Unloaded,
+        _ => return None,
+    })
+}
+
+const SPAN_HELP: &str = "use e.g. 2h, <1d, >1w, 1d..1w, today, lastweek, 2026-11-01 or 2026-11-01..2026-11-05";
+
+/// The value of a time filter (see the module docs).
+fn parse_span(s: &str) -> Result<Span, String> {
+    let s = s.trim().to_ascii_lowercase();
+    let edge = |side: &str, start: bool| -> Result<Option<Edge>, String> {
+        if side.is_empty() {
+            return Ok(None);
+        }
+        if let Some(p) = parse_period(side)? {
+            return Ok(Some(if start { Edge::Start(p) } else { Edge::End(p) }));
+        }
+        parse_duration(side).map(|ms| Some(Edge::Ago(ms))).ok_or_else(|| SPAN_HELP.to_string())
+    };
+    if let Some((a, b)) = s.split_once("..") {
+        if a.ends_with('.') || b.starts_with('.') {
+            return Err(SPAN_HELP.into());
+        }
+        let (from, to) = (edge(a, true)?, edge(b, false)?);
+        // Durations count back from now: `1d..1w` means from a week ago to a day ago, and
+        // `1w..` more than a week ago.
+        return Ok(match (from, to) {
+            (None, None) => return Err(SPAN_HELP.into()),
+            (Some(Edge::Ago(x)), Some(Edge::Ago(y))) => Span::Ago { min: x.min(y), max: x.max(y) },
+            (Some(Edge::Ago(x)), None) => Span::Ago { min: x, max: f64::INFINITY },
+            (None, Some(Edge::Ago(y))) => Span::Ago { min: 0.0, max: y },
+            (from, to) => Span::Range { from, to },
+        });
+    }
+    let (op, rest) = ["<=", ">=", "<", ">"].iter().find_map(|op| s.strip_prefix(op).map(|r| (*op, r))).unwrap_or(("", &s));
+    if let Some(p) = parse_period(rest)? {
+        return Ok(match op {
+            "<" => Span::Range { from: None, to: Some(Edge::Start(p)) },
+            "<=" => Span::Range { from: None, to: Some(Edge::End(p)) },
+            ">" => Span::Range { from: Some(Edge::End(p)), to: None },
+            ">=" => Span::Range { from: Some(Edge::Start(p)), to: None },
+            _ => Span::Range { from: Some(Edge::Start(p)), to: Some(Edge::End(p)) },
+        });
+    }
+    let ms = parse_duration(rest).ok_or_else(|| SPAN_HELP.to_string())?;
+    Ok(match op {
+        ">" | ">=" => Span::Ago { min: ms, max: f64::INFINITY },
+        _ => Span::Ago { min: 0.0, max: ms },
+    })
+}
+
+/// `today`, `lastweek`..., `2026-11-01`, `2026-11` or `2026`. `Ok(None)`: not a period.
+fn parse_period(s: &str) -> Result<Option<Period>, String> {
+    let current = |unit, back| Ok(Some(Period::Current(unit, back)));
+    match s {
+        "today" => return current(Unit::Day, 0),
+        "yesterday" => return current(Unit::Day, 1),
+        "week" | "thisweek" => return current(Unit::Week, 0),
+        "lastweek" => return current(Unit::Week, 1),
+        "month" | "thismonth" => return current(Unit::Month, 0),
+        "lastmonth" => return current(Unit::Month, 1),
+        "year" | "thisyear" => return current(Unit::Year, 0),
+        "lastyear" => return current(Unit::Year, 1),
+        _ => {}
+    }
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts[0].len() != 4 || parts.len() > 3 || !parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+        return Ok(None);
+    }
+    let bad = || format!("{s} is not a date (use 2026-11-01, 2026-11 or 2026)");
+    let year: i64 = parts[0].parse().map_err(|_| bad())?;
+    let Some(month) = parts.get(1) else { return Ok(Some(Period::Year(year))) };
+    let month: u32 = month.parse().ok().filter(|m| (1..=12).contains(m)).ok_or_else(bad)?;
+    let Some(day) = parts.get(2) else { return Ok(Some(Period::Month(year, month))) };
+    let day: u32 = day.parse().ok().filter(|d| *d >= 1 && *d <= days_in_month(year, month)).ok_or_else(bad)?;
+    Ok(Some(Period::Day(days_from_civil(year, month, day))))
+}
+
+impl Span {
+    /// The times (ms since epoch) it covers: `from <= t < to`. `offset`: local time minus UTC (ms).
+    fn resolve(self, now: f64, offset: f64) -> (f64, f64) {
+        match self {
+            Span::Ago { min, max } => (now - max, now - min + 1.0),
+            Span::Range { from, to } => {
+                let at = |e: Option<Edge>, open: f64| match e {
+                    None => open,
+                    Some(Edge::Ago(ms)) => now - ms,
+                    Some(Edge::Start(p)) => p.bounds(now, offset).0,
+                    Some(Edge::End(p)) => p.bounds(now, offset).1,
+                };
+                let (a, b) = (at(from, f64::NEG_INFINITY), at(to, f64::INFINITY));
+                // `2026-11-05..2026-11-01` means the same days as `2026-11-01..2026-11-05`.
+                match (from, to) {
+                    (Some(Edge::Start(p)), Some(Edge::End(q))) if a >= b => (q.bounds(now, offset).0, p.bounds(now, offset).1),
+                    _ => (a, b),
+                }
+            }
+        }
+    }
+}
+
+impl Period {
+    /// Its start and end (exclusive), ms since epoch. `offset`: local time minus UTC (ms).
+    fn bounds(self, now: f64, offset: f64) -> (f64, f64) {
+        let (first, next) = match self {
+            Period::Day(d) => (d, d + 1),
+            Period::Month(y, m) => (days_from_civil(y, m, 1), next_month(y, m)),
+            Period::Year(y) => (days_from_civil(y, 1, 1), days_from_civil(y + 1, 1, 1)),
+            Period::Current(unit, back) => {
+                // Clamped (about ±270,000 years) so a bogus time can't overflow the date math.
+                let today = ((now + offset) / DAY).floor().clamp(-1e8, 1e8) as i64;
+                match unit {
+                    Unit::Day => (today - back, today - back + 1),
+                    Unit::Week => {
+                        // 1970-01-01 was a Thursday, 3 days after a Monday.
+                        let monday = today - (today + 3).rem_euclid(7) - 7 * back;
+                        (monday, monday + 7)
+                    }
+                    Unit::Month => {
+                        let (y, m, _) = civil_from_days(today);
+                        let months = y * 12 + m as i64 - 1 - back;
+                        let (y, m) = (months.div_euclid(12), months.rem_euclid(12) as u32 + 1);
+                        (days_from_civil(y, m, 1), next_month(y, m))
+                    }
+                    Unit::Year => {
+                        let y = civil_from_days(today).0 - back;
+                        (days_from_civil(y, 1, 1), days_from_civil(y + 1, 1, 1))
+                    }
+                }
+            }
+        };
+        (first as f64 * DAY - offset, next as f64 * DAY - offset)
+    }
+}
+
+fn next_month(y: i64, m: u32) -> i64 {
+    if m == 12 { days_from_civil(y + 1, 1, 1) } else { days_from_civil(y, m + 1, 1) }
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    (next_month(y, m) - days_from_civil(y, m, 1)) as u32
+}
+
+/// Days since 1970-01-01 of a (proleptic Gregorian) date.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The date of a day since 1970-01-01: (year, month, day).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// `90s`, `30m`, `2h`, `1d`, `2w`, `3mo`, `1y` (a bare number means minutes) -> milliseconds.
 fn parse_duration(s: &str) -> Option<f64> {
     let s = s.trim().to_ascii_lowercase();
     let (num, unit) = match s.find(|c: char| !c.is_ascii_digit() && c != '.') {
@@ -345,6 +598,8 @@ fn parse_duration(s: &str) -> Option<f64> {
         "h" | "hr" => 3_600_000.0,
         "d" | "day" | "days" => 86_400_000.0,
         "w" | "week" | "weeks" => 604_800_000.0,
+        "mo" | "month" | "months" => 30.0 * DAY,
+        "y" | "year" | "years" => 365.0 * DAY,
         _ => return None,
     };
     Some(n * unit_ms)
@@ -496,6 +751,108 @@ mod tests {
         assert!(Query::parse("", &opts).unwrap().matches(&e));
         opts.workspaces = [crate::workspace::NO_WORKSPACE].into();
         assert!(!Query::parse("", &opts).unwrap().matches(&e));
+    }
+
+    #[test]
+    fn calendar_math() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        for d in [-800_000, -1, 0, 59, 11_016, 20_764, 3_000_000] {
+            let (y, m, day) = civil_from_days(d);
+            assert_eq!(days_from_civil(y, m, day), d);
+        }
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2100, 2), 28);
+        assert_eq!(days_in_month(2026, 12), 31);
+    }
+
+    #[test]
+    fn time_filters() {
+        const H: f64 = 3_600_000.0;
+        // Saturday 2026-11-07, 12:00 UTC.
+        let now = days_from_civil(2026, 11, 7) as f64 * DAY + 12.0 * H;
+        let at = |y, m, d, h: f64| days_from_civil(y, m, d) as f64 * DAY + h * H;
+        let m = |query: &str, e: &TabEntry, offset_min: f64| {
+            q(query).with_context(HashMap::new(), HashSet::new(), now).with_utc_offset(offset_min).matches(e)
+        };
+        let opened = |t: f64| TabEntry { opened_at: t, ..Default::default() };
+
+        // Relative.
+        let e = opened(now - 3.0 * H);
+        assert!(m("opened:4h", &e, 0.0) && m("opened:<4h", &e, 0.0));
+        assert!(!m("opened:2h", &e, 0.0));
+        assert!(m("opened:>2h", &e, 0.0) && !m("opened:>1d", &e, 0.0));
+        assert!(m("opened:2h..4h", &e, 0.0) && m("opened:4h..2h", &e, 0.0) && !m("opened:4h..1d", &e, 0.0));
+        assert!(m("opened:2h..", &e, 0.0) && !m("opened:..2h", &e, 0.0));
+        assert!(!m("-opened:4h", &e, 0.0));
+
+        // Calendar periods, in UTC and in UTC+14 (already Sunday there).
+        assert!(m("opened:today", &e, 0.0) && !m("opened:yesterday", &e, 0.0));
+        assert!(m("opened:yesterday", &opened(at(2026, 11, 6, 23.0)), 0.0));
+        assert!(m("opened:week", &opened(at(2026, 11, 2, 0.0)), 0.0), "Monday starts the week");
+        assert!(!m("opened:week", &opened(at(2026, 11, 1, 23.0)), 0.0));
+        assert!(m("opened:lastweek", &opened(at(2026, 11, 1, 23.0)), 0.0));
+        assert!(m("opened:month", &opened(at(2026, 11, 1, 0.0)), 0.0) && m("opened:lastmonth", &opened(at(2026, 10, 31, 0.0)), 0.0));
+        assert!(m("opened:year", &opened(at(2026, 1, 1, 0.0)), 0.0) && m("opened:lastyear", &opened(at(2025, 12, 31, 0.0)), 0.0));
+        assert!(m("opened:yesterday", &e, 14.0 * 60.0), "Saturday 09:00 is yesterday in UTC+14");
+
+        // Dates.
+        let nov3 = opened(at(2026, 11, 3, 10.0));
+        assert!(m("opened:2026-11-03", &nov3, 0.0) && !m("opened:2026-11-04", &nov3, 0.0));
+        assert!(m("opened:2026-11", &nov3, 0.0) && m("opened:2026", &nov3, 0.0) && !m("opened:2025", &nov3, 0.0));
+        assert!(m("opened:<2026-11-04", &nov3, 0.0) && !m("opened:<2026-11-03", &nov3, 0.0) && m("opened:<=2026-11-03", &nov3, 0.0));
+        assert!(m("opened:>2026-11-02", &nov3, 0.0) && !m("opened:>2026-11-03", &nov3, 0.0) && m("opened:>=2026-11-03", &nov3, 0.0));
+        assert!(m("opened:2026-11-01..2026-11-03", &nov3, 0.0) && m("opened:2026-11-05..2026-11-03", &nov3, 0.0));
+        assert!(!m("opened:2026-11-04..2026-11-05", &nov3, 0.0));
+        assert!(m("opened:2026-11..", &nov3, 0.0) && m("opened:..lastweek", &opened(at(2026, 10, 1, 0.0)), 0.0));
+        assert!(m("opened:2026-10-01..1d", &nov3, 0.0) && !m("opened:2026-10-01..5d", &nov3, 0.0));
+
+        // Each field reads its own time; a missing time never matches.
+        let e = TabEntry { last_accessed: now, created_at: now, closed_at: now, loaded_at: now, unloaded_at: now, ..Default::default() };
+        for f in ["used", "accessed", "added", "created", "first", "closed", "loaded", "unloaded"] {
+            assert!(m(&format!("{f}:1h"), &e, 0.0), "{f}");
+        }
+        assert!(!m("opened:100y", &e, 0.0) && !m("opened:<2100", &e, 0.0));
+        assert!(!q("opened:1h").matches(&e), "no time supplied");
+        assert!(q("opened:1h").uses_time());
+    }
+
+    #[test]
+    fn bad_time_filters_are_errors_not_crashes() {
+        let bad = [
+            "opened:",
+            "opened:soon",
+            "opened:..",
+            "opened:<",
+            "opened:>=",
+            "opened:2026-13",
+            "opened:2026-02-30",
+            "opened:2026-00-01",
+            "opened:2026-1-",
+            "opened:2026--01",
+            "opened:2026-11-01-02",
+            "opened:1e999x",
+            "opened:-5h",
+            "opened:<<1h",
+            "opened:2026-99999999999999999999",
+            "opened:1d...1w",
+            "used:é",
+            "closed:🙂",
+            "added:2026-11-01..soon",
+        ];
+        for s in bad {
+            assert!(Query::parse(s, &SearchOptions::default()).is_err(), "{s} should be an error");
+        }
+        // Odd but valid values, and absurd clocks and offsets: no panic, sensible results.
+        let e = TabEntry { opened_at: 1.0, ..Default::default() };
+        for s in ["opened:0m", "opened:99999999999999999999y", "opened:0000", "opened:9999-12-31", "opened:9999..", "opened:1d..1d"] {
+            let query = Query::parse(s, &SearchOptions::default()).unwrap_or_else(|err| panic!("{s}: {err}"));
+            for now in [1.0, 1e15, 1e300, f64::MAX, f64::INFINITY, f64::NAN, -1e300] {
+                for offset in [0.0, -840.0, 1e300, f64::NAN] {
+                    let _ = query.clone().with_context(HashMap::new(), HashSet::new(), now).with_utc_offset(offset).matches(&e);
+                }
+            }
+        }
     }
 
     #[test]

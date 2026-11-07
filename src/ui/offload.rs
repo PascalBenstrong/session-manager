@@ -16,7 +16,7 @@ use crate::search::{self, Query, SearchOptions, SearchRequest};
 use crate::transfer::{self, Imported};
 use crate::webm;
 
-/// `idle:` searches are run again this often (they depend on the time).
+/// `idle:` and time filter searches are run again this often (they depend on the time).
 const IDLE_STEP_MS: f64 = 10_000.0;
 
 thread_local! {
@@ -129,7 +129,9 @@ impl Search {
             Some((_, _, Err(e))) => return (Hits::All, Some(e.clone())),
             None => unreachable!(),
         };
-        let req = SearchRequest { query: query.to_string(), opts: opts.clone(), duplicates, now, revision: state.revision };
+        // Where local days start, for dates in time filters (`getTimezoneOffset` is UTC minus local).
+        let utc_offset_min = if now > 0.0 { -js_sys::Date::new(&now.into()).get_timezone_offset() } else { 0.0 };
+        let req = SearchRequest { query: query.to_string(), opts: opts.clone(), duplicates, now, utc_offset_min, revision: state.revision };
 
         let answered = self.answer.borrow_mut().take();
         if let Some((asked, answer)) = answered {
