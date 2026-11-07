@@ -2,6 +2,7 @@
 //! ↑/↓ to move, Enter (or click) to jump to a tab, Esc to close. Also clears the
 //! cookies / site data of the current tab or of any open tab in the list.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Key, Layout, Margin, Modifiers, RichText, Sense, Stroke, UiBuilder};
@@ -29,6 +30,10 @@ pub struct MiniView {
     /// The tabs listed (positions in the state's sessions, sorted) and how many there are in
     /// all, for (state generation, all sessions, viewed session, search results).
     listed: super::Cached<(u64, bool, Id, Option<u64>), Rc<Listed>>,
+    /// The current tab's site (for "can't save data"), looked up once: `None` until known,
+    /// `Some(None)` if the tab isn't a web page.
+    site: Rc<RefCell<Option<Option<String>>>>,
+    site_asked: bool,
 }
 
 /// Where the tabs listed are in the state's sessions (sorted), and how many there are in all.
@@ -44,6 +49,8 @@ impl Default for MiniView {
             reload_after_clean: true,
             search: Search::local(),
             listed: None,
+            site: Rc::default(),
+            site_asked: false,
         }
     }
 }
@@ -112,8 +119,21 @@ impl MiniView {
             acts.close_popup();
         }
 
+        if !self.site_asked {
+            self.site_asked = true;
+            let (site, ctx) = (self.site.clone(), ui.ctx().clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let found = crate::platform::get_tab(None)
+                    .await
+                    .ok()
+                    .and_then(|t| crate::cleanup::is_web_page(&t.url).then(|| crate::url::registrable_domain(&crate::url::host(&t.url))));
+                *site.borrow_mut() = Some(found.and_then(|s| crate::guards::storage_site(&s)));
+                ctx.request_repaint();
+            });
+        }
+
         // One click: the current tab's whole site, in all its open tabs.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let reload = if self.reload_after_clean { " and reloads its tabs" } else { "" };
             if ui
                 .add(primary_button(ui, "🧹 Clear this site's data"))
@@ -127,7 +147,32 @@ More options: 🧹 at the top."
                 acts.send(Command::ClearTabData { tab: None, data_types: DataTypes::default(), reload: self.reload_after_clean });
             }
             ui.checkbox(&mut self.reload_after_clean, "Reload").on_hover_text("Reload the site's tabs afterwards, so nothing the page still holds in memory is saved again");
+            let site = self.site.borrow().clone().flatten();
+            if let Some(site) = site {
+                if cx.state.no_storage_sites.contains(&site) {
+                    if ui
+                        .button(format!("✅ Let {site} save data"))
+                        .on_hover_text("It can store cookies and site data again (its open tabs once reloaded)")
+                        .clicked()
+                    {
+                        acts.send(Command::SetNoStorage { site, block: false });
+                    }
+                } else if ui
+                    .button("🚫 Stop it saving data")
+                    .on_hover_text(format!(
+                        "{site} and its subdomains won't be able to keep anything: their pages get storage that                          only lasts until they close or reload, and their cookies are removed as they are set.                          What they saved before is cleared now and their tabs reload. You won't stay logged in there."
+                    ))
+                    .clicked()
+                {
+                    acts.send(Command::SetNoStorage { site, block: true });
+                }
+            }
         });
+        if let Some(Some(site)) = &*self.site.borrow()
+            && cx.state.no_storage_sites.contains(site)
+        {
+            ui.label(RichText::new(format!("🚫 {site} can't save data")).small().color(p.warn));
+        }
         ui.add_space(6.0);
 
         // Search field.

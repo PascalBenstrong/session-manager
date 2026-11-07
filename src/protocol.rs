@@ -110,6 +110,12 @@ pub enum Command {
         id: Id,
     },
     ClearCleanupLog,
+    /// Stop a site (a domain, with its subdomains) from saving data, clearing what it has
+    /// saved and reloading its tabs; or (`block: false`) let it save again.
+    SetNoStorage {
+        site: String,
+        block: bool,
+    },
     /// Remove cookies / site data of one tab's site (`None` = the active tab of the
     /// focused window), optionally reloading the tab afterwards.
     ClearTabData {

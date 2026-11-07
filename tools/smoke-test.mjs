@@ -396,6 +396,56 @@ await step('clear the whole site of the current tab / a given tab, inside its op
   await api.tabs.remove([cur.id, other.id, internal.id]);
 });
 
+await step("a site that can't save data: page script, its data cleared, cookies removed as set", async () => {
+  const site = await api.tabs.create({ url: 'https://www.counter.example/a' });
+  const other = await api.tabs.create({ url: 'https://fine.example/' });
+  cookies.length = 0;
+  cookies.push(
+    { name: 'visits', domain: '.counter.example', path: '/', secure: true },
+    { name: 'keep', domain: 'fine.example', path: '/', secure: true },
+  );
+  reloaded.length = 0;
+  pageScripts.length = 0;
+  const r = await send({ cmd: 'SetNoStorage', site: 'https://WWW.counter.example/a?b', block: true });
+  assert.ok(r.ok, r.error);
+  assert.deepEqual(stored().no_storage_sites, ['counter.example']);
+  const reg = () => contentScripts.find((s) => s.id === 'sm-guard-no-storage');
+  assert.deepEqual(reg().matches, ['*://counter.example/*', '*://*.counter.example/*']);
+  assert.equal(reg().world, 'MAIN');
+  assert.deepEqual(reg().js, ['guards/no-storage.js']);
+  // What it saved is gone, its tab was locked, cleared and reloaded; other sites untouched.
+  assert.deepEqual(cookies.map((c) => c.name), ['keep']);
+  assert.deepEqual(reloaded, [site.id]);
+  assert.ok(pageScripts.some((s) => s.tabId === site.id && s.func === 'lockFrameData'));
+  assert.ok(!pageScripts.some((s) => s.tabId === other.id));
+
+  // New cookies of the site (and set under it by other sites) go as they are set.
+  const set = (c) => {
+    cookies.push(c);
+    ev.cookie.fire({ removed: false, cookie: c, cause: 'explicit' });
+  };
+  set({ name: 'visits', domain: 'm.counter.example', path: '/', secure: true });
+  set({ name: 'ad', domain: 'ads.example', path: '/', secure: true, partitionKey: { topLevelSite: 'https://counter.example' } });
+  set({ name: 'fine2', domain: 'fine.example', path: '/', secure: true });
+  await tick();
+  assert.deepEqual(cookies.map((c) => c.name).sort(), ['fine2', 'keep']);
+
+  // Bad names are refused, and nothing is registered for them.
+  const bad = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'SetNoStorage', site: 'not a site', block: true })));
+  assert.ok(!bad.ok && /not a site name/.test(bad.error));
+  assert.deepEqual(stored().no_storage_sites, ['counter.example']);
+
+  // Allowed again: the page script goes, nothing reloads.
+  reloaded.length = 0;
+  const r2 = await send({ cmd: 'SetNoStorage', site: 'counter.example', block: false });
+  assert.ok(r2.ok, r2.error);
+  assert.deepEqual(stored().no_storage_sites, []);
+  assert.equal(reg(), undefined);
+  assert.deepEqual(reloaded, []);
+  cookies.length = 0;
+  await api.tabs.remove([site.id, other.id]);
+});
+
 await step('auto-remove duplicates when a session is reopened', async () => {
   await send({ cmd: 'UpdateSettings', settings: { ...stored().settings, dedupe_on_session_load: true } });
   await send({ cmd: 'ImportSessions', sessions: [{ name: 'Twice3', entries: [{ url: 'https://twice3.example/a' }, { url: 'https://twice3.example/a#2' }, { url: 'https://twice3.example/b' }] }] });

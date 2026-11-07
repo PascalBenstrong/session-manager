@@ -31,6 +31,8 @@ pub struct CleanupView {
     use_interval: bool,
     interval: u32,
     on_cookie_set: bool,
+    /// A site being added to the "can't save data" list.
+    no_storage_site: String,
 }
 
 impl Default for CleanupView {
@@ -45,6 +47,7 @@ impl Default for CleanupView {
             use_interval: false,
             interval: 60,
             on_cookie_set: false,
+            no_storage_site: String::new(),
         }
     }
 }
@@ -85,9 +88,44 @@ impl CleanupView {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             self.quick_actions(ui, acts);
+            self.no_storage(ui, cx, acts);
             self.editor(ui, cx, acts);
             self.rules(ui, cx, acts);
             self.log(ui, cx, acts);
+        });
+    }
+
+    /// Sites that can't save data (also toggled from the popup).
+    fn no_storage(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
+        let p = theme::palette(ui);
+        let subtitle = "These sites and their subdomains can't keep anything: their pages get storage that only lasts                         until they close or reload, and their cookies are removed as they are set. Frames of other                         sites inside their pages aren't covered.";
+        section_card(ui, "🚫 Sites that can't save data", subtitle, |ui| {
+            let sites = &cx.state.no_storage_sites;
+            if sites.is_empty() {
+                ui.label(RichText::new("None yet. Add one here, or click 🚫 in the popup on the site.").color(p.muted));
+            }
+            for site in sites {
+                ui.horizontal(|ui| {
+                    ui.label(site);
+                    if icon_button(ui, "🗙", "Let it save data again").clicked() {
+                        acts.send(Command::SetNoStorage { site: site.clone(), block: false });
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                let resp = ui.add(text_input(&mut self.no_storage_site, "example.com", 220.0));
+                let valid = crate::guards::storage_site(&self.no_storage_site);
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.add_enabled(valid.is_some(), egui::Button::new("Add")).clicked() || enter)
+                    && let Some(site) = valid
+                {
+                    acts.confirm(
+                        format!("Stop {site} from saving data? What it saved is cleared now and its open tabs reload."),
+                        Command::SetNoStorage { site, block: true },
+                    );
+                    self.no_storage_site.clear();
+                }
+            });
         });
     }
 

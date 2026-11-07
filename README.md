@@ -206,6 +206,12 @@ The UI has dark and light themes; the toggle in the header cycles System → Lig
   - all open tabs
   - all domains
 - Manual clean-ups also clear storage from inside the open tabs of the sites cleaned (all frames). This reaches session storage, `window.name` and embedded frames' partitioned storage, which `browsingData` can't. A partitioned cookie goes with the site it was set under. Cleaning a site from the popup first stops its tabs from saving, then reloads them, so a page can't write back what it holds in memory.
+- Stop a site from saving data: *🚫 Stop it saving data* in the popup, or the list in *Cookies & site data*. On that site and its subdomains:
+  - a page script, registered in the page's world before the site's own scripts run, gives local and session storage, and cookies set by script, that live in memory only;
+  - IndexedDB, the Cache API and service worker registration are refused;
+  - the cookies the server sets are removed as they arrive.
+
+  Frames of other sites inside its pages aren't covered.
 - A *keep* list protects domains from cleaning.
 - Saved rules can run on a timer (`alarms`) and/or delete matching cookies as soon as a site sets them.
 - A log records recent clean-ups.

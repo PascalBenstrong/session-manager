@@ -65,7 +65,7 @@ thread_local! {
     /// The compiled matchers of the rules removing cookies as soon as they're set, with the
     /// rules and open tab URLs they were built from (see [`on_cookie_set`]).
     static COOKIE_MATCHERS: RefCell<(Vec<CleanupSpec>, Vec<String>, Vec<SpecMatcher>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
-    static GUARDS_SYNCED: RefCell<Option<(GuardSettings, Vec<BlockRule>, bool)>> = const { RefCell::new(None) };
+    static GUARDS_SYNCED: RefCell<Option<GuardsWanted>> = const { RefCell::new(None) };
 }
 
 /// How long after opening a tab a rule can still close it (it may load its page late).
@@ -185,18 +185,25 @@ pub async fn start() -> Result<(), JsValue> {
     Ok(())
 }
 
+/// What the page scripts are registered for: guard settings, block rules, the media
+/// script, and the sites that can't save data.
+type GuardsWanted = (GuardSettings, Vec<BlockRule>, bool, Vec<String>);
+
 /// Registers the page guard scripts and script blocking rules for the current settings
 /// (only when they changed since the last time).
 async fn sync_guards() {
-    let wanted = with_state(|s| (s.settings.guards.clone(), s.block_rules.clone(), s.settings.media.needs_page_script()));
+    let wanted = with_state(|s| {
+        (s.settings.guards.clone(), s.block_rules.clone(), s.settings.media.needs_page_script(), s.no_storage_sites.clone())
+    });
     if GUARDS_SYNCED.with(|g| g.borrow().as_ref() == Some(&wanted)) {
         return;
     }
-    let (g, rules, media) = &wanted;
+    let (g, rules, media, no_storage) = &wanted;
     let mut regs = guards::registrations(g, rules);
     if *media {
         regs.push(guards::media_registration());
     }
+    regs.extend(guards::no_storage_registration(no_storage));
     if let Err(e) = pf::sync_content_scripts(&regs).await {
         log(&format!("could not register page guards: {e}"));
     }
@@ -565,6 +572,13 @@ async fn prevent_duplicate(tab: &BrowserTab, now: f64) -> bool {
 async fn on_cookie_set(cookie: Cookie) {
     let hit = STATE.with(|s| {
         let s = s.borrow();
+        // Sites that can't save data: their own cookies, and those set under them (partitioned).
+        if !s.no_storage_sites.is_empty()
+            && (guards::storage_blocked(&s.no_storage_sites, &cookie.host())
+                || cookie.top_level_host().is_some_and(|h| guards::storage_blocked(&s.no_storage_sites, &h)))
+        {
+            return true;
+        }
         let rules = || s.cleanup_rules.iter().filter(|r| r.enabled && r.on_cookie_set && r.spec.data_types.cookies).map(|r| &r.spec);
         if rules().next().is_none() {
             return false;
@@ -1073,6 +1087,34 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             with_state(|s| s.push_cleanup_report(report.clone()));
             persist().await;
             Ok(Response { ok: true, info: Some(report.summary()), report: Some(report), ..Default::default() })
+        }
+        Command::SetNoStorage { site, block } => {
+            let site = guards::storage_site(&site).ok_or_else(|| format!("\"{site}\" is not a site name"))?;
+            let changed = with_state(|s| {
+                let had = s.no_storage_sites.contains(&site);
+                if block && !had {
+                    s.no_storage_sites.push(site.clone());
+                    s.no_storage_sites.sort();
+                } else if !block && had {
+                    s.no_storage_sites.retain(|x| *x != site);
+                }
+                had != block
+            });
+            if changed {
+                persist().await;
+            }
+            // Registered before the tabs reload, so their next pages start without storage.
+            sync_guards().await;
+            if !block {
+                return ok(format!("{site} can save data again (its open tabs once reloaded)"));
+            }
+            // What it saved before goes too, and its tabs reload into memory-only storage.
+            let (_, spec) = cleanup::site_spec(&format!("https://{site}/"), cleanup::DataTypes::default())?;
+            let report = run_cleanup(&format!("Blocked: {site}"), &spec, InPages::ClearAndReload).await?;
+            with_state(|s| s.push_cleanup_report(report.clone()));
+            persist().await;
+            let info = format!("{site} can no longer save data. {}", report.summary());
+            Ok(Response { ok: true, info: Some(info), report: Some(report), ..Default::default() })
         }
         Command::ClearCleanupLog => {
             with_state(|s| s.cleanup_log.clear());

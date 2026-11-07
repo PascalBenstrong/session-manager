@@ -223,6 +223,41 @@ pub fn site_match_patterns(site: &str) -> Vec<String> {
     vec![format!("*://{site}/*"), format!("*://*.{site}/*")]
 }
 
+/// A site for the "can't save data" list: a lowercase host name or IP address
+/// (`https://www.Example.com/x` -> `example.com`), or `None` if it isn't one. Only these
+/// characters go into match patterns: one bad pattern would fail every registration.
+pub fn storage_site(s: &str) -> Option<String> {
+    let site = normalize_site(s.trim()).to_ascii_lowercase();
+    let site = site.trim_end_matches('.');
+    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-');
+    let ok = !site.is_empty()
+        && site.len() <= 253
+        && site.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && site.split('.').all(label_ok);
+    ok.then(|| site.to_string())
+}
+
+/// Whether data of `host` (a page's or a cookie's) falls under one of the `sites`.
+pub fn storage_blocked(sites: &[String], host: &str) -> bool {
+    let host = host.trim_start_matches('.').to_ascii_lowercase();
+    !host.is_empty() && sites.iter().any(|s| url::host_within(&host, s))
+}
+
+/// The page script that keeps the `sites` from saving data (`web/guards/no-storage.js`),
+/// in the page's own world before its scripts run. Guard exceptions don't apply to it.
+pub fn no_storage_registration(sites: &[String]) -> Option<ScriptRegistration> {
+    let matches: Vec<String> = sites.iter().filter_map(|s| storage_site(s)).flat_map(|s| site_match_patterns(&s)).collect();
+    (!matches.is_empty()).then(|| ScriptRegistration {
+        id: "sm-guard-no-storage",
+        js: vec!["guards/no-storage.js"],
+        matches,
+        exclude_matches: Vec::new(),
+        all_frames: true,
+        run_at: "document_start",
+        world: "MAIN",
+    })
+}
+
 /// A content script to register in the page's own world.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -308,6 +343,35 @@ mod tests {
 
     fn rule(id: Id, kind: BlockRuleKind, pattern: &str, sites: &[&str]) -> BlockRule {
         BlockRule { id, enabled: true, kind, pattern: pattern.into(), sites: sites.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn sites_that_cant_save_data() {
+        assert_eq!(storage_site("https://www.Example.com/path?x").as_deref(), Some("example.com"));
+        assert_eq!(storage_site("  shop.example.co.uk. ").as_deref(), Some("shop.example.co.uk"));
+        assert_eq!(storage_site("192.168.1.4").as_deref(), Some("192.168.1.4"));
+        assert_eq!(storage_site("example.com/page").as_deref(), Some("example.com"));
+        for bad in ["", " ", "about:blank", "exa mple.com", "ex*ample.com", "a..b", ".", "-a.com", "a-.com", "é.com", "http://[::1]/"] {
+            assert_eq!(storage_site(bad), None, "{bad:?}");
+        }
+        assert_eq!(storage_site(&"a".repeat(64)), None);
+
+        let sites = vec!["example.com".to_string()];
+        assert!(storage_blocked(&sites, "example.com"));
+        assert!(storage_blocked(&sites, ".example.com"));
+        assert!(storage_blocked(&sites, "WWW.Example.com"));
+        assert!(!storage_blocked(&sites, "notexample.com"));
+        assert!(!storage_blocked(&sites, ""));
+        assert!(!storage_blocked(&[], "example.com"));
+
+        assert_eq!(no_storage_registration(&[]), None);
+        // Invalid entries (never added, but an old or edited state could have one) are skipped.
+        let reg = no_storage_registration(&["example.com".into(), "bad site".into()]).unwrap();
+        assert_eq!(reg.matches, vec!["*://example.com/*", "*://*.example.com/*"]);
+        assert_eq!((reg.world, reg.run_at, reg.all_frames), ("MAIN", "document_start", true));
+        assert!(reg.exclude_matches.is_empty(), "guard exceptions don't apply");
+        assert!(reg.id.starts_with(REGISTRATION_PREFIX));
+        assert_eq!(no_storage_registration(&["bad site".into()]), None);
     }
 
     #[test]

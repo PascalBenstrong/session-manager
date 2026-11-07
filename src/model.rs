@@ -428,6 +428,9 @@ pub struct AppState {
     pub block_rules: Vec<BlockRule>,
     /// Tabs recently opened by pages (newest first, bounded).
     pub popup_log: Vec<PopupEvent>,
+    /// Sites (domains, with their subdomains) not allowed to save data: their pages get
+    /// memory-only storage and their cookies are removed as they are set.
+    pub no_storage_sites: Vec<String>,
     /// Goes up every time the state is saved. A page gets the state both in replies and
     /// from storage changes, which can arrive out of order: it keeps the newest one.
     pub revision: u64,
@@ -451,6 +454,7 @@ impl Default for AppState {
             pending_workspace: BTreeMap::new(),
             block_rules: Vec::new(),
             popup_log: Vec::new(),
+            no_storage_sites: Vec::new(),
             revision: 0,
         };
         let id = s.alloc_id();
