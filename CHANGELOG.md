@@ -2,6 +2,17 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.13.0] - 2026-11-07
+
+### New
+- *🧹 Clear this site's data* at the top of the popup: one click removes the current site's cookies and stored data, and reloads its tabs (untick *Reload* to leave them).
+
+### Changed
+- Clearing a tab's site now covers the whole site with its subdomains (`www.`, `m.`, `login.`…), in every open tab of it, not just the exact address.
+- Site data is now also cleared from inside open pages, in all their frames. This removes session storage and `window.name`, which the browser can't clear from outside, and the storage of embedded frames from other sites. When the tabs are reloaded afterwards, they are first stopped from saving again, so a page can't put back what it still holds in memory, such as a count of the links you opened.
+- Cookies that other sites (ads, embeds) set while you were on a site are removed with it.
+- *Run* on a cleanup rule and the quick clean-ups (all open tabs' sites, all domains) also clear inside open tabs, without reloading them. Scheduled rules don't, and hibernated tabs are left asleep.
+
 ## [0.12.0] - 2026-11-07
 
 ### New
