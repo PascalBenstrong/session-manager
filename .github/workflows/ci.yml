@@ -46,7 +46,7 @@ jobs:
         run: cargo test
 
       - name: Build
-        run: ./build.sh
+        run: bash ./build.sh
 
       - name: Smoke tests (mock browser)
         run: |

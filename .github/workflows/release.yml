@@ -46,7 +46,7 @@ jobs:
         run: cargo test
 
       - name: Build the zips
-        run: ./build.sh --zip
+        run: bash ./build.sh --zip
 
       - name: Smoke tests on the release build
         run: |
