@@ -12,13 +12,111 @@
 //! Each tab has a sequence number (its position, saved with it). Tabs are only ever
 //! appended, removed, or all replaced, so the order of the sequence numbers is the order of
 //! the list, and a change to one tab never rewrites the others' positions.
+//!
+//! Tabs are found by entry id or by browser tab id in O(1) (plus the tabs changed since the
+//! last lookup): an index follows the same change tracking. An appended tab is indexed
+//! right away, a changed tab again at the next lookup, and after tabs were removed or
+//! replaced the index is rebuilt at the next lookup (O(tabs of the session)). Every hit is
+//! checked against the tab itself, so a stale index can't return a wrong tab.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::model::{Id, TabEntry};
+use crate::model::{Id, TabEntry, TabId};
+
+/// Where each tab is, by entry id and by browser tab id.
+#[derive(Clone, Default)]
+struct Index {
+    /// Positions by key (one, unless ids repeat: then the first is the answer, as a scan's).
+    by_id: HashMap<Id, Vec<usize>>,
+    by_tab: HashMap<TabId, Vec<usize>>,
+    /// The ids each position was indexed under.
+    keys: Vec<(Id, Option<TabId>)>,
+    /// Positions changed since they were indexed.
+    pending: Vec<usize>,
+    /// Rebuild before the next lookup (tabs were removed or replaced).
+    stale: bool,
+}
+
+/// Adds a position under a key (kept sorted: the first is the answer).
+fn put<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Vec<usize>>, k: K, p: usize) {
+    let v = map.entry(k).or_default();
+    if let Err(i) = v.binary_search(&p) {
+        v.insert(i, p);
+    }
+}
+
+fn take<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Vec<usize>>, k: K, p: usize) {
+    if let Some(v) = map.get_mut(&k) {
+        v.retain(|x| *x != p);
+        if v.is_empty() {
+            map.remove(&k);
+        }
+    }
+}
+
+impl Index {
+    fn stale() -> Self {
+        Index { stale: true, ..Default::default() }
+    }
+
+    fn add(&mut self, p: usize, e: &TabEntry) {
+        if self.stale {
+            return;
+        }
+        self.keys.push((e.id, e.tab_id));
+        put(&mut self.by_id, e.id, p);
+        if let Some(t) = e.tab_id {
+            put(&mut self.by_tab, t, p);
+        }
+    }
+
+    /// A tab may have changed its ids.
+    fn touch(&mut self, p: usize, len: usize) {
+        if self.stale {
+            return;
+        }
+        self.pending.push(p);
+        // Many changes without a lookup (e.g. a pass over every tab): rebuild instead.
+        if self.pending.len() > len.max(16) {
+            self.stale = true;
+            self.pending.clear();
+        }
+    }
+
+    fn sync(&mut self, list: &[TabEntry]) {
+        if self.stale || self.keys.len() != list.len() {
+            self.by_id.clear();
+            self.by_tab.clear();
+            self.keys.clear();
+            self.pending.clear();
+            self.stale = false;
+            for (p, e) in list.iter().enumerate() {
+                self.add(p, e);
+            }
+            return;
+        }
+        for p in std::mem::take(&mut self.pending) {
+            let Some(e) = list.get(p) else { continue };
+            let (old_id, old_tab) = self.keys[p];
+            if (old_id, old_tab) == (e.id, e.tab_id) {
+                continue;
+            }
+            take(&mut self.by_id, old_id, p);
+            if let Some(t) = old_tab {
+                take(&mut self.by_tab, t, p);
+            }
+            self.keys[p] = (e.id, e.tab_id);
+            put(&mut self.by_id, e.id, p);
+            if let Some(t) = e.tab_id {
+                put(&mut self.by_tab, t, p);
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Entries {
@@ -32,12 +130,22 @@ pub struct Entries {
     /// Tabs were added or removed, or the list is new: compare it all with what's saved.
     touched: Cell<bool>,
     next_seq: u64,
+    /// Where tabs are by id and by browser tab (see the module docs).
+    ix: RefCell<Index>,
 }
 
 impl Default for Entries {
     /// An empty list, not read from the database: touched.
     fn default() -> Self {
-        Self { list: Vec::new(), seq: Vec::new(), changed: Vec::new(), dirty: RefCell::default(), touched: Cell::new(true), next_seq: 0 }
+        Self {
+            list: Vec::new(),
+            seq: Vec::new(),
+            changed: Vec::new(),
+            dirty: RefCell::default(),
+            touched: Cell::new(true),
+            next_seq: 0,
+            ix: RefCell::new(Index::stale()),
+        }
     }
 }
 
@@ -47,7 +155,9 @@ pub struct EntryMut<'a> {
     entry: &'a mut TabEntry,
     changed: &'a mut bool,
     index: usize,
+    len: usize,
     dirty: &'a RefCell<Vec<usize>>,
+    ix: &'a RefCell<Index>,
 }
 
 impl Deref for EntryMut<'_> {
@@ -63,6 +173,7 @@ impl DerefMut for EntryMut<'_> {
             *self.changed = true;
             self.dirty.borrow_mut().push(self.index);
         }
+        self.ix.borrow_mut().touch(self.index, self.len);
         self.entry
     }
 }
@@ -99,7 +210,55 @@ impl Entries {
         let next_seq = items.last().map_or(0, |(s, _)| s + 1);
         let n = items.len();
         let (seq, list) = items.into_iter().unzip();
-        Self { list, seq, changed: vec![false; n], dirty: RefCell::default(), touched: Cell::new(false), next_seq }
+        Self {
+            list,
+            seq,
+            changed: vec![false; n],
+            dirty: RefCell::default(),
+            touched: Cell::new(false),
+            next_seq,
+            ix: RefCell::new(Index::stale()),
+        }
+    }
+
+    /// The position of the tab with this entry id.
+    pub fn position(&self, id: Id) -> Option<usize> {
+        let found = {
+            let mut ix = self.ix.borrow_mut();
+            ix.sync(&self.list);
+            ix.by_id.get(&id).and_then(|v| v.first().copied())
+        };
+        match found {
+            Some(p) if self.list.get(p).is_some_and(|e| e.id == id) => Some(p),
+            None => None,
+            // Can't happen; if it does, the answer is still right.
+            Some(_) => {
+                self.ix.borrow_mut().stale = true;
+                self.list.iter().position(|e| e.id == id)
+            }
+        }
+    }
+
+    /// The position of the tab linked to this browser tab.
+    pub fn position_of_tab(&self, tab: TabId) -> Option<usize> {
+        let found = {
+            let mut ix = self.ix.borrow_mut();
+            ix.sync(&self.list);
+            ix.by_tab.get(&tab).and_then(|v| v.first().copied())
+        };
+        match found {
+            Some(p) if self.list.get(p).is_some_and(|e| e.tab_id == Some(tab)) => Some(p),
+            None => None,
+            Some(_) => {
+                self.ix.borrow_mut().stale = true;
+                self.list.iter().position(|e| e.tab_id == Some(tab))
+            }
+        }
+    }
+
+    /// The tab with this entry id.
+    pub fn find(&self, id: Id) -> Option<&TabEntry> {
+        self.position(id).map(|p| &self.list[p])
     }
 
     pub fn as_slice(&self) -> &[TabEntry] {
@@ -107,6 +266,7 @@ impl Entries {
     }
 
     pub fn push(&mut self, e: TabEntry) {
+        self.ix.get_mut().add(self.list.len(), &e);
         self.list.push(e);
         self.seq.push(self.next_seq);
         self.next_seq += 1;
@@ -129,6 +289,7 @@ impl Entries {
         }
         if !gone.is_empty() {
             self.touched.set(true);
+            self.ix.get_mut().stale = true;
         }
         gone
     }
@@ -138,11 +299,13 @@ impl Entries {
         self.seq.remove(index);
         self.changed.remove(index);
         self.touched.set(true);
+        self.ix.get_mut().stale = true;
         self.list.remove(index)
     }
 
     /// Replaces every tab (they're all saved again).
     pub fn replace_all(&mut self, entries: Vec<TabEntry>) {
+        *self.ix.get_mut() = Index::default();
         self.list.clear();
         self.seq.clear();
         self.changed.clear();
@@ -157,12 +320,13 @@ impl Entries {
         self.seq.clear();
         self.changed.clear();
         self.touched.set(true);
+        *self.ix.get_mut() = Index::default();
         std::mem::take(&mut self.list)
     }
 
     /// The tab with this id, to change it (marked changed).
     pub fn get_mut(&mut self, id: Id) -> Option<&mut TabEntry> {
-        let i = self.list.iter().position(|e| e.id == id)?;
+        let i = self.position(id)?;
         Some(self.at_mut(i))
     }
 
@@ -172,17 +336,21 @@ impl Entries {
             self.changed[index] = true;
             self.dirty.get_mut().push(index);
         }
+        let len = self.list.len();
+        self.ix.get_mut().touch(index, len);
         &mut self.list[index]
     }
 
     /// Every tab, to change some: only the ones actually changed are marked.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = EntryMut<'_>> {
-        let dirty = &self.dirty;
+        let (dirty, ix, len) = (&self.dirty, &self.ix, self.list.len());
         self.list.iter_mut().zip(self.changed.iter_mut()).enumerate().map(move |(index, (entry, changed))| EntryMut {
             entry,
             changed,
             index,
+            len,
             dirty,
+            ix,
         })
     }
 
@@ -360,6 +528,59 @@ mod tests {
         // A list not read from the database is always compared in full.
         assert!(Entries::default().has_changes());
         assert!(Entries::from(vec![e(1)]).has_changes());
+    }
+
+    /// The index answers like a scan, whatever happens to the list.
+    #[test]
+    fn lookups_match_a_scan() {
+        let mut list =
+            Entries::from_saved((1..=20).map(|i| (i, TabEntry { tab_id: (i % 3 != 0).then_some(i as i64 * 10), ..e(i) })).collect());
+        let mut rng = 12345u64;
+        let mut next = |n: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % n
+        };
+        let mut new_id = 100;
+        for round in 0..3000 {
+            match next(9) {
+                0 => {
+                    new_id += 1;
+                    list.push(TabEntry { tab_id: Some(new_id as i64 * 10), ..e(new_id) });
+                }
+                1 if !list.is_empty() => {
+                    let i = next(list.len() as u64) as usize;
+                    list.remove(i);
+                }
+                2 if !list.is_empty() => {
+                    let i = next(list.len() as u64) as usize;
+                    list.at_mut(i).tab_id = Some(next(400) as i64);
+                }
+                3 => {
+                    let t = next(400) as i64;
+                    for mut x in list.iter_mut() {
+                        if x.id % 5 == round % 5 {
+                            x.tab_id = if x.tab_id.is_some() { None } else { Some(t) };
+                        }
+                    }
+                }
+                4 => {
+                    let cut = next(150);
+                    list.retain(|x| x.id != cut);
+                }
+                5 if round % 200 == 0 => {
+                    let keep: Vec<TabEntry> = list.iter().take(10).cloned().collect();
+                    list.replace_all(keep);
+                }
+                6 => list.clear_changes(),
+                _ => {}
+            }
+            for probe in 0..160u64 {
+                assert_eq!(list.position(probe), list.iter().position(|x| x.id == probe), "id {probe} in round {round}");
+                let t = probe as i64 * 5 % 400;
+                // Also with repeated tab ids (not in real states): the first, like a scan.
+                assert_eq!(list.position_of_tab(t), list.iter().position(|x| x.tab_id == Some(t)), "tab {t} in round {round}");
+            }
+        }
     }
 
     #[test]

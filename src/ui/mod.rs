@@ -486,8 +486,13 @@ impl App {
             self.db_reading = false;
             match read {
                 Ok(Some(read)) => self.db_read_done(read),
-                Ok(None) => {}
-                Err(e) => self.set_status(format!("Could not read the saved tabs: {e}"), true),
+                // Nothing in the database (it's off, or couldn't be opened): stop asking.
+                Ok(None) => self.db_wanted = None,
+                Err(e) => {
+                    // Tried again at the next change, not every frame.
+                    self.db_wanted = None;
+                    self.set_status(format!("Could not read the saved tabs: {e}"), true);
+                }
             }
         }
         for (text, error) in notices {
@@ -509,6 +514,13 @@ impl App {
             }
             if let Some(hits) = r.hits {
                 self.tabs.vector_results(hits);
+            }
+            // The command saved a newer state: read what changed from the database. (With
+            // the database off, the whole state comes from storage.local instead.)
+            if let Some(rev) = r.revision
+                && self.state.as_ref().is_some_and(|s| s.settings.tracking.database && rev > s.revision)
+            {
+                self.db_wanted = Some(self.db_wanted.map_or(rev, |w| w.max(rev)));
             }
             if let Some(e) = r.error {
                 // Keep the popup open so the error can be read.

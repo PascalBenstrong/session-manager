@@ -267,6 +267,10 @@ pub struct Response {
     pub state: Option<AppState>,
     pub report: Option<CleanupReport>,
     pub capabilities: Option<Capabilities>,
+    /// The state revision saved when the command finished (replies other than GetState,
+    /// which carries the state itself): pages newer than it have nothing to read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
     /// Results of [`Command::VectorSearch`], best first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hits: Option<Vec<crate::ai::VectorHit>>,

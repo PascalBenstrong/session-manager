@@ -126,10 +126,8 @@ fn with_state<R>(f: impl FnOnce(&mut AppState) -> R) -> R {
     STATE.with(|s| f(&mut s.borrow_mut()))
 }
 
-/// A copy of the state for pages, without the sessions' snapshots (pages read those from
-/// SNAPSHOTS_KEY).
-/// A command's reply with the state (without snapshots), written from the state itself
-/// rather than from a copy.
+/// The reply to GetState: the whole state (without snapshots: pages read those from
+/// SNAPSHOTS_KEY), written from the state itself rather than from a copy.
 #[derive(Serialize)]
 struct Reply<'a> {
     #[serde(flatten)]
@@ -137,8 +135,18 @@ struct Reply<'a> {
     state: &'a AppState,
 }
 
-fn reply_json(resp: &Response) -> serde_json::Result<String> {
-    STATE.with(|s| without_snapshots(&mut s.borrow_mut(), |s| serde_json::to_string(&Reply { response: resp, state: s })))
+/// A command's reply. Only GetState (a page starting) carries the whole state, O(tabs);
+/// other replies carry the revision saved, O(1): pages read what changed from the
+/// database (or get the state from storage.local with the database off).
+fn reply_json(resp: &mut Response, full: bool) -> serde_json::Result<String> {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if full {
+            return without_snapshots(&mut s, |s| serde_json::to_string(&Reply { response: resp, state: s }));
+        }
+        resp.revision = Some(s.revision);
+        serde_json::to_string(resp)
+    })
 }
 
 /// Runs `f` on the state with its snapshots taken out (and puts them back).
@@ -743,7 +751,10 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         }
         Event::Message { payload } => {
             let json = match serde_json::from_str::<Command>(&payload) {
-                Ok(cmd) => reply_json(&execute(cmd).await),
+                Ok(cmd) => {
+                    let full = cmd == Command::GetState;
+                    reply_json(&mut execute(cmd).await, full)
+                }
                 Err(e) => serde_json::to_string(&Response::err(format!("bad command: {e}"))),
             }
             .map_err(|e| e.to_string())?;

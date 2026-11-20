@@ -167,7 +167,7 @@ impl Snapshot {
 
 impl Session {
     pub fn entry(&self, id: Id) -> Option<&TabEntry> {
-        self.entries.iter().find(|e| e.id == id)
+        self.entries.find(id)
     }
 
     /// The tab with this id, to change it (it's saved at the next save).

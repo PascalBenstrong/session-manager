@@ -36,9 +36,16 @@ await glue.start_background();
 
 // Frequent changes (navigation, titles, playback) are saved together within a second: wait for that.
 const tick = () => new Promise((r) => setTimeout(r, 1100));
+/** Sends a command. Only GetState replies carry the state (others the revision saved): for
+ * the tests' convenience, the state is fetched after other commands. */
 const send = async (cmd) => {
   const r = JSON.parse(await pf.sendMessage(JSON.stringify(cmd)));
   assert.ok(r.ok, `${cmd.cmd} failed: ${r.error}`);
+  if (cmd.cmd !== 'GetState') {
+    assert.ok(!('state' in r), `${cmd.cmd}: replies other than GetState don't carry the state`);
+    assert.equal(typeof r.revision, 'number', `${cmd.cmd}: replies carry the revision saved`);
+    r.state = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'GetState' }))).state;
+  }
   return r;
 };
 /** The saved state: from the database (tabs put back in their sessions, in order), or from
@@ -589,7 +596,7 @@ await step('every save gets a newer revision (pages keep the newest state they g
   assert.ok(before > 0, 'saved states have a revision');
   const r = await send({ cmd: 'SaveWorkspace', workspace: { id: 0, name: 'Rev', rules: [] } });
   assert.ok(stored().revision > before, 'it goes up');
-  assert.equal(r.state.revision, stored().revision, 'replies carry the revision saved');
+  assert.equal(r.revision, stored().revision, 'replies carry the revision saved');
   await send({ cmd: 'DeleteWorkspace', id: r.state.workspaces.find((w) => w.name === 'Rev').id });
   assert.ok(stored().revision > r.state.revision);
 });
@@ -1139,6 +1146,21 @@ await step('AI summaries (stubbed provider) and vector search by meaning, with s
     globalThis.fetch = realFetch;
     delete globalThis.document;
   }
+});
+
+await step('command replies stay small with many tabs (only GetState carries the state)', async () => {
+  const opened = [];
+  for (let i = 0; i < 300; i++) opened.push(await api.tabs.create({ url: `https://many${i}.example/` }));
+  await tick();
+  const st = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'GetState' }))).state;
+  const sid = st.active_session;
+  const entry = st.sessions.find((x) => x.id === sid).entries.find((e) => e.url === 'https://many0.example/');
+  const full = (await pf.sendMessage(JSON.stringify({ cmd: 'GetState' }))).length;
+  const reply = await pf.sendMessage(JSON.stringify({ cmd: 'TagEntries', entries: [{ session: sid, entry: entry.id }], tag: 'one', add: true }));
+  assert.ok(reply.length < 1500, `a reply is ${reply.length} bytes`);
+  assert.ok(full > 50 * reply.length, `GetState ${full} bytes vs a reply ${reply.length}`);
+  await api.tabs.remove(opened.map((t) => t.id));
+  await tick();
 });
 
 await step('worker jobs: search on the state sent, imports, WebM errors', async () => {

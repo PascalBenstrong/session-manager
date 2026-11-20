@@ -166,10 +166,9 @@ impl AppState {
         others
     }
 
+    /// The entry linked to a browser tab. O(sessions), not O(tabs): see `entries.rs`.
     pub fn locate_tab(&self, tab_id: TabId) -> Option<EntryRef> {
-        self.sessions
-            .iter()
-            .find_map(|s| s.entries.iter().find(|e| e.tab_id == Some(tab_id)).map(|e| EntryRef { session: s.id, entry: e.id }))
+        self.sessions.iter().find_map(|s| s.entries.position_of_tab(tab_id).map(|p| EntryRef { session: s.id, entry: s.entries[p].id }))
     }
 
     pub fn entry(&self, r: EntryRef) -> Option<&TabEntry> {
@@ -471,19 +470,27 @@ impl AppState {
     /// Removes entries; returns the open tab ids of removed entries. Unless those tabs get
     /// closed, they are ignored so they don't get re-added automatically.
     pub fn remove_entries(&mut self, refs: &[EntryRef], ignore_open: bool) -> Vec<TabId> {
-        let mut open = Vec::new();
-        for r in refs {
-            if let Some(s) = self.session_mut(r.session)
-                && let Some(i) = s.entries.iter().position(|e| e.id == r.entry)
-            {
-                let e = s.entries.remove(i);
-                open.extend(e.tab_id);
-            }
-        }
+        let open: Vec<TabId> = self.take_entries(refs).into_iter().filter_map(|e| e.tab_id).collect();
         if ignore_open {
             self.ignored_tab_ids.extend(open.iter().copied());
         }
         open
+    }
+
+    /// Takes entries out of their sessions, in the order of `refs`: one pass over each session
+    /// involved (O(tabs of those sessions)), not one per entry.
+    fn take_entries(&mut self, refs: &[EntryRef]) -> Vec<TabEntry> {
+        let mut by_session: HashMap<Id, HashSet<Id>> = HashMap::new();
+        for r in refs {
+            by_session.entry(r.session).or_default().insert(r.entry);
+        }
+        let mut taken: HashMap<Id, TabEntry> = HashMap::new();
+        for (sid, ids) in by_session {
+            if let Some(s) = self.session_mut(sid) {
+                taken.extend(s.entries.retain(|e| !ids.contains(&e.id)).into_iter().map(|e| (e.id, e)));
+            }
+        }
+        refs.iter().filter_map(|r| taken.remove(&r.entry)).collect()
     }
 
     /// Closes entries' tabs but keeps the entries, as saved (closed) tabs in their session
@@ -535,14 +542,8 @@ impl AppState {
 
     pub fn move_entries(&mut self, refs: &[EntryRef], target: Id) -> Result<usize, String> {
         self.session(target).ok_or("no such session")?;
-        let mut moved = Vec::new();
-        for r in refs.iter().filter(|r| r.session != target) {
-            if let Some(s) = self.session_mut(r.session)
-                && let Some(i) = s.entries.iter().position(|e| e.id == r.entry)
-            {
-                moved.push(s.entries.remove(i));
-            }
-        }
+        let from: Vec<EntryRef> = refs.iter().filter(|r| r.session != target).copied().collect();
+        let mut moved = self.take_entries(&from);
         let n = moved.len();
         let generation = self.generation(target);
         for e in &mut moved {

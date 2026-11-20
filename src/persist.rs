@@ -260,6 +260,16 @@ mod tests {
         let in_state: usize = state.sessions.iter().map(|s| s.entries.len()).sum();
         assert_eq!(db.tabs.len(), in_state, "{what}: no tab left over in the database");
         assert!(state.sessions.iter().all(|s| !s.entries.has_changes()), "{what}: changes forgotten once saved");
+        // Lookups by tab and by id answer like a scan of every session.
+        for x in &state.sessions {
+            for e in x.entries.iter() {
+                assert_eq!(state.session(x.id).unwrap().entry(e.id).map(|f| f.id), Some(e.id), "{what}: entry {}", e.id);
+                if let Some(t) = e.tab_id {
+                    let scan = state.sessions.iter().find_map(|y| y.entries.iter().find(|f| f.tab_id == Some(t)).map(|f| (y.id, f.id)));
+                    assert_eq!(state.locate_tab(t).map(|r| (r.session, r.entry)), scan, "{what}: tab {t}");
+                }
+            }
+        }
     }
 
     #[test]
