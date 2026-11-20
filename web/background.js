@@ -8,5 +8,8 @@ import init, { start_background } from './pkg/session_manager.js';
 globalThis.smPlatform.installBackgroundListeners();
 
 init()
-  .then(() => start_background())
+  .then((wasm) => {
+    globalThis.smPlatform.setWasmMemory(wasm.memory);
+    return start_background();
+  })
   .catch((e) => console.error('[session-manager] background failed to start', e));

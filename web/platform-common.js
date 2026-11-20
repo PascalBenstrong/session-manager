@@ -747,8 +747,28 @@ export function installPlatform(api, overrides = {}) {
   let gesture = '';
   let pageWindowId = null;
 
+  // How long the background takes per event and per command, and its memory, for the
+  // performance tests in real browsers (tools/perf-real-test.mjs asks with { smTimings }).
+  // Two clock reads per event and the last 256 times per kind: nothing more.
+  const timings = new Map();
+  const loadedAt = performance.now();
+  let startupMs = null;
+  let wasmMemory = null;
+  const record = (kind, ms) => {
+    let list = timings.get(kind);
+    if (!list) timings.set(kind, (list = []));
+    list.push(ms);
+    if (list.length > 256) list.shift();
+  };
+  const kindOf = (ev) => (ev.type === 'message' ? `cmd:${(/"cmd":"(\w+)"/.exec(ev.payload) || [])[1] || '?'}` : ev.type);
+
   function emit(ev) {
-    if (handler) return Promise.resolve(handler(ev));
+    if (handler) {
+      const t = performance.now();
+      const done = Promise.resolve(handler(ev));
+      done.finally(() => record(kindOf(ev), performance.now() - t)).catch(() => {});
+      return done;
+    }
     return new Promise((resolve, reject) => queue.push({ ev, resolve, reject }));
   }
 
@@ -1527,10 +1547,17 @@ export function installPlatform(api, overrides = {}) {
 
     // ---- background only ----
     setEventHandler(fn) {
+      // The background is ready: how long it took since its script started.
+      startupMs ??= performance.now() - loadedAt;
       handler = fn;
       for (const { ev, resolve, reject } of queue.splice(0)) {
         Promise.resolve(fn(ev)).then(resolve, reject);
       }
+    },
+
+    /** The background's wasm memory (its size is reported to the performance tests). */
+    setWasmMemory(memory) {
+      wasmMemory = memory;
     },
 
     /** Must be called synchronously at background startup (top level). */
@@ -1660,6 +1687,16 @@ export function installPlatform(api, overrides = {}) {
           dockedTabs().then((list) => {
             if (list.includes(sender.tab.id)) platform.dockInspector(sender.tab.id).catch(() => {});
           });
+          return false;
+        }
+        // The performance tests read (and reset) the timings.
+        if (msg && msg.smTimings && sender && sender.id === api.runtime.id) {
+          sendResponse({
+            startupMs,
+            wasmBytes: wasmMemory ? wasmMemory.buffer.byteLength : null,
+            timings: Object.fromEntries(timings),
+          });
+          if (msg.smTimings === 'reset') timings.clear();
           return false;
         }
         if (!msg || typeof msg.smPayload !== 'string') return false;

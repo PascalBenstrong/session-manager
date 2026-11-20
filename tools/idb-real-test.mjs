@@ -5,32 +5,18 @@
 // 2. The extension itself, end to end: it migrates a 0.14 state from storage.local into
 //    IndexedDB, saves only changed tabs, keeps the order of tabs, and pages read it back.
 //
-//   ./build.sh && node tools/idb-real-test.mjs edge      (or chrome, firefox)
+//   ./build.sh && node tools/idb-real-test.mjs edge      (or chrome, firefox; SM_HEADLESS=1 in CI)
 //
 // A throwaway profile is used; your own browser profile is never touched.
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { fakeObservations } from './idb-node-check.mjs';
+import { launch, sleep, until } from './real-browser.mjs';
 
 const which = process.argv[2] || 'edge';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const until = async (what, f, ms = 15000) => {
-  let last;
-  for (const end = Date.now() + ms; Date.now() < end; await sleep(250)) {
-    try {
-      const v = await f();
-      if (v) return v;
-    } catch (e) {
-      last = e;
-    }
-  }
-  throw new Error(`timed out waiting for ${what}${last ? ` (${last.message})` : ''}`);
-};
 let passed = 0;
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -47,19 +33,16 @@ const runConformance = `(async () => {
   return JSON.stringify(await idbConformance(indexedDB, createDb));
 })()`;
 
-const profile = mkdtempSync(join(tmpdir(), 'sm-idb-'));
 let browser;
 try {
-  if (which === 'firefox') await firefox();
-  else await chromium();
+  browser = await launch(which);
+  const page = browser.page();
+  await compareConformance(async (expr) => JSON.parse(await page(expr)));
+  await extensionChecks(page, () => browser.reload(), browser.api, (path) => browser.open(path));
 } catch (e) {
   check('the run finished', false, e.stack || e.message);
 } finally {
-  if (browser?.pid) spawn('taskkill', ['/PID', String(browser.pid), '/T', '/F']);
-  await sleep(1500);
-  try {
-    rmSync(profile, { recursive: true, force: true });
-  } catch {}
+  await browser?.close();
 }
 console.log(`\n${passed}/${results.length} checks passed (${which})`);
 process.exit(results.length === passed ? 0 : 1);
@@ -197,166 +180,4 @@ async function extensionChecks(page, reload, api, openPage) {
     return d.tabs.length > 0 && d;
   });
   check('database on again: back in IndexedDB, storage.local cleared', back.tabs.length === after.tabs.length && (await local(page, 'sm_state')) === null);
-}
-
-// ------------------------------------------------------------------ Edge / Chrome
-
-async function chromium() {
-  const exe = which === 'chrome' ? 'C:/Program Files/Google/Chrome/Application/chrome.exe' : 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-  const ext = join(root, 'dist', 'chrome');
-  browser = spawn(exe, [
-    `--user-data-dir=${profile}`, '--remote-debugging-port=9334', `--load-extension=${ext}`, `--disable-extensions-except=${ext}`,
-    '--no-first-run', '--no-default-browser-check', '--window-size=1200,800', 'about:blank',
-  ]);
-  const version = await until('the browser', async () => (await fetch('http://127.0.0.1:9334/json/version')).json());
-  const cdp = await connect(version.webSocketDebuggerUrl);
-  // Edge has built-in extensions with a background.js too: ours is the one with our name.
-  const extId = await until('the extension', async () => {
-    const { targetInfos } = await cdp.send('Target.getTargets');
-    for (const t of targetInfos.filter((t) => t.type === 'service_worker' && /^chrome-extension:\/\/[a-p]{32}\/background\.js$/.test(t.url))) {
-      const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
-      const r = await cdp.send('Runtime.evaluate', { expression: 'chrome.runtime.getManifest().name', returnByValue: true }, sessionId).catch(() => null);
-      await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
-      if (r?.result?.value === 'Session Manager') return new URL(t.url).host;
-    }
-    return null;
-  });
-  console.log(`extension ${extId} loaded in ${which}`);
-  const open = async (path = 'inspector.html') => {
-    const { targetId } = await cdp.send('Target.createTarget', { url: `chrome-extension://${extId}/${path}` });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    const evaluate = async (expression) => {
-      const r = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
-      if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
-      return r.result.value;
-    };
-    await until('smPlatform on the page', () => evaluate("typeof smPlatform === 'object'")).catch(async (e) => {
-      const why = await evaluate("JSON.stringify({ url: location.href, ready: document.readyState, text: document.body?.innerText?.slice(0, 300) })").catch((x) => x.message);
-      throw new Error(`${e.message}: ${why}`);
-    });
-    return evaluate;
-  };
-  const page = await open();
-  await compareConformance(async (expr) => JSON.parse(await page(expr)));
-  const reload = async () => {
-    await page('chrome.runtime.reload()').catch(() => {});
-    await sleep(2500);
-    await until('the extension after reloading', async () => {
-      const { targetInfos } = await cdp.send('Target.getTargets');
-      return targetInfos.some((t) => t.type === 'service_worker' && t.url.includes(extId));
-    });
-    return open();
-  };
-  await extensionChecks(page, reload, 'chrome', open);
-}
-
-async function connect(url) {
-  const ws = new WebSocket(url);
-  await new Promise((ok, fail) => {
-    ws.onopen = ok;
-    ws.onerror = fail;
-  });
-  let next = 1;
-  const pending = new Map();
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    const p = pending.get(msg.id);
-    if (!p) return;
-    pending.delete(msg.id);
-    if (msg.error) p.fail(new Error(`${p.method}: ${msg.error.message}`));
-    else p.ok(msg.result);
-  };
-  return {
-    send(method, params = {}, sessionId) {
-      const id = next++;
-      ws.send(JSON.stringify({ id, method, params, sessionId }));
-      return new Promise((ok, fail) => pending.set(id, { ok, fail, method }));
-    },
-  };
-}
-
-// ------------------------------------------------------------------ Firefox
-
-async function firefox() {
-  const uuid = '5e55104e-0000-4000-8000-000000000002';
-  writeFileSync(
-    join(profile, 'user.js'),
-    [
-      `user_pref("extensions.webextensions.uuids", ${JSON.stringify(JSON.stringify({ 'session-manager@local.extension': uuid }))});`,
-      // Reinstalling stands in for restarting the extension: keep its data meanwhile.
-      'user_pref("extensions.webextensions.keepStorageOnUninstall", true);',
-      'user_pref("extensions.webextensions.keepUuidOnUninstall", true);',
-      'user_pref("browser.shell.checkDefaultBrowser", false);',
-      'user_pref("browser.aboutwelcome.enabled", false);',
-      'user_pref("datareporting.policy.dataSubmissionEnabled", false);',
-    ].join('\n'),
-  );
-  browser = spawn('C:/Program Files/Mozilla Firefox/firefox.exe', [
-    '-profile', profile, '-no-remote', '-new-instance', '--remote-debugging-port', '9336', '--remote-allow-system-access', '-width', '1200', '-height', '800',
-  ], { env: { ...process.env, MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: '1' } });
-  const bidi = await until('Firefox', async () => connectBidi('ws://127.0.0.1:9336/session'), 30000);
-  await bidi.send('session.new', { capabilities: {} });
-  const install = () => bidi.send('webExtension.install', { extensionData: { type: 'path', path: join(root, 'dist', 'firefox') } });
-  let { extension } = await install();
-  console.log(`extension ${extension} installed in firefox`);
-  const base = `moz-extension://${uuid}`;
-  const chromeWin = (await bidi.send('browsingContext.getTree', { 'moz:scope': 'chrome' })).contexts[0].context;
-  const open = async (path = 'inspector.html') => {
-    const known = new Set((await bidi.send('browsingContext.getTree', {})).contexts.map((c) => c.context));
-    await bidi.send('script.evaluate', {
-      // Selected: pages in background tabs don't draw frames (the UI updates as it draws).
-      expression: `(gBrowser.selectedTab = gBrowser.addTab(${JSON.stringify(`${base}/${path}`)}, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() })) && true`,
-      target: { context: chromeWin },
-      awaitPromise: false,
-    });
-    const context = await until('the extension page', async () =>
-      (await bidi.send('browsingContext.getTree', {})).contexts.find((c) => !known.has(c.context) && c.url.startsWith(base))?.context);
-    const evaluate = async (expression) => {
-      const r = await bidi.send('script.evaluate', {
-        expression: `Promise.resolve(${expression}).then((v) => v)`,
-        target: { context },
-        awaitPromise: true,
-        resultOwnership: 'none',
-      });
-      if (r.type === 'exception') throw new Error(r.exceptionDetails.text);
-      return r.result.value;
-    };
-    await until('smPlatform on the page', () => evaluate("typeof smPlatform === 'object'"));
-    return evaluate;
-  };
-  const page = await open();
-  await compareConformance(async (expr) => JSON.parse(await page(expr)));
-  const reload = async () => {
-    // Reinstalling a temporary add-on from the same path keeps its storage (like an update).
-    await bidi.send('webExtension.uninstall', { extension }).catch(() => {});
-    ({ extension } = await install());
-    await sleep(2500);
-    return open();
-  };
-  await extensionChecks(page, reload, 'browser', open);
-}
-
-async function connectBidi(url) {
-  const ws = new WebSocket(url);
-  await new Promise((ok, fail) => {
-    ws.onopen = ok;
-    ws.onerror = () => fail(new Error('no connection'));
-  });
-  let next = 1;
-  const pending = new Map();
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    const p = pending.get(msg.id);
-    if (!p) return;
-    pending.delete(msg.id);
-    if (msg.type === 'error') p.fail(new Error(`${p.method}: ${msg.error}: ${msg.message}`));
-    else p.ok(msg.result);
-  };
-  return {
-    send(method, params) {
-      const id = next++;
-      ws.send(JSON.stringify({ id, method, params }));
-      return new Promise((ok, fail) => pending.set(id, { ok, fail, method }));
-    },
-  };
 }

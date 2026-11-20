@@ -1,0 +1,77 @@
+# Pushing a release tag (v0.15.0) builds the zips and publishes them as a GitHub release,
+# with that version's notes from CHANGELOG.md. The tag must match the version in
+# Cargo.toml and both manifests.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag matches the version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for f in chrome/manifest.json firefox/manifest.json; do
+            v=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$f" | head -1)
+            [ "$v" = "$tag" ] || { echo "::error::$f has version $v, the tag says $tag"; exit 1; }
+          done
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$v" = "$tag" ] || { echo "::error::Cargo.toml has version $v, the tag says $tag"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-bindgen CLI (the version in Cargo.lock)
+        run: |
+          v=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          cargo install wasm-bindgen-cli --version "$v" --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Build the zips
+        run: ./build.sh --zip
+
+      - name: Smoke tests on the release build
+        run: |
+          node tools/smoke-test.mjs firefox
+          node tools/smoke-test.mjs chrome
+
+      - name: Check the zips
+        run: |
+          for b in firefox chrome; do
+            v=$(unzip -p "dist/session-manager-$b.zip" manifest.json | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -1)
+            [ "$v" = "${GITHUB_REF_NAME#v}" ] || { echo "::error::$b zip has version $v"; exit 1; }
+          done
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v h="## [${GITHUB_REF_NAME#v}]" '
+            index($0, h) == 1 { on = 1; next }
+            on && index($0, "## [") == 1 { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::no CHANGELOG.md entry for ${GITHUB_REF_NAME#v}"; exit 1; }
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            dist/session-manager-firefox.zip
+            dist/session-manager-chrome.zip

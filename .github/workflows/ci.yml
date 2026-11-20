@@ -1,0 +1,75 @@
+# Builds and tests every pull request to main (and main itself).
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-bindgen CLI (the version in Cargo.lock)
+        run: |
+          v=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$v" ]; then
+            cargo install wasm-bindgen-cli --version "$v" --locked
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Smoke tests (mock browser)
+        run: |
+          node tools/smoke-test.mjs firefox
+          node tools/smoke-test.mjs chrome
+
+      - name: IndexedDB fake
+        run: node tools/idb-node-check.mjs > /dev/null
+
+      - name: Quick performance checks (mock browser)
+        run: node tools/perf-test.mjs firefox
+
+      # Real browser APIs: the runner's Chrome and Firefox, headless.
+      - name: Storage in real browsers
+        env:
+          SM_HEADLESS: '1'
+        run: |
+          node tools/idb-real-test.mjs chrome
+          node tools/idb-real-test.mjs firefox
+
+      - name: Performance in real browsers
+        env:
+          SM_HEADLESS: '1'
+        run: |
+          node tools/perf-real-test.mjs chrome
+          node tools/perf-real-test.mjs firefox

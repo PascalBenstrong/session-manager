@@ -68,7 +68,7 @@ After rebuilding, reload the extension: the ⟳ button on `chrome://extensions`,
 
 1. Add a `## [x.y.z] - YYYY-MM-DD` entry at the top of [CHANGELOG.md](CHANGELOG.md), with `### New` / `### Improved` / `### Fixed` sections and `- ` bullets.
 2. Set the same version in `Cargo.toml`, `firefox/manifest.json` and `chrome/manifest.json`. `cargo test` fails if any of them disagree.
-3. Run `./build.sh --zip`.
+3. Run `./build.sh --zip`, or commit and push a tag `vX.Y.Z`: the *Release* workflow (`.github/workflows/release.yml`) checks that the tag matches the versions, tests, builds both zips and publishes them as a GitHub release with that version's notes from the changelog.
 
 When users get the update, the toolbar icon shows **NEW** and the popup highlights *What's new* until the notes have been opened.
 
@@ -81,11 +81,20 @@ node tools/smoke-test.mjs chrome
 node tools/idb-node-check.mjs                      # IndexedDB conformance on the Node fake (tools/fake-indexeddb.js)
 node tools/idb-real-test.mjs edge                  # same checks on real Edge / Firefox IndexedDB, compared with the fake,
 node tools/idb-real-test.mjs firefox               #   plus migration from 0.14 and the database switch, end to end
+node tools/perf-real-test.mjs edge                 # performance regressions in a real browser (see below)
+node tools/perf-real-test.mjs firefox
+node tools/perf-test.mjs firefox                   # quick performance checks with the mock browser
 node tools/serve.mjs   # then open http://127.0.0.1:8123/tools/preview.html (add ?popup for popup size)
 # with the server running:
 node tools/real-browser-test.mjs edge      # real, visible Edge with the developer tools open
 node tools/real-browser-test.mjs firefox   # real, visible Firefox with the developer tools open
 ```
+
+The real-browser tests (`idb-real-test`, `perf-real-test`; `edge`, `chrome` or `firefox`) start the browser with the built extension in a throwaway profile. `SM_HEADLESS=1` runs it headless; `SM_CHROME` / `SM_FIREFOX` point to another executable.
+
+**Performance regressions:** `tools/perf-real-test.mjs` runs the extension in a real browser twice, in fresh profiles: same sessions, but the inactive ones hold 10× more saved tabs in the second run. The background reports its own handler times and wasm memory, and the test checks that memory after a restart, startup time, the cost of a tab update and of a command with its save, what a page receives, and the records a save rewrites stay the same (and that reading an inactive session back costs the same per tab). `tools/perf-test.mjs` does similar checks quickly with the mock browser. Neither replaces the CPU / memory measurements with hundreds of live-video tabs described in [PERF_GOALS.md](PERF_GOALS.md).
+
+**CI:** every pull request to `main` runs `.github/workflows/ci.yml`: formatting, unit tests, the build, the smoke tests, the quick performance checks, and the storage and performance tests in headless Chrome and Firefox.
 
 `tools/capture-test.mjs` (Edge; with `tools/serve.mjs` running) records the videos of `tools/real/media.html` (top frame and a frame), records the tab cut to a video, saves an HLS and a DASH stream through the capture window's own controls, and saves and uploads the results.
 

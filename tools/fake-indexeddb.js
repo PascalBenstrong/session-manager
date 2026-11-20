@@ -15,7 +15,17 @@ const domError = (name, message = name) => {
   return e;
 };
 
-const tick = (f) => setTimeout(f, 0);
+// A new task (as browsers dispatch IndexedDB events). setImmediate where there is one: Node
+// clamps setTimeout to 1 ms, which would make every request take a millisecond.
+const ABSENT = Symbol('absent');
+const tick = typeof setImmediate === 'function' ? (f) => setImmediate(f) : (f) => setTimeout(f, 0);
+
+/** What was written, for tests that check how much a save writes (tools/perf-test.mjs). */
+export const stats = { puts: 0, deletes: 0, bytesWritten: 0, rowsRead: 0 };
+export function resetStats() {
+  Object.assign(stats, { puts: 0, deletes: 0, bytesWritten: 0, rowsRead: 0 });
+}
+const sizeOf = (v) => (typeof v === 'string' ? v.length : JSON.stringify(v ?? null).length);
 
 /** IndexedDB key order: numbers < strings (other key types aren't used here). */
 function validKey(k) {
@@ -81,7 +91,11 @@ class FakeIndex {
     const tx = this.objectStore.transaction;
     tx._check();
     if (key !== undefined && !validKey(key)) throw domError('DataError');
-    return tx._request(this, () => this._rows(key).map((r) => structuredClone(r[2])));
+    return tx._request(this, () => {
+      const rows = this._rows(key);
+      stats.rowsRead += rows.length;
+      return rows.map((r) => structuredClone(r[2]));
+    });
   }
   /** Primary keys, in the same order as getAll. */
   getAllKeys(key) {
@@ -131,7 +145,11 @@ class FakeObjectStore {
   }
   getAll() {
     this.transaction._check();
-    return this.transaction._request(this, () => this._sorted().map(([, v]) => structuredClone(v)));
+    return this.transaction._request(this, () => {
+      const rows = this._sorted();
+      stats.rowsRead += rows.length;
+      return rows.map(([, v]) => structuredClone(v));
+    });
   }
   getAllKeys() {
     this.transaction._check();
@@ -146,6 +164,9 @@ class FakeObjectStore {
     if (!validKey(key)) throw domError('DataError', 'No valid key.');
     const copy = structuredClone(value); // cloned now, as browsers do
     return this.transaction._request(this, () => {
+      stats.puts++;
+      stats.bytesWritten += sizeOf(copy);
+      this.transaction._remember(this.name, key);
       this._data().records.set(key, copy);
       return key;
     });
@@ -156,6 +177,7 @@ class FakeObjectStore {
     const copy = structuredClone(value);
     return this.transaction._request(this, () => {
       if (this._data().records.has(key)) throw domError('ConstraintError', 'Key already exists in the object store.');
+      this.transaction._remember(this.name, key);
       this._data().records.set(key, copy);
       return key;
     });
@@ -164,6 +186,8 @@ class FakeObjectStore {
     this._write();
     if (!validKey(key)) throw domError('DataError');
     return this.transaction._request(this, () => {
+      stats.deletes++;
+      this.transaction._remember(this.name, key);
       this._data().records.delete(key);
       return undefined;
     });
@@ -171,6 +195,7 @@ class FakeObjectStore {
   clear() {
     this._write();
     return this.transaction._request(this, () => {
+      for (const k of this._data().records.keys()) this.transaction._remember(this.name, k);
       this._data().records.clear();
       return undefined;
     });
@@ -190,7 +215,6 @@ class FakeTransaction {
     this._queue = [];
     this._active = true;
     this._state = 'waiting'; // running, done
-    this._backup = null;
     // Active during the task that created it.
     tick(() => {
       this._active = false;
@@ -208,6 +232,15 @@ class FakeTransaction {
   _check() {
     if (!this._active || this._state === 'done') throw domError('TransactionInactiveError', 'The transaction is not active.');
   }
+  /** Before a record changes: keeps its value (or that it was absent) to restore on abort. */
+  _remember(store, key) {
+    if (!this._undo) return;
+    let m = this._undo.get(store);
+    if (!m) this._undo.set(store, (m = new Map()));
+    if (m.has(key)) return;
+    const records = this.db._stores.get(store).records;
+    m.set(key, records.has(key) ? records.get(key) : ABSENT);
+  }
   _request(source, op) {
     const r = new FakeRequest(source, this);
     this._queue.push([r, op]);
@@ -215,12 +248,9 @@ class FakeTransaction {
   }
   _start() {
     this._state = 'running';
-    if (this.mode !== 'readonly') {
-      this._backup = new Map(this.scope.map((n) => {
-        const d = this.db._stores.get(n);
-        return [n, { records: new Map(d.records), indexes: new Map(d.indexes) }];
-      }));
-    }
+    // What a write changes is remembered as it changes (to undo on abort): the cost follows
+    // the records written, not the size of the store.
+    this._undo = this.mode !== 'readonly' ? new Map() : null;
     tick(() => this._step());
   }
   _step() {
@@ -272,7 +302,16 @@ class FakeTransaction {
   }
   abort(error = null) {
     if (this._state === 'done') throw domError('InvalidStateError', 'The transaction has finished.');
-    if (this._backup) for (const [n, d] of this._backup) this.db._stores.set(n, d);
+    if (this._undo) {
+      for (const [store, m] of this._undo) {
+        const records = this.db._stores.get(store).records;
+        for (const [k, v] of m) {
+          if (v === ABSENT) records.delete(k);
+          else records.set(k, v);
+        }
+      }
+      this._undo = null;
+    }
     // An explicit abort() leaves `error` null, as in browsers.
     this.error = error;
     for (const [r] of this._queue) {
