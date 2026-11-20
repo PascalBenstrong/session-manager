@@ -291,23 +291,42 @@ impl AppState {
     /// Returns how many entries changed workspace.
     pub fn auto_place(&mut self, refs: Option<&[EntryRef]>, reset_manual: bool) -> usize {
         let placer = Placer::new(&self.workspaces);
-        let refs: Option<std::collections::HashSet<EntryRef>> = refs.map(|r| r.iter().copied().collect());
+        // No rules and nothing to reset: nothing can move.
+        if placer.is_empty() && !reset_manual {
+            return 0;
+        }
+        let place = |e: &mut crate::entries::EntryMut| {
+            let mut n = 0;
+            if reset_manual && e.workspace_manual {
+                e.workspace_manual = false;
+                if placer.workspace_for(e).is_none() {
+                    n += e.workspace.is_some() as usize;
+                    e.workspace = None;
+                }
+            }
+            // Only tabs the rules move are saved again.
+            n + e.update(|e| {
+                placer.place(e);
+            }) as usize
+        };
         let mut n = 0;
-        for s in &mut self.sessions {
-            let sid = s.id;
-            for mut e in s.entries.iter_mut().filter(|e| refs.as_ref().is_none_or(|r| r.contains(&EntryRef { session: sid, entry: e.id })))
-            {
-                if reset_manual && e.workspace_manual {
-                    e.workspace_manual = false;
-                    if placer.workspace_for(&e).is_none() {
-                        n += e.workspace.is_some() as usize;
-                        e.workspace = None;
+        match refs {
+            // These tabs only, found through the index (not every tab of every session).
+            Some(refs) => {
+                for r in refs {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == r.session)
+                        && let Some(i) = s.entries.position(r.entry)
+                    {
+                        n += place(&mut s.entries.at(i));
                     }
                 }
-                // Only tabs the rules move are saved again.
-                n += e.update(|e| {
-                    placer.place(e);
-                }) as usize;
+            }
+            None => {
+                for s in &mut self.sessions {
+                    for mut e in s.entries.iter_mut() {
+                        n += place(&mut e);
+                    }
+                }
             }
         }
         n

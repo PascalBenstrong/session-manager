@@ -475,6 +475,13 @@ impl Entries {
         &mut self.list[index]
     }
 
+    /// The tab at `index`, to change it if need be: marked changed only if it is (like the
+    /// tabs of [`Entries::iter_mut`]).
+    pub fn at(&mut self, index: usize) -> EntryMut<'_> {
+        let len = self.list.len();
+        EntryMut { entry: &mut self.list[index], changed: &mut self.changed[index], index, len, dirty: &self.dirty, ix: &self.ix }
+    }
+
     /// Every tab, to change some: only the ones actually changed are marked.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = EntryMut<'_>> {
         let (dirty, ix, len) = (&self.dirty, &self.ix, self.list.len());
