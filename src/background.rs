@@ -70,8 +70,11 @@ thread_local! {
     static GUARDS_SYNCED: RefCell<Option<GuardsWanted>> = const { RefCell::new(None) };
     /// The extension's database (IndexedDB) could be opened.
     static DB_OK: Cell<bool> = const { Cell::new(false) };
-    /// The tabs as saved in the database: id -> (session, hash of its JSON).
+    /// The tab ids of each session in the database (to find what to delete).
     static TABS_SAVED: RefCell<persist::Saved> = RefCell::new(Default::default());
+    /// The database is out of date (the state came from storage.local, was saved there, or
+    /// a write failed): the next save rewrites it whole instead of writing the changes.
+    static NEED_FULL: Cell<bool> = const { Cell::new(true) };
     /// The database holds a state (to empty once the state is saved in storage.local).
     static DB_HAS_DATA: Cell<bool> = const { Cell::new(false) };
     /// storage.local keys of the state from before the database (or from while it was
@@ -343,14 +346,15 @@ async fn load_state() -> AppState {
     };
 
     let source = persist::newest(db.as_ref().map(|d| &d.0), legacy.as_ref());
-    // The database's tabs as they are: the first save writes only the difference (and
-    // deletes what's left over from before a switch to storage.local).
     let (db_state, saved) = match db {
         Some((s, saved)) => (Some(s), saved),
         None => (None, persist::Saved::new()),
     };
     DB_HAS_DATA.with(|d| d.set(db_state.is_some()));
     TABS_SAVED.with(|t| *t.borrow_mut() = saved);
+    // Read from the database: saves write what changes from here. Otherwise the database
+    // is rewritten whole by the first save (also clearing what's left from before).
+    NEED_FULL.with(|n| n.set(source != Source::Database));
 
     if let Some(l) = &legacy {
         let mut keys = vec![STATE_KEY.to_string()];
@@ -396,9 +400,18 @@ async fn persist() {
             (serde_json::to_string(&all), snapshots_fingerprint(&s))
         });
         let write = if use_db {
-            let plan = TABS_SAVED.with(|t| persist::plan(&mut s, &t.borrow(), next));
+            // Only the tabs that changed (tracked as they change), unless the database is
+            // out of date.
+            let full = NEED_FULL.with(|n| n.replace(false));
+            let plan = TABS_SAVED.with(|t| {
+                let mut t = t.borrow_mut();
+                if full { persist::plan_full(&mut s, &mut t, next) } else { persist::plan_changes(&mut s, &mut t, next) }
+            });
             persist::header_json(&mut s).map(|header| Ok((header, plan)))
         } else {
+            // Everything in one key; the database will be rewritten whole when it's back.
+            persist::forget_changes(&mut s);
+            NEED_FULL.with(|n| n.set(true));
             without_snapshots(&mut s, serde_json::to_string).map(Err)
         };
         let now: std::collections::HashSet<Id> = s.sessions.iter().map(|x| x.id).collect();
@@ -412,9 +425,8 @@ async fn persist() {
     });
     match write {
         Err(e) => log(&format!("could not serialize state: {e}")),
-        Ok(Ok((header, plan))) => match pf::db_write(&header, &plan.puts, &plan.dels).await {
+        Ok(Ok((header, plan))) => match pf::db_write(&header, &plan.puts, &plan.dels, plan.clear).await {
             Ok(()) => {
-                TABS_SAVED.with(|t| *t.borrow_mut() = plan.saved);
                 DB_HAS_DATA.with(|d| d.set(true));
                 // Pages read the new state from the database.
                 if let Err(e) = pf::storage_set(CHANGED_KEY, &next.to_string()).await {
@@ -428,7 +440,8 @@ async fn persist() {
             }
             Err(e) => {
                 // Nothing is lost: the whole state goes to storage.local, which wins at
-                // the next start if it's newer.
+                // the next start if it's newer, and the database is rewritten next time.
+                NEED_FULL.with(|n| n.set(true));
                 log(&format!("could not save to the database, saving in storage.local: {e}"));
                 save_in_storage_local().await;
             }
@@ -489,6 +502,7 @@ async fn after_storage_local_save() {
             Ok(()) => {
                 DB_HAS_DATA.with(|d| d.set(false));
                 TABS_SAVED.with(|t| t.borrow_mut().clear());
+                NEED_FULL.with(|n| n.set(true));
             }
             Err(e) => log(&format!("could not empty the database: {e}")),
         }

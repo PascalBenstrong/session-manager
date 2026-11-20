@@ -133,7 +133,8 @@ pub struct Session {
     pub id: Id,
     pub name: String,
     pub created_at: f64,
-    pub entries: Vec<TabEntry>,
+    /// Its tabs, tracking what changed since the last save.
+    pub entries: crate::entries::Entries,
     /// Saved revisions of `entries`, oldest first.
     pub snapshots: Vec<Snapshot>,
     /// The current generation of open tabs. Every tab opened in the session gets this value
@@ -143,10 +144,6 @@ pub struct Session {
     /// The state revision at which the session's tabs last changed in the database (pages
     /// read again only the sessions whose value changed).
     pub tabs_revision: u64,
-    /// The ids of its tabs in order, only in the state saved in the database (its tabs are
-    /// saved apart). Empty otherwise.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub order: Vec<Id>,
 }
 
 /// A saved revision of a session's tab list.
@@ -173,8 +170,9 @@ impl Session {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// The tab with this id, to change it (it's saved at the next save).
     pub fn entry_mut(&mut self, id: Id) -> Option<&mut TabEntry> {
-        self.entries.iter_mut().find(|e| e.id == id)
+        self.entries.get_mut(id)
     }
 
     /// The saved tabs that were open when the session's tabs were last closed (window

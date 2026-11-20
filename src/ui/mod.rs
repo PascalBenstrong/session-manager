@@ -567,10 +567,10 @@ impl App {
             self.set_status("The saved state is unreadable", true);
             return;
         };
-        let mut fresh: BTreeMap<Id, Vec<String>> = read.sessions.into_iter().map(|x| (x.id, x.tabs)).collect();
+        let mut fresh: BTreeMap<Id, Vec<pf::DbTab>> = read.sessions.into_iter().map(|x| (x.id, x.tabs)).collect();
         for x in s.sessions.iter_mut() {
-            let tabs = match fresh.remove(&x.id) {
-                Some(list) => list.iter().filter_map(|j| serde_json::from_str::<crate::model::TabEntry>(j).ok()).collect(),
+            x.entries = match fresh.remove(&x.id) {
+                Some(list) => crate::persist::read_tabs(list.iter().map(|t| (t.o, t.j.as_str()))),
                 None => match self.state.as_ref().and_then(|cur| cur.session(x.id)).filter(|c| c.tabs_revision == x.tabs_revision) {
                     Some(cur) => cur.entries.clone(),
                     None => {
@@ -580,7 +580,6 @@ impl App {
                     }
                 },
             };
-            crate::persist::put_in_order(x, tabs);
         }
         self.accept_state(s);
     }

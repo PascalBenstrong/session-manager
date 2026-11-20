@@ -10,6 +10,7 @@ pub mod ai;
 pub mod capture;
 pub mod cleanup;
 pub mod dedupe;
+pub mod entries;
 pub mod guards;
 pub mod hibernate;
 pub mod media;

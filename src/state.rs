@@ -73,8 +73,11 @@ impl AppState {
     pub fn normalize(&mut self) {
         // Favicons aren't kept any more (they were never shown); drop the ones saved before.
         for s in &mut self.sessions {
-            let snaps = s.snapshots.iter_mut().flat_map(|x| x.entries.iter_mut());
-            for e in s.entries.iter_mut().chain(snaps) {
+            for e in s.snapshots.iter_mut().flat_map(|x| x.entries.iter_mut()) {
+                e.fav_icon_url = None;
+            }
+            // Only tabs that have one change (and get saved again).
+            for mut e in s.entries.iter_mut().filter(|e| e.fav_icon_url.is_some()) {
                 e.fav_icon_url = None;
             }
         }
@@ -135,7 +138,7 @@ impl AppState {
         let token = format!("g{}", self.alloc_id());
         let s = self.session_mut(session).expect("checked");
         s.last_closed = token.clone();
-        for e in s.entries.iter_mut().filter(|e| e.is_open()) {
+        for mut e in s.entries.iter_mut().filter(|e| e.is_open()) {
             e.last_closed = token.clone();
         }
     }
@@ -203,10 +206,8 @@ impl AppState {
         let rules = AutoRules::new(&self.auto_rules);
         let mut changed = false;
         for s in &mut self.sessions {
-            for e in &mut s.entries {
-                let before = (e.tags.clone(), e.group.clone());
-                rules.apply(e);
-                changed |= before != (e.tags.clone(), e.group.clone());
+            for mut e in s.entries.iter_mut() {
+                changed |= e.update(|e| rules.apply(e));
             }
         }
         changed
@@ -246,7 +247,10 @@ impl AppState {
             }
             e.stamp(before.is_open(), before.is_loaded(), self.tab_time(now));
             let changed = e != before;
-            *self.entry_mut(r).expect("located") = e;
+            // Unchanged (frequent: loading, favicons, titles set again): nothing to save.
+            if changed {
+                *self.entry_mut(r).expect("located") = e;
+            }
             return changed;
         }
         if !self.settings.auto_add_tabs || !trackable(&tab.url, self.settings.ignore_internal_urls) {
@@ -298,12 +302,11 @@ impl AppState {
         match self.locate_tab(tab_id) {
             Some(r) => {
                 let record = self.settings.tracking.last_used;
-                let e = self.entry_mut(r).expect("located");
                 if record {
-                    e.last_accessed = now;
+                    self.entry_mut(r).expect("located").last_accessed = now;
                 }
                 // The current workspace follows the tab in use.
-                let workspace = e.workspace;
+                let workspace = self.entry(r).expect("located").workspace;
                 let before = self.active_workspace;
                 if workspace.is_some() {
                     self.active_workspace = workspace;
@@ -360,17 +363,21 @@ impl AppState {
         let mut linked: HashSet<TabId> = HashSet::new();
         let time = self.tab_time(now);
         for s in &mut self.sessions {
-            for e in &mut s.entries {
+            for mut e in s.entries.iter_mut() {
                 if let Some(id) = e.tab_id {
                     let was_loaded = e.is_loaded();
                     match by_id.get(&id) {
                         Some(t) if t.url == e.url && !linked.contains(&id) => {
                             linked.insert(id);
-                            e.discarded = t.discarded;
-                            e.browser_group = t.group_title.clone();
-                            e.stamp(true, was_loaded, time);
+                            // Still open (the extension restarted): usually nothing changed,
+                            // and then nothing is saved again.
+                            e.update(|e| {
+                                e.discarded = t.discarded;
+                                e.browser_group = t.group_title.clone();
+                                e.stamp(true, was_loaded, time);
+                            });
                         }
-                        _ => keep_closed(e, time),
+                        _ => keep_closed(&mut e, time),
                     }
                 }
             }
@@ -410,7 +417,7 @@ impl AppState {
             .find_map(|si| self.sessions[si].entries.iter().position(|e| e.tab_id.is_none() && e.url == t.url).map(|ei| (si, ei)));
         let Some((si, ei)) = found else { return false };
         let (time, generation) = (self.tab_time(now), self.generation(self.sessions[si].id));
-        let e = &mut self.sessions[si].entries[ei];
+        let e = self.sessions[si].entries.at_mut(ei);
         e.tab_id = Some(t.id);
         e.window_id = Some(t.window_id);
         e.discarded = t.discarded;
@@ -618,7 +625,7 @@ impl AppState {
                 let target = self.create_session(&format!("{session_name} ({})", snap.name), now);
                 let entries: Vec<TabEntry> = snap.entries.iter().map(|e| self.fresh_entry(e)).collect();
                 let added = entries.iter().map(|e| e.id).collect();
-                self.session_mut(target).expect("created").entries = entries;
+                self.session_mut(target).expect("created").entries.replace_all(entries);
                 self.drop_dangling_workspaces();
                 Ok((target, added))
             }
@@ -633,7 +640,7 @@ impl AppState {
             }
             RestoreMode::Replace => {
                 self.create_snapshot(session, &format!("Before restoring \"{}\"", snap.name), true, now)?;
-                let current = std::mem::take(&mut self.session_mut(session).expect("checked").entries);
+                let current = self.session_mut(session).expect("checked").entries.take_all();
                 // Live tabs whose URL is in the snapshot stay linked to the restored entries.
                 let mut open: Vec<TabEntry> = current.into_iter().filter(|e| e.is_open()).collect();
                 let mut restored = Vec::new();
@@ -651,7 +658,7 @@ impl AppState {
                 }
                 // Tabs that are open but not part of the snapshot stay open, untracked.
                 self.ignored_tab_ids.extend(open.iter().filter_map(|e| e.tab_id));
-                self.session_mut(session).expect("checked").entries = restored;
+                self.session_mut(session).expect("checked").entries.replace_all(restored);
                 self.drop_dangling_workspaces();
                 Ok((session, added))
             }
@@ -727,7 +734,7 @@ impl AppState {
                 }
             }
             let target = self.session_mut(id).expect("created");
-            target.entries = entries;
+            target.entries.replace_all(entries);
             target.snapshots = s.snapshots;
             ids.push(id);
         }
@@ -908,7 +915,7 @@ mod tests {
         // As saved by a version without generations.
         let sid = s.active_session;
         s.session_mut(sid).unwrap().last_closed.clear();
-        s.session_mut(sid).unwrap().entries.iter_mut().for_each(|e| e.last_closed.clear());
+        s.session_mut(sid).unwrap().entries.iter_mut().for_each(|mut e| e.last_closed.clear());
         s.normalize();
         s.reconcile(&[], 2.0); // the browser restarted without its tabs
         let urls: Vec<_> = s.last_closed_refs(sid).iter().map(|r| s.entry(*r).unwrap().url.clone()).collect();

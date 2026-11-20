@@ -35,7 +35,7 @@ impl AppState {
     pub fn mark_discarded(&mut self, ids: &[TabId], now: f64) -> bool {
         let ids: HashSet<TabId> = ids.iter().copied().collect();
         let mut changed = false;
-        for e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()) {
+        for mut e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()) {
             if e.tab_id.is_some_and(|t| ids.contains(&t)) && !e.discarded {
                 e.discarded = true;
                 e.unloaded_at = now;

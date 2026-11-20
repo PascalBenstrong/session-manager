@@ -218,15 +218,15 @@ export async function idbConformance(idb, createDb) {
   note('api: readState on an empty database', await api.readState({}));
   const header = (revs) => JSON.stringify({ revision: 9, sessions: [{ id: 1, tabs_revision: revs[0] }, { id: 2, tabs_revision: revs[1] }] });
   await api.write(header([1, 1]), [
-    { id: 12, s: 1, j: '{"id":12}' },
-    { id: 3, s: 2, j: '{"id":3}' },
-    { id: 11, s: 1, j: '{"id":11}' },
+    { id: 12, s: 1, o: 0, j: '{"id":12}' },
+    { id: 3, s: 2, o: 0, j: '{"id":3}' },
+    { id: 11, s: 1, o: 1, j: '{"id":11}' },
   ], []);
   note('api: load', await api.load());
   note('api: readState, nothing known', await api.readState({}));
   note('api: readState, session 1 known', await api.readState({ 1: 1 }));
   note('api: readState, all known', await api.readState({ 1: 1, 2: 1 }));
-  await api.write(header([1, 2]), [{ id: 3, s: 1, j: '{"id":3,"moved":true}' }], [11, 999]);
+  await api.write(header([1, 2]), [{ id: 3, s: 1, o: 2, j: '{"id":3,"moved":true}' }], [11, 999]);
   note('api: after moving, deleting and deleting a missing id', await api.load());
   note('api: readState after the change', await api.readState({ 1: 1, 2: 1 }));
   let failed = 'no error';
@@ -237,6 +237,8 @@ export async function idbConformance(idb, createDb) {
   }
   note('api: a bad record fails the write', failed);
   note('api: nothing of the failed write was saved', (await api.load()).header === header([1, 2]));
+  await api.write(header([5, 5]), [{ id: 40, s: 2, o: 7, j: '{"id":40}' }], [], true);
+  note('api: a write that clears first leaves only its tabs', await api.load());
   note('api: vectors', [await api.getVectors(1), await (async () => {
     await api.putVectors(1, '{"v":1}');
     await api.putVectors(2, '{"v":2}');
@@ -251,7 +253,7 @@ export async function idbConformance(idb, createDb) {
 
   // A second connection (another page) sees what the first wrote.
   const reader = createDb(API, () => idb);
-  await api.write(header([4, 4]), [{ id: 1, s: 2, j: '{"id":1}' }], []);
+  await api.write(header([4, 4]), [{ id: 1, s: 2, o: 3, j: '{"id":1}' }], []);
   note('api: another connection reads it', await reader.readState({}));
   (await reader.open()).close();
   (await api.open()).close();

@@ -73,7 +73,7 @@ mod tests {
         let mut s = AppState { revision: 7, ..Default::default() };
         let entries = [(10, "https://docs.rs/egui", "egui docs"), (11, "https://example.com/", "Example")]
             .map(|(id, url, title)| TabEntry { id, url: url.into(), title: title.into(), ..Default::default() });
-        s.sessions.push(Session { id: 2, name: "Work".into(), entries: entries.to_vec(), ..Default::default() });
+        s.sessions.push(Session { id: 2, name: "Work".into(), entries: entries.to_vec().into(), ..Default::default() });
         s
     }
 

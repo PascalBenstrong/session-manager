@@ -255,7 +255,7 @@ impl AppState {
             self.active_workspace = None;
         }
         self.pending_workspace.retain(|_, w| *w != id);
-        for e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()).filter(|e| e.workspace == Some(id)) {
+        for mut e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()).filter(|e| e.workspace == Some(id)) {
             e.workspace = None;
             e.workspace_manual = false;
         }
@@ -295,15 +295,19 @@ impl AppState {
         let mut n = 0;
         for s in &mut self.sessions {
             let sid = s.id;
-            for e in s.entries.iter_mut().filter(|e| refs.as_ref().is_none_or(|r| r.contains(&EntryRef { session: sid, entry: e.id }))) {
+            for mut e in s.entries.iter_mut().filter(|e| refs.as_ref().is_none_or(|r| r.contains(&EntryRef { session: sid, entry: e.id })))
+            {
                 if reset_manual && e.workspace_manual {
                     e.workspace_manual = false;
-                    if placer.workspace_for(e).is_none() {
+                    if placer.workspace_for(&e).is_none() {
                         n += e.workspace.is_some() as usize;
                         e.workspace = None;
                     }
                 }
-                n += placer.place(e) as usize;
+                // Only tabs the rules move are saved again.
+                n += e.update(|e| {
+                    placer.place(e);
+                }) as usize;
             }
         }
         n
@@ -367,7 +371,7 @@ impl AppState {
             self.active_workspace = None;
         }
         self.pending_workspace.retain(|_, w| ids.contains(w));
-        for e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()) {
+        for mut e in self.sessions.iter_mut().flat_map(|s| s.entries.iter_mut()) {
             if e.workspace.is_some_and(|w| !ids.contains(&w)) {
                 e.workspace = None;
                 e.workspace_manual = false;

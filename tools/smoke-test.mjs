@@ -49,8 +49,7 @@ const stored = () => {
   const state = JSON.parse(db.stores.get('meta').records.get('state'));
   const tabs = [...db.stores.get('tabs').records.values()];
   for (const s of state.sessions) {
-    const pos = new Map((s.order || []).map((id, i) => [id, i]));
-    s.entries = tabs.filter((t) => t.s === s.id).map((t) => JSON.parse(t.j)).sort((a, b) => (pos.get(a.id) ?? 1e9) - (pos.get(b.id) ?? 1e9));
+    s.entries = tabs.filter((t) => t.s === s.id).sort((a, b) => a.o - b.o).map((t) => JSON.parse(t.j));
   }
   return state;
 };

@@ -92,7 +92,7 @@ async function extensionChecks(page, reload, api) {
     return r;
   };
   const dbState = (p) =>
-    p(`smPlatform.dbLoad().then((d) => JSON.stringify({ header: d.header && JSON.parse(d.header), tabs: d.tabs.map((t) => ({ id: t.id, s: t.s, url: JSON.parse(t.j).url })) }))`).then(JSON.parse);
+    p(`smPlatform.dbLoad().then((d) => JSON.stringify({ header: d.header && JSON.parse(d.header), tabs: d.tabs.map((t) => ({ id: t.id, s: t.s, o: t.o, url: JSON.parse(t.j).url, j: t.j })) }))`).then(JSON.parse);
   const local = (p, key) => p(`${api}.storage.local.get(${JSON.stringify(key)}).then((r) => JSON.stringify(r[${JSON.stringify(key)}] ?? null))`).then(JSON.parse);
 
   // ---- migration from 0.14: a state with its tabs in storage.local, saved as 0.14 did.
@@ -121,7 +121,7 @@ async function extensionChecks(page, reload, api) {
   const urls = (sid) => migrated.tabs.filter((t) => t.s === sid && seeded.has(t.id)).map((t) => t.url).sort();
   check('migration: the 0.14 tabs are in IndexedDB, by session',
     isDeepStrictEqual(urls(1), ['https://old.example/a', 'https://old.example/b', 'https://old.example/c']) && isDeepStrictEqual(urls(2), ['https://read.example/']),
-    JSON.stringify(migrated.tabs));
+    JSON.stringify(migrated.tabs.map(({ id, s, o, url }) => ({ id, s, o, url }))));
   check('migration: the state record holds no tabs', migrated.header.sessions.every((s) => !s.entries || s.entries.length === 0));
   check('migration: the old storage.local state is removed', (await until('sm_state removed', async () => (await local(page, 'sm_state')) === null ? 'gone' : null)) === 'gone');
   const st = (await command(page, { cmd: 'GetState' })).state;
@@ -140,14 +140,18 @@ async function extensionChecks(page, reload, api) {
   const oldAfter = after.header.sessions.find((s) => s.name === 'Old work');
   check('a change marks only its session', oldAfter.tabs_revision === after.header.revision && reading.tabs_revision < after.header.revision,
     `old ${oldAfter.tabs_revision}, reading ${reading.tabs_revision}, revision ${after.header.revision}`);
-  check('the state record keeps each session’s tab order', isDeepStrictEqual(seededOrder(oldAfter.order), [10, 4, 12]), JSON.stringify(oldAfter.order));
+  const byPosition = after.tabs.filter((t) => t.s === oldAfter.id).sort((a, b) => a.o - b.o).map((t) => t.id);
+  check('each tab’s saved position keeps the order', isDeepStrictEqual(seededOrder(byPosition), [10, 4, 12]), JSON.stringify(byPosition));
+  check('the state record holds no tab order (it doesn’t grow with the tabs)', after.header.sessions.every((x) => !('order' in x)));
+  const same = (id) => before.tabs.find((t) => t.id === id)?.j === after.tabs.find((t) => t.id === id)?.j;
+  check('only the changed tab was rewritten', !same(4) && [10, 12, 20].every(same));
   const changedKey = await local(page, 'sm_changed');
   check('pages are told about the save (sm_changed)', Number(changedKey) === after.header.revision, String(changedKey));
   check('the other tabs were left as they were', before.tabs.length === after.tabs.length);
 
   // ---- pages read it from IndexedDB (another page's view of the change)
   const read = JSON.parse(await page(`smPlatform.dbReadState({ ${old.id}: 0, ${reading.id}: ${reading.tabs_revision} }).then(JSON.stringify)`));
-  check('a page reads only the sessions that changed', read.sessions.length === 1 && read.sessions[0].id === old.id && read.sessions[0].tabs.some((j) => JSON.parse(j).tags?.includes('changed')));
+  check('a page reads only the sessions that changed', read.sessions.length === 1 && read.sessions[0].id === old.id && read.sessions[0].tabs.some((t) => JSON.parse(t.j).tags?.includes('changed')));
 
   // ---- it survives a restart, and switching the database off moves everything back
   page = await reload();

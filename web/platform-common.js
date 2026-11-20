@@ -501,19 +501,21 @@ export function createDb(name, factory = () => globalThis.indexedDB) {
         idbReq(tabs.getAllKeys()),
         idbReq(tabs.getAll()),
       ]);
-      return { header: header ?? null, tabs: values.map((v, i) => ({ id: keys[i], s: v.s, j: v.j })) };
+      return { header: header ?? null, tabs: values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, j: v.j })) };
     },
 
     /**
-     * One transaction: puts tabs ([{ id, s, j }]), deletes tabs (ids) and sets the state.
-     * Nothing is written if any part fails.
+     * One transaction: empties the tabs first if `clear`, puts tabs ([{ id, s, o, j }]: id,
+     * session, position, JSON), deletes tabs (ids) and sets the state. Nothing is written if
+     * any part fails.
      */
-    async write(header, puts, dels) {
+    async write(header, puts, dels, clear = false) {
       const db = await open();
       const tx = db.transaction(['meta', 'tabs'], 'readwrite');
       const done = idbDone(tx);
       const store = tx.objectStore('tabs');
-      for (const p of puts) store.put({ s: p.s, j: p.j }, p.id);
+      if (clear) store.clear();
+      for (const p of puts) store.put({ s: p.s, o: p.o ?? 0, j: p.j }, p.id);
       for (const id of dels) store.delete(id);
       tx.objectStore('meta').put(header, 'state');
       await done;
@@ -532,7 +534,7 @@ export function createDb(name, factory = () => globalThis.indexedDB) {
     /**
      * For pages: the saved state, and the tabs of the sessions whose `tabs_revision` isn't
      * the one in `known` ({ sessionId: revision }), read in one transaction.
-     * Returns { header, sessions: [{ id, tabs: [json] }] } or null if nothing is saved.
+     * Returns { header, sessions: [{ id, tabs: [{ o, j }] }] } or null if nothing is saved.
      */
     async readState(known) {
       const db = await open();
@@ -542,7 +544,7 @@ export function createDb(name, factory = () => globalThis.indexedDB) {
       const wanted = (JSON.parse(header).sessions || []).filter((s) => known[s.id] !== (s.tabs_revision || 0)).map((s) => s.id);
       const index = tx.objectStore('tabs').index('session');
       const lists = await Promise.all(wanted.map((id) => idbReq(index.getAll(id))));
-      return { header, sessions: wanted.map((id, i) => ({ id, tabs: lists[i].map((t) => t.j) })) };
+      return { header, sessions: wanted.map((id, i) => ({ id, tabs: lists[i].map((t) => ({ o: t.o ?? 0, j: t.j })) })) };
     },
 
     async getVectors(session) {
@@ -1320,7 +1322,7 @@ export function installPlatform(api, overrides = {}) {
       await smDb.open();
     },
     dbLoad: () => smDb.load(),
-    dbWrite: (header, puts, dels) => smDb.write(header, puts, dels),
+    dbWrite: (header, puts, dels, clear) => smDb.write(header, puts, dels, clear),
     dbClear: () => smDb.clear(),
     dbReadState: (known) => smDb.readState(known),
     dbGetVectors: (session) => smDb.getVectors(session),

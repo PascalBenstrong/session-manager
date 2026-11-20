@@ -479,7 +479,7 @@ fn download_snapshot(session: &Session, snap: &Snapshot) {
     let as_session = Session {
         name: format!("{} — {}", session.name, snap.name),
         created_at: snap.created_at,
-        entries: snap.entries.clone(),
+        entries: snap.entries.clone().into(),
         ..Default::default()
     };
     let json = transfer::export_sessions([&as_session], false, pf::now());

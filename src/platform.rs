@@ -176,7 +176,7 @@ extern "C" {
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoad)]
     fn js_db_load() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbWrite)]
-    fn js_db_write(header: &str, puts: JsValue, dels: JsValue) -> std::result::Result<Promise, JsValue>;
+    fn js_db_write(header: &str, puts: JsValue, dels: JsValue, clear: bool) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbClear)]
     fn js_db_clear() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbReadState)]
@@ -685,12 +685,22 @@ pub async fn db_load() -> Result<DbLoad> {
     call_as(js_db_load()).await
 }
 
-pub async fn db_write(header: &str, puts: &[crate::persist::TabRecord], dels: &[crate::model::Id]) -> Result<()> {
-    call(js_db_write(header, to_js(puts), to_js(dels))).await.map(drop)
+/// One transaction: empties the tabs first if `clear`, then puts and deletes tabs and sets
+/// the state.
+pub async fn db_write(header: &str, puts: &[crate::persist::TabRecord], dels: &[crate::model::Id], clear: bool) -> Result<()> {
+    call(js_db_write(header, to_js(puts), to_js(dels), clear)).await.map(drop)
 }
 
 pub async fn db_clear() -> Result<()> {
     call(js_db_clear()).await.map(drop)
+}
+
+/// A tab as read by a page: its position and JSON.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct DbTab {
+    pub o: u64,
+    pub j: String,
 }
 
 /// The tabs of one session, as read by a page.
@@ -698,7 +708,7 @@ pub async fn db_clear() -> Result<()> {
 #[serde(default)]
 pub struct DbSessionTabs {
     pub id: crate::model::Id,
-    pub tabs: Vec<String>,
+    pub tabs: Vec<DbTab>,
 }
 
 #[derive(Deserialize, Default)]
