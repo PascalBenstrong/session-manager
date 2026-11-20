@@ -14,6 +14,7 @@
 // extension's own work; the CPU / memory measurements of PERF_GOALS.md (hundreds of tabs
 // playing live video) are a separate, manual run.
 import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launch, sleep, until } from './real-browser.mjs';
@@ -31,8 +32,12 @@ const SCALES = { small: 300, large: 3000 };
 const server = spawn(process.execPath, [join(here, 'serve.mjs'), String(SITE_PORT)], { stdio: 'ignore' });
 let passed = 0;
 const results = [];
-const check = (name, ok, detail) => {
+const report = [];
+// `scaling`: { label, ratio, limit } for checks that compare the large run with the small one
+// (charted by tools/perf-report.mjs).
+const check = (name, ok, detail, scaling) => {
   results.push(ok);
+  report.push({ name, ok, detail, ...scaling });
   console.log(`${ok ? 'ok  ' : 'FAIL'} - ${name} (${detail})`);
   if (ok) passed++;
 };
@@ -45,23 +50,34 @@ try {
   }
   const { small, large } = measured;
   const ratio = (k, floor) => Math.max(large[k], floor) / Math.max(small[k], floor);
-  check('background memory after a restart doesn’t grow with inactive sessions', large.wasmMB <= small.wasmMB * 1.25 + 1, `${small.wasmMB} / ${large.wasmMB} MB`);
-  check('startup takes about as long', ratio('startupMs', 100) < 2, `${small.startupMs} / ${large.startupMs} ms`);
-  check('a tab update costs about the same', ratio('tabUpdatedMs', 1) < 2, `${small.tabUpdatedMs} / ${large.tabUpdatedMs} ms`);
-  check('a command (with its save) costs about the same', ratio('commandMs', 2) < 2, `${small.commandMs} / ${large.commandMs} ms`);
-  check('...seen from the page too', ratio('roundTripMs', 3) < 2, `${small.roundTripMs} / ${large.roundTripMs} ms`);
-  check('a page gets about as much', large.pageBytes < small.pageBytes * 1.3, `${small.pageBytes} / ${large.pageBytes} bytes`);
+  check('background memory after a restart doesn’t grow with inactive sessions', large.wasmMB <= small.wasmMB * 1.25 + 1, `${small.wasmMB} / ${large.wasmMB} MB`,
+    { label: 'Background memory', ratio: large.wasmMB / small.wasmMB, limit: (small.wasmMB * 1.25 + 1) / small.wasmMB });
+  check('startup takes about as long', ratio('startupMs', 100) < 2, `${small.startupMs} / ${large.startupMs} ms`,
+    { label: 'Startup', ratio: ratio('startupMs', 100), limit: 2 });
+  check('a tab update costs about the same', ratio('tabUpdatedMs', 1) < 2, `${small.tabUpdatedMs} / ${large.tabUpdatedMs} ms`,
+    { label: 'Tab update', ratio: ratio('tabUpdatedMs', 1), limit: 2 });
+  check('a command (with its save) costs about the same', ratio('commandMs', 2) < 2, `${small.commandMs} / ${large.commandMs} ms`,
+    { label: 'Command + save', ratio: ratio('commandMs', 2), limit: 2 });
+  check('...seen from the page too', ratio('roundTripMs', 3) < 2, `${small.roundTripMs} / ${large.roundTripMs} ms`,
+    { label: 'Round trip from a page', ratio: ratio('roundTripMs', 3), limit: 2 });
+  check('a page gets about as much', large.pageBytes < small.pageBytes * 1.3, `${small.pageBytes} / ${large.pageBytes} bytes`,
+    { label: 'Page payload', ratio: large.pageBytes / small.pageBytes, limit: 1.3 });
   check('a save after one change rewrites one tab', large.rewritten === 1 && small.rewritten === 1, `${small.rewritten} / ${large.rewritten}`);
   // Reading a session back costs what that session holds (10× more in the large run): not more per tab.
   const perTab = (r, n) => Math.max(r.readBackMs, 5) / n;
   check('reading an inactive session back costs the same per tab', perTab(large, SCALES.large) < 2 * perTab(small, SCALES.small),
-    `${small.readBackMs} ms for ${SCALES.small} / ${large.readBackMs} ms for ${SCALES.large} tabs`);
+    `${small.readBackMs} ms for ${SCALES.small} / ${large.readBackMs} ms for ${SCALES.large} tabs`,
+    { label: 'Read-back per tab', ratio: perTab(large, SCALES.large) / perTab(small, SCALES.small), limit: 2 });
 } catch (e) {
   check('the run finished', false, e.stack || e.message);
 } finally {
   server.kill();
 }
 console.log(`\n${passed}/${results.length} performance checks passed (${which}, real browser)`);
+if (process.env.SM_PERF_OUT) {
+  const name = { edge: 'Edge', chrome: 'Chrome', firefox: 'Firefox' }[which] || which;
+  writeFileSync(process.env.SM_PERF_OUT, JSON.stringify({ suite: `${name} (real browser)`, ...measured, checks: report }, null, 2));
+}
 process.exit(passed === results.length ? 0 : 1);
 
 async function run(perSession) {
@@ -99,11 +115,18 @@ async function run(perSession) {
     for (let i = 0; i < OPEN_TABS; i++) await page(`${api}.tabs.create({ url: ${JSON.stringify(`${SITE}?t=${i}`)}, active: false }).then(() => true)`);
     await sleep(2500);
 
-    // A restart: the background reads only what it keeps.
-    page = await browser.reload();
-    const state = await until('the background', async () => (await command({ cmd: 'GetState', sessions: [], with_active: true })).state, 30000);
-    await sleep(1500);
-    const t0 = await timings(true);
+    // Restarts: the background reads only what it keeps. Startup is the median of three (a
+    // single one is noisy: it includes compiling the wasm module).
+    const starts = [];
+    let state;
+    let t0;
+    for (let i = 0; i < 3; i++) {
+      page = await browser.reload();
+      state = await until('the background', async () => (await command({ cmd: 'GetState', sessions: [], with_active: true })).state, 30000);
+      await sleep(1500);
+      t0 = await timings(true);
+      starts.push(t0.startupMs);
+    }
 
     // Tab updates: the open tabs load other pages.
     const tabIds = await json(`${api}.tabs.query({ url: 'http://127.0.0.1/*' }).then((t) => t.map((x) => x.id))`).catch(() => []);
@@ -142,7 +165,7 @@ async function run(perSession) {
     const t1 = await timings();
     return {
       wasmMB: Math.round((t0.wasmBytes / 1048576) * 10) / 10,
-      startupMs: Math.round(t0.startupMs),
+      startupMs: Math.round(median(starts)),
       tabUpdatedMs: median(t1.timings.tabUpdated),
       commandMs: median(t1.timings['cmd:TagEntries']),
       roundTripMs: median(trips),

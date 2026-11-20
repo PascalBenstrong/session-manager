@@ -86,17 +86,38 @@ async function chromium(exe, profile, port, started) {
     `--remote-debugging-port=${port}`,
     `--load-extension=${ext}`,
     `--disable-extensions-except=${ext}`,
-    // Chrome 137+ ignores --load-extension unless this is off.
+    // Chrome 137+ ignored --load-extension unless this was off (later branded versions
+    // ignore it anyway; Chrome for Testing and Chromium load it).
     '--disable-features=DisableLoadExtensionCommandLineSwitch',
     '--no-first-run',
     '--no-default-browser-check',
     '--window-size=1200,800',
   ];
   if (headless) args.push('--headless=new', '--no-sandbox', '--disable-gpu');
-  started(spawn(exe, [...args, 'about:blank']));
-  const version = await until('the browser', async () => (await fetch(`http://127.0.0.1:${port}/json/version`)).json(), 30000);
+  const child = spawn(exe, [...args, 'about:blank']);
+  started(child);
+  // The browser's own messages, for when it doesn't come up as expected.
+  const output = [];
+  for (const stream of [child.stdout, child.stderr]) {
+    stream?.on('data', (d) => {
+      output.push(...String(d).split('\n').filter(Boolean));
+      output.splice(0, Math.max(0, output.length - 40));
+    });
+  }
+  const explain = async (e, cdp) => {
+    const targets = cdp ? (await cdp.send('Target.getTargets').catch(() => ({ targetInfos: [] }))).targetInfos.map((t) => `${t.type} ${t.url}`) : [];
+    const lines = [e.message, `  browser: ${exe}`];
+    if (targets.length) lines.push('  targets:', ...targets.map((t) => `    ${t}`));
+    lines.push('  browser output:', ...(output.length ? output : ['(none)']).map((l) => `    ${l}`));
+    return new Error(lines.join('\n'));
+  };
+  const version = await until('the browser', async () => (await fetch(`http://127.0.0.1:${port}/json/version`)).json(), 30000).catch(async (e) => {
+    throw await explain(e);
+  });
   const cdp = await connectCdp(version.webSocketDebuggerUrl);
   // Browsers ship extensions with a background.js too: ours is the one with our name.
+  // (Branded Google Chrome no longer loads unpacked extensions from the command line: use
+  // Chrome for Testing or Chromium, e.g. SM_CHROME=<path>.)
   const extId = await until('the extension', async () => {
     const { targetInfos } = await cdp.send('Target.getTargets');
     for (const t of targetInfos.filter((t) => t.type === 'service_worker' && /^chrome-extension:\/\/[a-p]{32}\/background\.js$/.test(t.url))) {
@@ -106,7 +127,9 @@ async function chromium(exe, profile, port, started) {
       if (r?.result?.value === 'Session Manager') return new URL(t.url).host;
     }
     return null;
-  }, 30000);
+  }, 30000).catch(async (e) => {
+    throw await explain(e, cdp);
+  });
   const open = async (path = 'inspector.html') => {
     const { targetId } = await cdp.send('Target.createTarget', { url: `chrome-extension://${extId}/${path}` });
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });

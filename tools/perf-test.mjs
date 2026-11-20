@@ -61,8 +61,12 @@ async function parent() {
   for (const k of Object.keys(small)) console.log(`${k.padEnd(18)} ${String(small[k]).padStart(10)} ${String(large[k]).padStart(12)}`);
 
   let passed = 0;
-  const check = (name, ok, detail) => {
+  const report = [];
+  // `scaling`: { label, ratio, limit } for checks that compare the large run with the small
+  // one (charted by tools/perf-report.mjs).
+  const check = (name, ok, detail, scaling) => {
     console.log(`${ok ? 'ok  ' : 'FAIL'} - ${name} (${detail})`);
+    report.push({ name, ok, detail, ...scaling });
     if (ok) passed++;
     return ok;
   };
@@ -70,19 +74,27 @@ async function parent() {
   const ratio = (k, floor) => Math.max(large[k], floor) / Math.max(small[k], floor);
   const checks = [
     check('a save after one change writes one record', large.savePuts <= 2 && small.savePuts <= 2, `${small.savePuts} / ${large.savePuts} records`),
-    check('...of the same size at 10× the tabs', large.saveBytes <= 2 * small.saveBytes + 200, `${small.saveBytes} / ${large.saveBytes} bytes`),
+    check('...of the same size at 10× the tabs', large.saveBytes <= 2 * small.saveBytes + 200, `${small.saveBytes} / ${large.saveBytes} bytes`,
+      { label: 'Bytes per save', ratio: large.saveBytes / small.saveBytes, limit: (2 * small.saveBytes + 200) / small.saveBytes }),
     check('a command reply stays small', large.replyBytes < 1500, `${large.replyBytes} bytes`),
     check('a page gets only the session it shows', large.pageBytes < 0.35 * large.fullBytes, `${large.pageBytes} of ${large.fullBytes} bytes`),
     check('an unchanged session is not sent again', large.unchangedBytes < 0.05 * large.pageBytes, `${large.unchangedBytes} bytes`),
     check('startup reads the active session and open tabs, not every tab', large.startupRows <= large.keptTabs + 10 && large.startupRows < 0.4 * large.totalTabs,
       `${large.startupRows} rows read of ${large.totalTabs} tabs (${large.keptTabs} kept)`),
-    check('a tab event costs about the same at 10× the tabs', ratio('eventMs', 0.05) < 2, `${small.eventMs} / ${large.eventMs} ms`),
-    check('activating a tab costs about the same', ratio('activateMs', 0.05) < 2, `${small.activateMs} / ${large.activateMs} ms`),
-    check('a save of the state alone costs about the same', ratio('renameMs', 0.2) < 2, `${small.renameMs} / ${large.renameMs} ms`),
-    check('a command (with its save) costs about the same', ratio('commandMs', 0.2) < 2, `${small.commandMs} / ${large.commandMs} ms`),
+    check('a tab event costs about the same at 10× the tabs', ratio('eventMs', 0.05) < 2, `${small.eventMs} / ${large.eventMs} ms`,
+      { label: 'Tab event', ratio: ratio('eventMs', 0.05), limit: 2 }),
+    check('activating a tab costs about the same', ratio('activateMs', 0.05) < 2, `${small.activateMs} / ${large.activateMs} ms`,
+      { label: 'Tab activation', ratio: ratio('activateMs', 0.05), limit: 2 }),
+    check('a save of the state alone costs about the same', ratio('renameMs', 0.2) < 2, `${small.renameMs} / ${large.renameMs} ms`,
+      { label: 'Save (state only)', ratio: ratio('renameMs', 0.2), limit: 2 }),
+    check('a command (with its save) costs about the same', ratio('commandMs', 0.2) < 2, `${small.commandMs} / ${large.commandMs} ms`,
+      { label: 'Command + save', ratio: ratio('commandMs', 0.2), limit: 2 }),
     check('a tab event stays under 5 ms', large.eventMs < 5, `${large.eventMs} ms`),
   ];
   console.log(`\n${passed}/${checks.length} performance checks passed (${browserName})`);
+  if (process.env.SM_PERF_OUT) {
+    writeFileSync(process.env.SM_PERF_OUT, JSON.stringify({ suite: 'Mock browser', small, large, checks: report }, null, 2));
+  }
   process.exit(passed === checks.length ? 0 : 1);
 }
 
