@@ -13,6 +13,7 @@ use super::widgets::{
     icon_button_colored, parse_list, pill, primary_button, status_dot, tab_state_color, text_input, workspace_chip, ws_color,
 };
 use super::{Actions, ViewCtx};
+use crate::ai::VectorHit;
 use crate::dedupe::Scope;
 use crate::hibernate::HibernateTarget;
 use crate::model::{EntryRef, Id, TabEntry, TabGrouping, TabId, TabSort, sort_entries, time_ago};
@@ -168,7 +169,19 @@ pub struct TabsView {
     /// there are in all, for (state generation, all sessions, viewed session, search
     /// results, sort, oldest first).
     listed: super::Cached<ListedKey, Rc<Listed>>,
+    /// Search by meaning (vector search in the background) instead of by text.
+    by_meaning: bool,
+    /// The query last sent for a vector search, and when the query last changed.
+    meaning_sent: Option<(String, bool, Id)>,
+    meaning_edited: f64,
+    /// The last vector search results: the query they're for, and the tabs, best first.
+    meaning_hits: Option<(String, Vec<VectorHit>)>,
 }
+
+/// How long typing pauses before a vector search is sent (ms).
+const MEANING_DEBOUNCE_MS: f64 = 450.0;
+/// Most tabs a vector search lists.
+const MEANING_LIMIT: u32 = 100;
 
 /// Where the tabs listed are in the state's sessions (in order), and how many there are in all.
 type Listed = (Vec<(usize, usize)>, usize);
@@ -179,6 +192,36 @@ type ListedKey = (u64, bool, Id, Option<u64>, TabSort, bool);
 type WorkspaceCounts = (Vec<EntryRef>, usize, usize);
 
 impl TabsView {
+    /// Whether the view shows every session's tabs: searching all sessions, or a
+    /// workspace's settings (its rules are checked against every saved tab).
+    pub fn needs_all_sessions(&self) -> bool {
+        self.all_sessions || self.ws_open.is_some()
+    }
+
+    /// The results of a vector search sent by this view.
+    pub fn vector_results(&mut self, hits: Vec<VectorHit>) {
+        if let Some((query, _, _)) = &self.meaning_sent {
+            self.meaning_hits = Some((query.clone(), hits));
+        }
+    }
+
+    /// Sends the vector search for the query once typing pauses.
+    fn send_meaning_search(&mut self, ui: &egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
+        let query = self.query.trim().to_string();
+        let wanted = (query.clone(), self.all_sessions, cx.viewed);
+        if query.is_empty() || self.meaning_sent.as_ref() == Some(&wanted) {
+            return;
+        }
+        let now = pf::now();
+        if now - self.meaning_edited < MEANING_DEBOUNCE_MS {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(MEANING_DEBOUNCE_MS as u64));
+            return;
+        }
+        let sessions = if self.all_sessions { None } else { Some(vec![cx.viewed]) };
+        acts.send(Command::VectorSearch { query, sessions, limit: MEANING_LIMIT });
+        self.meaning_sent = Some(wanted);
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         let state = cx.state;
         if let Some(n) = self.open_created
@@ -194,7 +237,13 @@ impl TabsView {
 
         let playing: HashSet<TabId> = state.media.playing.iter().map(|p| p.tab_id).collect();
         let scope = if self.all_sessions { Scope::All } else { Scope::Session(cx.viewed) };
-        let (hits, query_error) = self.search.run(ui.ctx(), state, &self.query, &self.opts, Some(scope));
+        let meaning = self.by_meaning && state.settings.ai.vector_search && !self.query.trim().is_empty();
+        if meaning {
+            self.send_meaning_search(ui, cx, acts);
+        }
+        // By meaning, the text search doesn't filter (the vector results replace it below).
+        let text_query = if meaning { "" } else { self.query.as_str() };
+        let (hits, query_error) = self.search.run(ui.ctx(), state, text_query, &self.opts, Some(scope));
 
         // Entry ids are globally unique, so map them back to their session.
         let key = (super::state_generation(), self.all_sessions, cx.viewed);
@@ -229,7 +278,19 @@ impl TabsView {
             }
         };
         let total = listed.1;
-        let matched: Vec<&TabEntry> = listed.0.iter().map(|&(si, ei)| &state.sessions[si].entries[ei]).collect();
+        let mut matched: Vec<&TabEntry> = listed.0.iter().map(|&(si, ei)| &state.sessions[si].entries[ei]).collect();
+        if meaning {
+            // The vector results, best first (filters still apply); none until they come.
+            let allowed: HashSet<Id> = matched.iter().map(|e| e.id).collect();
+            matched = match &self.meaning_hits {
+                Some((q, found)) if *q == self.query.trim() => found
+                    .iter()
+                    .filter(|h| owner.contains_key(&h.entry.entry) && allowed.contains(&h.entry.entry))
+                    .filter_map(|h| state.entry(h.entry))
+                    .collect(),
+                _ => Vec::new(),
+            };
+        }
         let session_names: HashMap<Id, &str> = state.sessions.iter().map(|s| (s.id, s.name.as_str())).collect();
         let rc = RowCtx { owner: &owner, session_names: &session_names, playing: &playing };
         let refs = rc.refs(&matched);
@@ -863,20 +924,40 @@ impl TabsView {
                         if icon_button_colored(ui, "⚙", "Search options", filters_on.then_some(p.accent_hover)).clicked() {
                             self.show_filters = !self.show_filters;
                         }
+                        if cx.state.settings.ai.vector_search {
+                            let tip = if self.by_meaning {
+                                "Searching by meaning (titles, sites and AI summaries). Click to search by text."
+                            } else {
+                                "Search by meaning: find tabs about what you type, not only containing it"
+                            };
+                            if icon_button_colored(ui, "✨", tip, self.by_meaning.then_some(p.accent_hover)).clicked() {
+                                self.by_meaning = !self.by_meaning;
+                                self.meaning_sent = None;
+                            }
+                        }
                         if !self.query.is_empty() && icon_button(ui, "🗙", "Clear search").clicked() {
                             self.query.clear();
                         }
+                        let hint = if self.by_meaning && cx.state.settings.ai.vector_search {
+                            "Describe what you're looking for — e.g. recipes with chocolate, rust error handling"
+                        } else {
+                            "Search tabs — host:  tag:  group:  ws:  desc:  is:hibernated  idle:1h  /regex/  -not"
+                        };
                         // A fixed id: the clear button appears before it once something is
                         // typed, which would change its automatic id and drop the focus.
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.query)
-                                .id_salt("tabs-search")
-                                .hint_text("Search tabs — host:  tag:  group:  ws:  is:hibernated  idle:1h  /regex/  -not")
-                                .frame(egui::Frame::NONE)
-                                .desired_width(ui.available_width())
-                                .margin(egui::vec2(2.0, 6.0)),
-                        )
-                        .on_hover_text(SEARCH_HELP);
+                        let r = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.query)
+                                    .id_salt("tabs-search")
+                                    .hint_text(hint)
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(ui.available_width())
+                                    .margin(egui::vec2(2.0, 6.0)),
+                            )
+                            .on_hover_text(SEARCH_HELP);
+                        if r.changed() {
+                            self.meaning_edited = pf::now();
+                        }
                     });
                 });
             });
@@ -909,7 +990,12 @@ impl TabsView {
                     ui.label(RichText::new(err).color(p.danger));
                 }
                 None => {
-                    ui.label(RichText::new(format!("{} of {total} tabs", matched.len())).color(p.muted));
+                    let waiting = self.by_meaning
+                        && cx.state.settings.ai.vector_search
+                        && !self.query.trim().is_empty()
+                        && self.meaning_hits.as_ref().is_none_or(|(q, _)| *q != self.query.trim());
+                    let text = if waiting { "Searching by meaning…".to_string() } else { format!("{} of {total} tabs", matched.len()) };
+                    ui.label(RichText::new(text).color(p.muted));
                 }
             }
             self.workspace_filter_pill(ui, cx);
@@ -1218,8 +1304,27 @@ impl TabsView {
                     {
                         acts.send(Command::Hibernate { target: HibernateTarget::Entries(loaded), force: false });
                     }
+                    if cx.state.settings.ai.active_provider().is_some() {
+                        let readable: Vec<EntryRef> =
+                            matched.iter().zip(refs).filter(|(e, _)| e.is_open() && !e.discarded).map(|(_, r)| *r).collect();
+                        if ui
+                            .add_enabled(!readable.is_empty(), egui::Button::new(format!("✨ Summarise {}", readable.len())))
+                            .on_hover_text(format!(
+                                "Send the text of the {these} loaded tabs to your AI provider and save a summary as each tab's description"
+                            ))
+                            .clicked()
+                        {
+                            acts.send(Command::Summarize { entries: readable });
+                        }
+                    }
                     ui.menu_button("More ▾", |ui| {
                         ui.set_min_width(200.0);
+                        let described: Vec<EntryRef> =
+                            matched.iter().zip(refs).filter(|(e, _)| !e.description.is_empty()).map(|(_, r)| *r).collect();
+                        if !described.is_empty() && ui.button(format!("Remove {} summary(ies)", described.len())).clicked() {
+                            acts.send(Command::ClearDescriptions { entries: described });
+                            ui.close();
+                        }
                         if ui.button("Remove from group").clicked() {
                             acts.send(Command::SetGroup { entries: refs.to_vec(), group: None });
                             ui.close();
@@ -1380,6 +1485,9 @@ impl TabsView {
             if e.pinned {
                 meta.push_str("  ·  pinned");
             }
+            if !e.description.is_empty() {
+                meta.push_str("  ·  ✨");
+            }
             if look.sort != TabSort::Session {
                 let at = e.time_of(look.sort);
                 if at > 0.0 {
@@ -1411,9 +1519,10 @@ impl TabsView {
         } else {
             "switch to this tab"
         };
+        let summary = if e.description.is_empty() { String::new() } else { format!("\n\n✨ {}", e.description) };
         let resp = resp
             .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(format!("{}\n\nClick to {action} · Ctrl-click to select · drag onto a workspace to move it", e.url));
+            .on_hover_text(format!("{}{summary}\n\nClick to {action} · Ctrl-click to select · drag onto a workspace to move it", e.url));
         if resp.clicked() {
             let mods = ui.input(|i| i.modifiers);
             if mods.command || mods.shift {

@@ -2,24 +2,38 @@
 
 Session Manager: a browser extension that keeps tabs in sessions, finds and organizes them, keeps revisions of sessions, and cleans cookies and site data.
 
-Version: 0.14.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
+Version: 0.15.1. Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Platform and architecture
 - Supports Firefox and Chrome (Chromium-based browsers) with Manifest V3.
 - Written in Rust; the UI uses egui; both compile to WebAssembly.
 - Shared/core code lives in the project root (`src/`, `web/`, `icons/`). Browser-specific files live in a folder per browser (`firefox/`, `chrome/`): the manifest and a small JS shim for API differences.
 - Browser-independent logic (sessions, search, organizing, duplicates, snapshots, import parsing, cleanup planning) is plain Rust with unit tests.
-- Sessions and settings are stored locally in the browser (`storage.local`). Nothing is sent anywhere.
+- Sessions and settings are stored locally, in the browser's database (IndexedDB, `session-manager`): one record per tab, and the rest of the state in one record, so a save writes only the tabs that changed (and deletes the removed ones) in one transaction. Pages are told the saved revision (`storage.local` `sm_changed`) and read only the sessions whose tabs changed. Pages load only what they show: the tabs of the session viewed and the active one (every session only while a view needs them all: searching all sessions, duplicates across sessions, a workspace's rule check, saving all sessions), the open tabs of other sessions only where listed (the sidebar: its window's; page guards: all), and every session's tab counts. After a save they ask for just the sessions that changed (`GetState` with what they know); command replies carry only the revision saved. Snapshots are read only when the Snapshots view opens. Tabs are found by browser tab or entry id through an index kept with the change tracking, not by scanning every session. Snapshots stay in `storage.local`. The database can be switched off: then everything is saved in `storage.local` (`sm_state`), as in 0.14; if the database can't be opened or a write fails, the state is saved there too, so nothing is lost.
+- The background keeps in memory only the active session's tabs and the open tabs of every session (browser events are about open tabs; open tabs of inactive sessions are still followed). Inactive sessions' saved tabs stay in the database (an index of open tabs lets the background read only those at startup) and are read back only when needed: a page showing that session, a search across sessions, a command on its tabs, rules or duplicates over every tab, automatic snapshots of sessions that changed. They're let go once the command is done. After a browser restart they stay in memory for 30 seconds, while the browser restores tabs. With the database off, every tab stays in memory.
+- Upgrading from 0.14 (state and tabs in `storage.local`) moves everything into the database at the first start, keeping the order of tabs and the revision; the old `storage.local` copy is removed once the database has it. At startup the newest of the two (by revision) is used.
+- Browsers don't give extensions SQL: their own SQLite isn't exposed, WebSQL is gone, and SQLite compiled to wasm needs synchronous OPFS access, which a Chrome extension's service worker can't get.
+- Nothing is sent anywhere, except page text sent for summaries to an AI provider the user adds and turns on (see AI summaries).
 
 ## Sessions and tabs
 - Automatically add open tabs to the current (active) session.
-- Closing a tab removes it from the session. When a whole window closes or the browser quits, its tabs stay in the session as unloaded (configurable).
+- Closing a tab removes it from the session. When a whole window closes or the browser quits, its tabs stay in the session as unloaded (configurable). Closing the last tab of a window is closing a tab (the browser reports it as the window closing): it is removed.
+- Restore the last open tabs: every session has a `last_closed` generation, copied to each tab opened in it. Restoring a session's tabs (Load, a snapshot opened, or Restore) starts a new generation for the session and its open tabs. The session's closed tabs that still carry its current generation are the tabs that were open when its tabs were last closed (window closed, browser quit): one button (manager and popup) reopens them, unloaded or loaded. Tabs closed by hand (removed, or closed and kept) are left out.
 - Allow manually removing tabs from a session. A removed tab stays open but is no longer tracked.
 - Allow setting a session as active without loading all the tabs in it.
 - Allow loading the tabs of a session unloaded (lazily), in a new window, or fully loaded.
 - Allow finding the last open (most recently used) tab in a session.
 - Create, rename and delete sessions, and move tabs between sessions.
 - After a browser restart, re-link saved tabs to the open tabs.
+
+## AI summaries and search by meaning
+- Off by default; nothing is sent until the user turns it on and adds a provider. Providers: OpenAI-compatible endpoints (OpenAI, Ollama, LM Studio, OpenRouter...) and the Anthropic Messages API, with a base URL, API key (kept in `storage.local`), model, optional embedding model and summary instructions.
+- A tab's summary (the text of its loaded page, sent to the provider) is saved in its `description`. On request (selected or matching tabs → ✨ Summarise), or automatically a few seconds after a page loads (optional). Sites can be excluded, and how much page text is sent is limited.
+- Search by meaning (vector search) over tab titles, sites and summaries: the provider's embeddings when it has an embedding model, otherwise vectors computed locally (hashed words, nothing sent). The index is saved per session (in the database) and updated when tabs change. `desc:` searches summaries as text.
+- After searching several sessions, the indexes of the inactive sessions can be freed from memory (automatically, or with a button); they're read again when needed.
+
+## Recording, storage and performance switches
+- Every feature that writes to storage or costs time can be turned off, and turning one off never deletes what it saved: recording last used times, open / close / load times, last open tabs, the pop-up and clean-up logs, the database (back to one `storage.local` key), AI summaries (and automatic ones), vector search; and, as before, tab tracking, automatic snapshots, automatic organizing, duplicate prevention, the media limit, stream controls, page guards, workspace rules (per workspace) and clean-up rules (per rule).
 
 ## Workspaces
 - Allow grouping tabs into workspaces. Workspaces are shared by all sessions; a tab is in at most one.
@@ -84,7 +98,7 @@ Version: 0.14.0. Release notes: [CHANGELOG.md](CHANGELOG.md).
 - Sinks: save as a file, upload (PUT or POST, raw body or multipart field, custom headers, progress, cancel), play in the window (on a chosen audio output via setSinkId; Firefox: selectAudioOutput), picture-in-picture, full screen. Files stay in the window until saved or uploaded (closing it asks first).
 
 ## Search
-- Search tabs by keyword, title, URL, host, domain, custom tags, groups and workspace.
+- Search tabs by keyword, title, URL, host, domain, custom tags, groups, workspace and AI summary (`desc:`), or by meaning (see AI summaries).
 - Match by text appearing (contains), exact match, prefix, suffix, glob and regular expression, with optional case sensitivity.
 - Optionally search only in certain groups, or across all sessions.
 - Support negation and state filters: open, unloaded, hibernated, playing media, pinned, grouped, ungrouped, tagged, duplicate, and not used for a given time.

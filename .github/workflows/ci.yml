@@ -1,0 +1,137 @@
+# Builds and tests every pull request to main (and main itself).
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  # To read the last main run's performance results (the baseline in the summary).
+  actions: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-bindgen CLI (the version in Cargo.lock)
+        run: |
+          v=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$v" ]; then
+            cargo install wasm-bindgen-cli --version "$v" --locked
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Build
+        id: build
+        run: bash ./build.sh
+
+      - name: Smoke tests (mock browser)
+        run: |
+          node tools/smoke-test.mjs firefox
+          node tools/smoke-test.mjs chrome
+
+      - name: IndexedDB fake
+        run: node tools/idb-node-check.mjs > /dev/null
+
+      - name: Quick performance checks (mock browser)
+        env:
+          SM_PERF_OUT: perf/mock.json
+        run: |
+          mkdir -p perf
+          node tools/perf-test.mjs firefox
+
+      # Real browser APIs, headless: Chrome for Testing (branded Google Chrome no longer
+      # loads unpacked extensions from the command line) and the runner's Firefox. Each
+      # step runs even if another failed, so every result is reported.
+      - name: Install Chrome for Testing
+        id: chrome
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          out=$(npx --yes @puppeteer/browsers install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1)
+          echo "$out"
+          echo "path=${out#* }" >> "$GITHUB_OUTPUT"
+
+      - name: Storage in real Chrome
+        if: ${{ !cancelled() && steps.chrome.outcome == 'success' }}
+        env:
+          SM_HEADLESS: '1'
+          SM_CHROME: ${{ steps.chrome.outputs.path }}
+        run: node tools/idb-real-test.mjs chrome
+
+      - name: Storage in real Firefox
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          SM_HEADLESS: '1'
+        run: node tools/idb-real-test.mjs firefox
+
+      - name: Performance in real Chrome
+        if: ${{ !cancelled() && steps.chrome.outcome == 'success' }}
+        env:
+          SM_HEADLESS: '1'
+          SM_CHROME: ${{ steps.chrome.outputs.path }}
+          SM_PERF_OUT: perf/chrome.json
+        run: |
+          mkdir -p perf
+          node tools/perf-real-test.mjs chrome
+
+      - name: Performance in real Firefox
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          SM_HEADLESS: '1'
+          SM_PERF_OUT: perf/firefox.json
+        run: |
+          mkdir -p perf
+          node tools/perf-real-test.mjs firefox
+
+      # The performance results as a chart and a table in the run's summary, next to the
+      # last run on main; the chart (SVG) and the numbers are kept as an artifact.
+      - name: Last performance results on main
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: ci.yml
+          branch: main
+          name: performance
+          path: perf-baseline
+          if_no_artifact_found: ignore
+
+      - name: Performance chart
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p perf
+          node tools/perf-report.mjs perf/*.json --baseline perf-baseline --svg perf/perf-chart.svg >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the performance results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance
+          path: perf/
+          if-no-files-found: ignore

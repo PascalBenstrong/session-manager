@@ -241,7 +241,7 @@ mod tests {
             TabEntry { tab_id: Some(6), ..e(14, "https://c.com") },
             TabEntry { tab_id: Some(7), last_accessed: 9.0, ..e(15, "https://c.com") },
         ];
-        s.session_mut(sid).unwrap().entries = entries;
+        s.session_mut(sid).unwrap().entries.replace_all(entries);
         let other = s.create_session("Other", 0.0);
         s.session_mut(other).unwrap().entries.push(e(20, "https://b.com"));
         s

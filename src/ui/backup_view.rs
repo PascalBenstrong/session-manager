@@ -95,7 +95,7 @@ impl BackupView {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             self.snapshots(ui, cx, session, acts);
-            self.export(ui, cx, session);
+            self.export(ui, cx, session, acts);
             self.import(ui, session, acts);
         });
     }
@@ -161,7 +161,7 @@ impl BackupView {
             ui.checkbox(&mut self.open_restored, "Open restored tabs right away (unloaded)");
             ui.add_space(6.0);
 
-            let snapshots = cx.snapshots_of(session.id);
+            let snapshots = cx.snapshots_of(session);
             if snapshots.is_empty() {
                 empty_state(ui, "📸", "No snapshots yet", "Save one above, or turn on automatic snapshots.");
                 return;
@@ -173,10 +173,13 @@ impl BackupView {
             let mut current = None;
             for snap in snapshots.iter().rev() {
                 let diffs = &mut self.snapshot_diffs.as_mut().expect("set above").1;
-                let (added, removed) = *diffs.entry(snap.id).or_insert_with(|| {
-                    let current = current.get_or_insert_with(|| session.urls());
-                    let urls = snap.urls();
-                    (urls.difference(current).count(), current.difference(&urls).count())
+                // Known once its tabs are here (asked for when the view opens).
+                let diff_now = snap.loaded().then(|| {
+                    *diffs.entry(snap.id).or_insert_with(|| {
+                        let current = current.get_or_insert_with(|| session.urls());
+                        let urls = snap.urls();
+                        (urls.difference(current).count(), current.difference(&urls).count())
+                    })
                 });
                 egui::Frame::new()
                     .fill(p.surface_hover)
@@ -191,12 +194,12 @@ impl BackupView {
                                 ui.spacing_mut().item_spacing.y = 1.0;
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(&snap.name).strong());
-                                    badge(ui, &format!("{} tabs", snap.entries.len()), false);
+                                    badge(ui, &format!("{} tabs", snap.tabs), false);
                                 });
-                                let diff = if added == 0 && removed == 0 {
-                                    "same tabs as now".to_string()
-                                } else {
-                                    format!("+{added} / −{removed} compared to now")
+                                let diff = match diff_now {
+                                    None => "…".to_string(),
+                                    Some((0, 0)) => "same tabs as now".to_string(),
+                                    Some((added, removed)) => format!("+{added} / −{removed} compared to now"),
                                 };
                                 ui.label(RichText::new(format!("{} · {diff}", format_time(snap.created_at))).small().color(p.muted));
                             });
@@ -207,7 +210,7 @@ impl BackupView {
                                         Command::DeleteSnapshot { session: session.id, snapshot: snap.id },
                                     );
                                 }
-                                if icon_button(ui, "⬇", "Save this snapshot to disk").clicked() {
+                                if snap.loaded() && icon_button(ui, "⬇", "Save this snapshot to disk").clicked() {
                                     download_snapshot(session, snap);
                                 }
                                 ui.menu_button("Restore ▾", |ui| {
@@ -227,7 +230,8 @@ impl BackupView {
                                         );
                                         ui.close();
                                     }
-                                    if ui.button(format!("Add the {added} missing tab(s)")).clicked() {
+                                    let missing = diff_now.map_or("missing".to_string(), |(added, _)| format!("{added} missing"));
+                                    if ui.button(format!("Add the {missing} tab(s)")).clicked() {
                                         acts.send(Command::RestoreSnapshot { session: session.id, snapshot: snap.id, mode: RestoreMode::Merge, open });
                                         ui.close();
                                     }
@@ -251,17 +255,23 @@ impl BackupView {
 
     // ------------------------------------------------------------ export
 
-    fn export(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, session: &Session) {
+    fn export(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, session: &Session, acts: &mut Actions) {
         section_card(ui, "Save to disk", "Download sessions as a file you can import again later, here or in another browser.", |ui| {
             ui.horizontal_wrapped(|ui| {
+                // Written by the background (it reads the tabs and snapshots that aren't here).
                 if ui.add(primary_button(ui, format!("⬇  \"{}\" (.json)", session.name))).clicked() {
-                    let json = transfer::export_sessions([&cx.with_snapshots(session)], self.include_snapshots, pf::now());
-                    save(&format!("session-{}-{}.json", slug(&session.name), today()), &json, "application/json");
+                    acts.send(Command::ExportSessions {
+                        sessions: Some(vec![session.id]),
+                        include_snapshots: self.include_snapshots,
+                        filename: format!("session-{}-{}.json", slug(&session.name), today()),
+                    });
                 }
                 if ui.button(format!("⬇  All {} sessions (.json)", cx.state.sessions.len())).clicked() {
-                    let all: Vec<Session> = cx.state.sessions.iter().map(|s| cx.with_snapshots(s)).collect();
-                    let json = transfer::export_sessions(&all, self.include_snapshots, pf::now());
-                    save(&format!("sessions-{}.json", today()), &json, "application/json");
+                    acts.send(Command::ExportSessions {
+                        sessions: None,
+                        include_snapshots: self.include_snapshots,
+                        filename: format!("sessions-{}.json", today()),
+                    });
                 }
                 if ui.button("⬇  URL list (.txt)").on_hover_text("Comma separated, one per line").clicked() {
                     save(&format!("urls-{}-{}.txt", slug(&session.name), today()), &transfer::export_urls(&session.entries), "text/plain");
@@ -479,7 +489,7 @@ fn download_snapshot(session: &Session, snap: &Snapshot) {
     let as_session = Session {
         name: format!("{} — {}", session.name, snap.name),
         created_at: snap.created_at,
-        entries: snap.entries.clone(),
+        entries: snap.entries.clone().into(),
         ..Default::default()
     };
     let json = transfer::export_sessions([&as_session], false, pf::now());

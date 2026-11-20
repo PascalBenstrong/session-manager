@@ -25,7 +25,7 @@ mod widgets;
 
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,8 +35,9 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::dedupe::{DedupeOptions, DuplicateGroup, Scope, find_duplicates};
 use crate::model::{AppState, EntryRef, Id, Session, Snapshot, TabId};
+use crate::page_state::{self, Want};
 use crate::platform as pf;
-use crate::protocol::{Capabilities, Command, Response, SNAPSHOTS_KEY, STATE_KEY};
+use crate::protocol::{CHANGED_KEY, Capabilities, Command, OpenTabs, Response};
 use widgets::{badge, icon_button, nav_item, primary_button, segmented, text_input};
 
 /// Width from which the sidebar layout is used.
@@ -65,11 +66,12 @@ pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
 #[derive(Default)]
 struct Inbox {
     responses: Vec<Response>,
-    /// The newest state the background saved, not read yet: only the newest is parsed (once
-    /// per frame), however many arrive meanwhile. Kept as the JS string until then.
-    pushed_state: Option<JsValue>,
-    /// The newest snapshots saved (SNAPSHOTS_KEY), not read yet; same as `pushed_state`.
-    pushed_snapshots: Option<JsValue>,
+    /// The reply to GetSnapshots, with what it was asked for (see `sync_snapshots`).
+    snapshots_reply: Option<((Id, Vec<Id>), Response)>,
+    /// The newest revision the background saved (CHANGED_KEY), not acted on yet.
+    changed: Option<u64>,
+    /// The reply to this page's GetState (see `sync_state`).
+    state_reply: Option<Response>,
     /// The window of a sidebar page.
     window_id: Option<TabId>,
     /// Messages for the toast: (text, error).
@@ -224,18 +226,18 @@ pub(crate) struct ViewCtx<'a> {
     pub state: &'a AppState,
     pub caps: &'a Capabilities,
     pub viewed: Id,
-    /// The sessions' snapshots (not in `state`: they are kept apart, see SNAPSHOTS_KEY).
+    /// The snapshots of the session shown, with their tabs, once asked for (the state
+    /// describes every session's snapshots without their tabs).
     pub snapshots: &'a BTreeMap<Id, Vec<Snapshot>>,
 }
 
 impl ViewCtx<'_> {
-    pub fn snapshots_of(&self, session: Id) -> &[Snapshot] {
-        self.snapshots.get(&session).map_or(&[], Vec::as_slice)
-    }
-
-    /// A copy of a session with its snapshots (to export it).
-    pub fn with_snapshots(&self, session: &Session) -> Session {
-        Session { snapshots: self.snapshots_of(session.id).to_vec(), ..session.clone() }
+    /// A session's snapshots: with their tabs if they were asked for, else what describes them.
+    pub fn snapshots_of<'b>(&'b self, session: &'b Session) -> &'b [Snapshot] {
+        match self.snapshots.get(&session.id) {
+            Some(full) if full.iter().map(|x| x.id).eq(session.snapshots.iter().map(|x| x.id)) => full,
+            _ => &session.snapshots,
+        }
     }
 }
 
@@ -258,6 +260,17 @@ pub struct App {
     pending: u32,
     state: Option<Rc<AppState>>,
     snapshots: BTreeMap<Id, Vec<Snapshot>>,
+    /// What this page has of the state (see `page_state.rs`): what it asked for last, what
+    /// it's asking for now (one request at a time), a newer revision saved since, and
+    /// whether to ask for everything again.
+    state_asked: Option<Want>,
+    state_asking: Option<Want>,
+    state_newer: Option<u64>,
+    state_full_again: bool,
+    /// The snapshots shown (one session's, with their tabs): for which session and snapshot
+    /// list, and whether they're being asked for.
+    snapshots_key: Option<(Id, Vec<Id>)>,
+    snapshots_asking: bool,
     caps: Capabilities,
     status: Option<Status>,
     view: View,
@@ -288,41 +301,19 @@ impl App {
         let inbox = Rc::new(RefCell::new(Inbox::default()));
         // The capture window shows nothing of the state.
         if !capture {
+            // After each save the background says which revision: the page then asks for
+            // what changed in what it shows (see `sync_state`).
             let inbox = inbox.clone();
             let ctx = cc.egui_ctx.clone();
             let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
-                if v.is_string() {
-                    inbox.borrow_mut().pushed_state = Some(v);
-                    ctx.request_repaint();
-                }
-            });
-            pf::on_state_changed(STATE_KEY, cb.as_ref().unchecked_ref());
-            cb.forget();
-        }
-        // Only the manager and the popup show snapshots.
-        if !sidebar && !inspector && !capture {
-            // Snapshots: read once, then followed like the state.
-            let pushed = inbox.clone();
-            let ctx = cc.egui_ctx.clone();
-            let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
-                if v.is_string() {
-                    pushed.borrow_mut().pushed_snapshots = Some(v);
-                    ctx.request_repaint();
-                }
-            });
-            pf::on_state_changed(SNAPSHOTS_KEY, cb.as_ref().unchecked_ref());
-            cb.forget();
-            let inbox = inbox.clone();
-            let ctx = cc.egui_ctx.clone();
-            spawn_local(async move {
-                if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
+                if let Some(rev) = v.as_string().and_then(|r| r.parse::<u64>().ok()) {
                     let mut inbox = inbox.borrow_mut();
-                    if inbox.pushed_snapshots.is_none() {
-                        inbox.pushed_snapshots = Some(JsValue::from_str(&json));
-                    }
+                    inbox.changed = Some(inbox.changed.map_or(rev, |c| c.max(rev)));
                     ctx.request_repaint();
                 }
             });
+            pf::on_state_changed(CHANGED_KEY, cb.as_ref().unchecked_ref());
+            cb.forget();
         }
         if sidebar {
             let inbox = inbox.clone();
@@ -348,6 +339,12 @@ impl App {
             pending: 0,
             state: None,
             snapshots: BTreeMap::new(),
+            state_asked: None,
+            state_asking: None,
+            state_newer: None,
+            state_full_again: false,
+            snapshots_key: None,
+            snapshots_asking: false,
             caps: Capabilities::default(),
             status: None,
             view: View::Tabs,
@@ -365,7 +362,7 @@ impl App {
             organize: Default::default(),
             cleanup: Default::default(),
         };
-        app.send(Command::GetState);
+        app.sync_state();
         app
     }
 
@@ -439,34 +436,154 @@ impl App {
         });
     }
 
+    /// Asks for the snapshots (with their tabs) of the session shown in the Snapshots view,
+    /// when they changed. Only that session's: the others' stay in the database.
+    fn sync_snapshots(&mut self) {
+        if self.popup || self.sidebar || self.view != View::Backup || self.snapshots_asking {
+            return;
+        }
+        let Some(state) = &self.state else { return };
+        let viewed = self.viewed_session.unwrap_or(state.active_session);
+        let Some(session) = state.session(viewed) else { return };
+        let key: (Id, Vec<Id>) = (viewed, session.snapshots.iter().map(|x| x.id).collect());
+        if self.snapshots_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.snapshots_asking = true;
+        let inbox = self.inbox.clone();
+        let ctx = self.ctx.clone();
+        spawn_local(async move {
+            let resp = pf::send_command(&Command::GetSnapshots { session: viewed }).await;
+            inbox.borrow_mut().snapshots_reply = Some((key, resp));
+            ctx.request_repaint();
+        });
+    }
+
+    /// What this page shows of the state: the tabs of the session viewed and the active
+    /// one, every session's only while a view needs them all; open tabs of the other
+    /// sessions for the sidebar (its window) and the page guards view (all).
+    fn want(&self) -> Want {
+        if self.inspector.is_some() || self.capture.is_some() {
+            return Want { sessions: Some(BTreeSet::new()), with_active: false, open_tabs: OpenTabs::None };
+        }
+        let all = if self.popup {
+            self.mini.needs_all_sessions()
+        } else if self.sidebar {
+            false
+        } else {
+            match self.view {
+                View::Tabs => self.tabs.needs_all_sessions(),
+                View::Organize => self.organize.needs_all_sessions(),
+                _ => false,
+            }
+        };
+        let sessions = (!all).then(|| {
+            let mut ids = BTreeSet::new();
+            if let Some(s) = &self.state {
+                ids.insert(s.active_session);
+                ids.insert(self.viewed_session.unwrap_or(s.active_session));
+            }
+            ids
+        });
+        let open_tabs = if self.sidebar {
+            self.window_id.map_or(OpenTabs::None, OpenTabs::Window)
+        } else if !self.popup && self.view == View::Guards {
+            OpenTabs::All
+        } else {
+            OpenTabs::None
+        };
+        Want { sessions, with_active: true, open_tabs }
+    }
+
+    /// Asks the background for the state when what the page shows changed, or a newer
+    /// state was saved: only the tabs it shows that changed (see `page_state.rs`).
+    fn sync_state(&mut self) {
+        if self.state_asking.is_some() {
+            return;
+        }
+        let want = self.want();
+        let newer = self.state_newer.is_some_and(|r| self.state.as_ref().is_none_or(|s| r > s.revision));
+        if self.state.is_some() && !newer && !self.state_full_again && self.state_asked.as_ref() == Some(&want) {
+            return;
+        }
+        let known = if self.state_full_again { BTreeMap::new() } else { page_state::known(self.state.as_deref()) };
+        let cmd = Command::GetState {
+            sessions: want.sessions.as_ref().map(|s| s.iter().copied().collect()),
+            with_active: want.with_active,
+            open_tabs: want.open_tabs,
+            known: known.into_iter().collect(),
+        };
+        self.state_newer = None;
+        self.state_full_again = false;
+        self.state_asking = Some(want);
+        let inbox = self.inbox.clone();
+        let ctx = self.ctx.clone();
+        spawn_local(async move {
+            let resp = pf::send_command(&cmd).await;
+            inbox.borrow_mut().state_reply = Some(resp);
+            ctx.request_repaint();
+        });
+    }
+
     fn drain_inbox(&mut self) {
-        let (responses, pushed, notices) = {
+        let (responses, notices, state_reply) = {
             let mut inbox = self.inbox.borrow_mut();
             if let Some(w) = inbox.window_id.take() {
                 self.window_id = Some(w);
             }
-            if let Some(json) = inbox.pushed_snapshots.take().and_then(|v| v.as_string())
-                && let Ok(all) = serde_json::from_str::<BTreeMap<Id, Vec<Snapshot>>>(&json)
-            {
-                self.snapshots = all;
+            if let Some((key, r)) = inbox.snapshots_reply.take() {
+                self.snapshots_asking = false;
+                if let Some(snaps) = r.snapshots {
+                    self.snapshots = BTreeMap::from([(key.0, snaps)]);
+                    self.snapshots_key = Some(key);
+                }
             }
-            (std::mem::take(&mut inbox.responses), inbox.pushed_state.take(), std::mem::take(&mut inbox.notices))
+            if let Some(rev) = inbox.changed.take() {
+                self.state_newer = Some(self.state_newer.map_or(rev, |w| w.max(rev)));
+            }
+            (std::mem::take(&mut inbox.responses), std::mem::take(&mut inbox.notices), inbox.state_reply.take())
         };
         for (text, error) in notices {
             self.set_status(text, error);
         }
-        if let Some(json) = pushed.and_then(|v| v.as_string())
-            && let Ok(s) = serde_json::from_str::<AppState>(&json)
-        {
-            self.accept_state(s);
+        if let Some(r) = state_reply {
+            let asked = self.state_asking.take();
+            if let Some(c) = r.capabilities.clone() {
+                self.caps = c;
+            }
+            match r.state {
+                Some(s) => {
+                    let asked_for = asked.clone().unwrap_or_default();
+                    match page_state::merge(self.state.as_deref(), s, &asked_for) {
+                        Some(s) => {
+                            self.accept_state(s);
+                            self.state_asked = asked;
+                        }
+                        // It kept tabs this page doesn't have: ask for everything again.
+                        None => self.state_full_again = true,
+                    }
+                }
+                None => self.set_status(r.error.unwrap_or_else(|| "Could not get the state".into()), true),
+            }
         }
         for r in responses {
             self.pending = self.pending.saturating_sub(1);
-            if let Some(s) = r.state {
-                self.accept_state(s);
-            }
             if let Some(c) = r.capabilities {
                 self.caps = c;
+            }
+            if let Some(hits) = r.hits {
+                self.tabs.vector_results(hits);
+            }
+            if let Some((name, text)) = r.file.as_ref()
+                && let Err(e) = pf::download_text(name, text, "application/json")
+            {
+                self.set_status(format!("Could not save the file: {e}"), true);
+            }
+            // The command saved a newer state: ask for what changed.
+            if let Some(rev) = r.revision
+                && self.state.as_ref().is_some_and(|s| rev > s.revision)
+            {
+                self.state_newer = Some(self.state_newer.map_or(rev, |w| w.max(rev)));
             }
             if let Some(e) = r.error {
                 // Keep the popup open so the error can be read.
@@ -494,6 +611,7 @@ impl App {
     /// storage changes can arrive out of order).
     fn accept_state(&mut self, s: AppState) {
         if self.state.as_ref().is_none_or(|cur| s.revision >= cur.revision) {
+            publish_page_state(&s);
             self.state = Some(Rc::new(s));
             STATE_GENERATION.with(|g| g.set(g.get() + 1));
         }
@@ -552,12 +670,12 @@ impl App {
             for s in &state.sessions {
                 let active = s.id == state.active_session;
                 let icon = if active { "★" } else { "▢" };
-                let count = s.entries.len().to_string();
+                let count = s.tab_count().to_string();
                 let resp = nav_item(ui, icon, &s.name, s.id == viewed, Some((&count, active)));
                 let resp = resp.on_hover_text(format!(
                     "{} open · {} unloaded{}",
                     s.open_count(),
-                    s.entries.len() - s.open_count(),
+                    s.tab_count() - s.open_count(),
                     if active { "\nActive: new tabs are added here" } else { "" }
                 ));
                 if resp.clicked() {
@@ -626,9 +744,9 @@ impl App {
                 ui.label(
                     RichText::new(format!(
                         "{} tabs · {} open · {} unloaded",
-                        session.entries.len(),
+                        session.tab_count(),
                         session.open_count(),
-                        session.entries.len() - session.open_count()
+                        session.tab_count() - session.open_count()
                     ))
                     .color(p.muted),
                 );
@@ -666,15 +784,37 @@ impl App {
     /// Set active / Load / Last tab. Laid out right-to-left.
     fn session_actions(&mut self, ui: &mut egui::Ui, state: &AppState, session: &Session, labels: bool) {
         let is_active = session.id == state.active_session;
-        let closed = session.entries.len() - session.open_count();
+        let closed = session.tab_count() - session.open_count();
 
         let last = if labels { egui::Button::new("⟲  Last tab") } else { egui::Button::new("⟲") };
         if ui
-            .add_enabled(!session.entries.is_empty(), last)
+            .add_enabled(session.tab_count() > 0, last)
             .on_hover_text("Find and focus the most recently used tab of this session")
             .clicked()
         {
             self.send(Command::FocusLastTab { session: session.id });
+        }
+
+        // The tabs that were open when the session's tabs were last closed (browser quit,
+        // window closed): one click brings them back.
+        let previous = session.last_closed_entries().count();
+        if previous > 0 && state.settings.tracking.last_closed {
+            let label = if labels { format!("↺  Restore {previous}") } else { format!("↺ {previous}") };
+            ui.menu_button(label, |ui| {
+                ui.set_min_width(220.0);
+                if ui.button("Restore unloaded (lazy)").on_hover_text("Tabs come back but only load when clicked").clicked() {
+                    self.send(Command::RestoreLastClosed { session: session.id, discarded: true });
+                    ui.close();
+                }
+                if ui.button("Restore and load all").clicked() {
+                    self.send(Command::RestoreLastClosed { session: session.id, discarded: false });
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text(format!(
+                "Reopen the {previous} tab(s) that were open when this session's tabs were last closed (window closed or browser quit). Tabs you closed yourself are not included."
+            ));
         }
 
         ui.add_enabled_ui(closed > 0, |ui| {
@@ -758,7 +898,7 @@ impl App {
             let can_delete = state.sessions.len() > 1;
             if ui.add_enabled(can_delete, egui::Button::new("🗑 Delete session…")).clicked() {
                 self.confirm(
-                    format!("Delete session \"{}\" and forget its {} tab(s)? Open tabs stay open.", session.name, session.entries.len()),
+                    format!("Delete session \"{}\" and forget its {} tab(s)? Open tabs stay open.", session.name, session.tab_count()),
                     Command::DeleteSession { id: session.id, close_tabs: false },
                 );
                 ui.close();
@@ -795,12 +935,8 @@ impl App {
                 .height(360.0)
                 .show_ui(ui, |ui| {
                     for s in &state.sessions {
-                        let label = format!(
-                            "{}  ·  {}/{}",
-                            widgets::session_label(s, s.id == state.active_session),
-                            s.open_count(),
-                            s.entries.len()
-                        );
+                        let label =
+                            format!("{}  ·  {}/{}", widgets::session_label(s, s.id == state.active_session), s.open_count(), s.tab_count());
                         if ui.selectable_label(s.id == session.id, label).clicked() {
                             self.viewed_session = Some(s.id);
                             self.rename_buf = None;
@@ -952,6 +1088,8 @@ impl App {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         self.drain_inbox();
+        self.sync_state();
+        self.sync_snapshots();
         if let Some(mut inspector) = self.inspector.take() {
             let mut acts = Actions::default();
             inspector.ui(ui, &mut acts, self.state.as_deref());
@@ -1020,6 +1158,9 @@ impl App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin)).show(ui, |ui| {
             let cx = ViewCtx { state: &state, caps: &self.caps, viewed: session.id, snapshots: &self.snapshots };
             match self.view {
+                View::Tabs if session.partial => {
+                    ui.centered_and_justified(|ui| ui.spinner());
+                }
                 View::Tabs => self.tabs.show(ui, &cx, &mut acts),
                 View::Organize => self.organize.show(ui, &cx, &mut acts),
                 View::Cleanup => self.cleanup.show(ui, &cx, &mut acts),
@@ -1062,4 +1203,17 @@ fn close_window() {
     if let Some(w) = web_sys::window() {
         let _ = w.close();
     }
+}
+
+/// What the page holds, for tests in real browsers (the UI is drawn on a canvas):
+/// `globalThis.smPageState = { revision, sessions: [{ id, partial, tabs, count }] }` —
+/// `tabs` loaded, `count` it has. Small: no tab data.
+fn publish_page_state(s: &AppState) {
+    let summary = serde_json::json!({
+        "revision": s.revision,
+        "sessions": s.sessions.iter().map(|x| serde_json::json!({
+            "id": x.id, "partial": x.partial, "tabs": x.entries.len(), "count": x.tab_count(),
+        })).collect::<Vec<_>>(),
+    });
+    let _ = js_sys::Reflect::set(&js_sys::global(), &JsValue::from_str("smPageState"), &pf::to_js(&summary));
 }

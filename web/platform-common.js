@@ -423,6 +423,213 @@ export async function tabOutWithGroup(api, t, titles = new Map()) {
   return out;
 }
 
+// ---- IndexedDB ----
+// The extension's database (smPlatform.db* use the 'session-manager' one). Stores: meta
+// ('state': the state without tabs or snapshots, as JSON), tabs (key: entry id; { s:
+// session id, o: position, a: 1 if open else 0, j: entry JSON }, indexed by session and by
+// `a`) and vectors (key: session id; its vector index as JSON). Only the background writes.
+// Version 2 added the index of open tabs (the background reads only those of inactive
+// sessions); version 3 the snapshots (key: snapshot id; { s: session id, j: snapshot JSON },
+// indexed by session).
+// tools/idb-conformance.js runs this against real browsers and the test fake.
+export const DB_VERSION = 3;
+
+const idbReq = (r) =>
+  new Promise((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+
+const idbDone = (tx) =>
+  new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('database write failed'));
+    tx.onabort = () => reject(tx.error || new Error('database write aborted'));
+  });
+
+/** The database `name`; `factory` gives the IndexedDB to use (read when first opened). */
+export function createDb(name, factory = () => globalThis.indexedDB) {
+  let opening = null;
+
+  /** Opened once (and again if it was closed or failed to open). */
+  function open() {
+    if (opening) return opening;
+    opening = new Promise((resolve, reject) => {
+      let req;
+      try {
+        const idb = factory();
+        if (!idb) throw new Error('IndexedDB is not available');
+        req = idb.open(name, DB_VERSION);
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
+        const tabs = db.objectStoreNames.contains('tabs') ? req.transaction.objectStore('tabs') : db.createObjectStore('tabs');
+        if (!tabs.indexNames.contains('session')) tabs.createIndex('session', 's');
+        // Records saved before (version 1) have no `a`: the background reads them all once
+        // and saves them again (the state says which layout it was saved with).
+        if (!tabs.indexNames.contains('open')) tabs.createIndex('open', 'a');
+        if (!db.objectStoreNames.contains('vectors')) db.createObjectStore('vectors');
+        if (!db.objectStoreNames.contains('snapshots')) db.createObjectStore('snapshots').createIndex('session', 's');
+      };
+      req.onsuccess = () => {
+        const db = req.result;
+        // Another version of the extension upgrades it: let go, open again next time.
+        db.onversionchange = () => {
+          db.close();
+          opening = null;
+        };
+        db.onclose = () => {
+          opening = null;
+        };
+        resolve(db);
+      };
+      req.onerror = () => reject(req.error || new Error('the database could not be opened'));
+      req.onblocked = () => reject(new Error('the database is in use by an older version of the extension'));
+    });
+    opening.catch(() => {
+      opening = null;
+    });
+    return opening;
+  }
+
+  return {
+    open,
+
+    /** The saved state and every tab: { header: string|null, tabs: [{ id, s, j }] }. */
+    async load() {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readonly');
+      const tabs = tx.objectStore('tabs');
+      const [header, keys, values] = await Promise.all([
+        idbReq(tx.objectStore('meta').get('state')),
+        idbReq(tabs.getAllKeys()),
+        idbReq(tabs.getAll()),
+      ]);
+      return { header: header ?? null, tabs: values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, a: v.a ?? 0, j: v.j })) };
+    },
+
+    /**
+     * The state, the active session's tabs and the open tabs of every session, in one
+     * transaction: what the background keeps in memory. { header, tabs: [{ id, s, o, a, j }] }
+     * (a tab can be listed twice).
+     */
+    async loadPartial() {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readonly');
+      const header = await idbReq(tx.objectStore('meta').get('state'));
+      if (!header) return { header: null, tabs: [] };
+      const active = JSON.parse(header).active_session;
+      const tabs = tx.objectStore('tabs');
+      const [sk, sv, ok, ov] = await Promise.all([
+        idbReq(tabs.index('session').getAllKeys(active)),
+        idbReq(tabs.index('session').getAll(active)),
+        idbReq(tabs.index('open').getAllKeys(1)),
+        idbReq(tabs.index('open').getAll(1)),
+      ]);
+      const rec = (keys, values) => values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, a: v.a ?? 0, j: v.j }));
+      return { header, tabs: rec(sk, sv).concat(rec(ok, ov)) };
+    },
+
+    /** Every tab of these sessions: [{ id, s, o, a, j }]. */
+    async loadSessions(sessions) {
+      const db = await open();
+      const index = db.transaction('tabs', 'readonly').objectStore('tabs').index('session');
+      const lists = await Promise.all(sessions.map((id) => Promise.all([idbReq(index.getAllKeys(id)), idbReq(index.getAll(id))])));
+      return lists.flatMap(([keys, values]) => values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, a: v.a ?? 0, j: v.j })));
+    },
+
+    /**
+     * One transaction: empties the tabs first if `clear`, deletes every tab of the sessions
+     * `delSessions`, puts tabs ([{ id, s, o, a, j }]), deletes tabs (ids) and sets the
+     * state. Nothing is written if any part fails.
+     */
+    async write(header, puts, dels, clear = false, delSessions = [], snapPuts = [], snapDels = []) {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs', 'snapshots'], 'readwrite');
+      const done = idbDone(tx);
+      const store = tx.objectStore('tabs');
+      const snaps = tx.objectStore('snapshots');
+      if (clear) store.clear();
+      if (delSessions.length) {
+        // A deleted session's tabs and snapshots.
+        const keys = await Promise.all(delSessions.map((id) => idbReq(store.index('session').getAllKeys(id))));
+        for (const k of keys.flat()) store.delete(k);
+        const snapKeys = await Promise.all(delSessions.map((id) => idbReq(snaps.index('session').getAllKeys(id))));
+        for (const k of snapKeys.flat()) snaps.delete(k);
+      }
+      for (const p of puts) store.put({ s: p.s, o: p.o ?? 0, a: p.a ?? 0, j: p.j }, p.id);
+      for (const id of dels) store.delete(id);
+      for (const p of snapPuts) snaps.put({ s: p.s, j: p.j }, p.id);
+      for (const id of snapDels) snaps.delete(id);
+      tx.objectStore('meta').put(header, 'state');
+      await done;
+    },
+
+    /** The snapshots (with their tabs) of these sessions: [{ id, s, j }]. */
+    async loadSnapshots(sessions) {
+      const db = await open();
+      const index = db.transaction('snapshots', 'readonly').objectStore('snapshots').index('session');
+      const lists = await Promise.all(sessions.map((id) => Promise.all([idbReq(index.getAllKeys(id)), idbReq(index.getAll(id))])));
+      return lists.flatMap(([keys, values]) => values.map((v, i) => ({ id: keys[i], s: v.s, j: v.j })));
+    },
+
+    /** Empties the state, tabs and snapshots (after the state was saved in storage.local instead). */
+    async clear() {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs', 'snapshots'], 'readwrite');
+      const done = idbDone(tx);
+      tx.objectStore('meta').clear();
+      tx.objectStore('tabs').clear();
+      tx.objectStore('snapshots').clear();
+      await done;
+    },
+
+    /**
+     * For pages: the saved state, and the tabs of the sessions whose `tabs_revision` isn't
+     * the one in `known` ({ sessionId: revision }), read in one transaction.
+     * Returns { header, sessions: [{ id, tabs: [{ o, j }] }] } or null if nothing is saved.
+     */
+    async readState(known) {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readonly');
+      const header = await idbReq(tx.objectStore('meta').get('state'));
+      if (!header) return null;
+      const wanted = (JSON.parse(header).sessions || []).filter((s) => known[s.id] !== (s.tabs_revision || 0)).map((s) => s.id);
+      const index = tx.objectStore('tabs').index('session');
+      const lists = await Promise.all(wanted.map((id) => idbReq(index.getAll(id))));
+      return { header, sessions: wanted.map((id, i) => ({ id, tabs: lists[i].map((t) => ({ o: t.o ?? 0, j: t.j })) })) };
+    },
+
+    async getVectors(session) {
+      const db = await open();
+      return (await idbReq(db.transaction('vectors', 'readonly').objectStore('vectors').get(session))) ?? null;
+    },
+
+    async putVectors(session, json) {
+      const db = await open();
+      const tx = db.transaction('vectors', 'readwrite');
+      const done = idbDone(tx);
+      tx.objectStore('vectors').put(json, session);
+      await done;
+    },
+
+    async deleteVectors(sessions) {
+      if (!sessions.length) return;
+      const db = await open();
+      const tx = db.transaction('vectors', 'readwrite');
+      const done = idbDone(tx);
+      for (const id of sessions) tx.objectStore('vectors').delete(id);
+      await done;
+    },
+  };
+}
+
+const smDb = createDb('session-manager');
+
 export function cookieOut(c) {
   return {
     name: c.name,
@@ -540,8 +747,28 @@ export function installPlatform(api, overrides = {}) {
   let gesture = '';
   let pageWindowId = null;
 
+  // How long the background takes per event and per command, and its memory, for the
+  // performance tests in real browsers (tools/perf-real-test.mjs asks with { smTimings }).
+  // Two clock reads per event and the last 256 times per kind: nothing more.
+  const timings = new Map();
+  const loadedAt = performance.now();
+  let startupMs = null;
+  let wasmMemory = null;
+  const record = (kind, ms) => {
+    let list = timings.get(kind);
+    if (!list) timings.set(kind, (list = []));
+    list.push(ms);
+    if (list.length > 256) list.shift();
+  };
+  const kindOf = (ev) => (ev.type === 'message' ? `cmd:${(/"cmd":"(\w+)"/.exec(ev.payload) || [])[1] || '?'}` : ev.type);
+
   function emit(ev) {
-    if (handler) return Promise.resolve(handler(ev));
+    if (handler) {
+      const t = performance.now();
+      const done = Promise.resolve(handler(ev));
+      done.finally(() => record(kindOf(ev), performance.now() - t)).catch(() => {});
+      return done;
+    }
     return new Promise((resolve, reject) => queue.push({ ev, resolve, reject }));
   }
 
@@ -1157,6 +1384,67 @@ export function installPlatform(api, overrides = {}) {
       });
     },
 
+    /** Several keys in one write (pages get them in one change event). */
+    async storageSetMany(items) {
+      if (Object.keys(items).length) await api.storage.local.set(items);
+    },
+
+    async storageRemove(keys) {
+      if (keys && keys.length) await api.storage.local.remove(keys);
+    },
+
+    // ---- database (IndexedDB; see createDb) ----
+    /** Throws if the database can't be opened (e.g. storage off for the profile). */
+    async dbOpen() {
+      await smDb.open();
+    },
+    dbLoad: () => smDb.load(),
+    dbWrite: (header, puts, dels, clear, delSessions, snapPuts, snapDels) => smDb.write(header, puts, dels, clear, delSessions, snapPuts, snapDels),
+    dbLoadSnapshots: (sessions) => smDb.loadSnapshots(sessions),
+    dbLoadPartial: () => smDb.loadPartial(),
+    dbLoadSessions: (sessions) => smDb.loadSessions(sessions),
+    dbClear: () => smDb.clear(),
+    dbReadState: (known) => smDb.readState(known),
+    dbGetVectors: (session) => smDb.getVectors(session),
+    dbPutVectors: (session, json) => smDb.putVectors(session, json),
+    dbDeleteVectors: (sessions) => smDb.deleteVectors(sessions),
+
+    // ---- AI integrations ----
+    /** The title and visible text of a tab's page (top frame), at most maxChars. */
+    async pageText(tabId, maxChars) {
+      const [r] = await api.scripting.executeScript({
+        target: { tabId },
+        func: (max) => {
+          const body = document.body;
+          const text = body ? body.innerText || body.textContent || '' : '';
+          return { title: document.title || '', text: text.replace(/\s+\n/g, '\n').slice(0, max) };
+        },
+        args: [Math.max(0, maxChars | 0)],
+      });
+      if (!r || !r.result) throw new Error('the page could not be read');
+      return r.result;
+    },
+
+    /** An HTTP request (AI providers). Never throws: failures are { status: 0, body: message }. */
+    async httpRequest(req, timeoutMs) {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), timeoutMs || 60000);
+      try {
+        const r = await fetch(req.url, {
+          method: req.method || 'POST',
+          headers: req.headers || {},
+          body: req.body || undefined,
+          signal: ctl.signal,
+          credentials: 'omit',
+        });
+        return { status: r.status, body: await r.text() };
+      } catch (e) {
+        return { status: 0, body: ctl.signal.aborted ? 'timed out' : String((e && e.message) || e) };
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+
     // ---- alarms ----
     async getAlarms() {
       return (await api.alarms.getAll()).map((a) => ({ name: a.name, periodInMinutes: a.periodInMinutes ?? null }));
@@ -1259,10 +1547,17 @@ export function installPlatform(api, overrides = {}) {
 
     // ---- background only ----
     setEventHandler(fn) {
+      // The background is ready: how long it took since its script started.
+      startupMs ??= performance.now() - loadedAt;
       handler = fn;
       for (const { ev, resolve, reject } of queue.splice(0)) {
         Promise.resolve(fn(ev)).then(resolve, reject);
       }
+    },
+
+    /** The background's wasm memory (its size is reported to the performance tests). */
+    setWasmMemory(memory) {
+      wasmMemory = memory;
     },
 
     /** Must be called synchronously at background startup (top level). */
@@ -1392,6 +1687,16 @@ export function installPlatform(api, overrides = {}) {
           dockedTabs().then((list) => {
             if (list.includes(sender.tab.id)) platform.dockInspector(sender.tab.id).catch(() => {});
           });
+          return false;
+        }
+        // The performance tests read (and reset) the timings.
+        if (msg && msg.smTimings && sender && sender.id === api.runtime.id) {
+          sendResponse({
+            startupMs,
+            wasmBytes: wasmMemory ? wasmMemory.buffer.byteLength : null,
+            timings: Object.fromEntries(timings),
+          });
+          if (msg.smTimings === 'reset') timings.clear();
           return false;
         }
         if (!msg || typeof msg.smPayload !== 'string') return false;

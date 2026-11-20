@@ -6,16 +6,20 @@
 //! browser folder (`firefox/`, `chrome/`) provides.
 
 pub mod ads;
+pub mod ai;
 pub mod capture;
 pub mod cleanup;
 pub mod dedupe;
+pub mod entries;
 pub mod guards;
 pub mod hibernate;
 pub mod media;
 pub mod model;
 pub mod netlog;
 pub mod organize;
+pub mod page_state;
 pub mod pattern;
+pub mod persist;
 pub mod protocol;
 pub mod release_notes;
 pub mod search;

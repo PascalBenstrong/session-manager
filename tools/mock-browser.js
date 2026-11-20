@@ -141,7 +141,7 @@ export function createMockBrowser() {
         }
         // Preview: run in this page (as the inspected tab's top frame).
         if (files) for (const f of files) await import(new URL(`../web/${f}`, import.meta.url).href);
-        return func ? [{ frameId: 0, result: func() }] : [{ frameId: 0, result: undefined }];
+        return func ? [{ frameId: 0, result: func(...(args || [])) }] : [{ frameId: 0, result: undefined }];
       },
     },
     webRequest: {
@@ -197,6 +197,14 @@ export function createMockBrowser() {
             const old = storage[k];
             storage[k] = v;
             ev.storage.fire({ [k]: { oldValue: old, newValue: v } }, 'local');
+          }
+        },
+        async remove(keys) {
+          for (const k of [].concat(keys)) {
+            if (!(k in storage)) continue;
+            const old = storage[k];
+            delete storage[k];
+            ev.storage.fire({ [k]: { oldValue: old } }, 'local');
           }
         },
       },

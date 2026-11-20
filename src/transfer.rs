@@ -26,7 +26,9 @@ pub fn export_sessions<'a>(sessions: impl IntoIterator<Item = &'a Session>, incl
         .into_iter()
         .map(|s| {
             let mut s = s.clone();
-            s.entries.iter_mut().for_each(unlink);
+            for mut e in s.entries.iter_mut() {
+                unlink(&mut e);
+            }
             if include_snapshots {
                 s.snapshots.iter_mut().flat_map(|snap| snap.entries.iter_mut()).for_each(unlink);
             } else {
@@ -506,7 +508,7 @@ mod tests {
         let s = Session {
             id: 1,
             name: "Work".into(),
-            entries: vec![TabEntry { id: 2, url: "https://a.com".into(), tab_id: Some(9), ..Default::default() }],
+            entries: vec![TabEntry { id: 2, url: "https://a.com".into(), tab_id: Some(9), ..Default::default() }].into(),
             snapshots: vec![Snapshot { id: 3, entries: vec![TabEntry { tab_id: Some(4), ..Default::default() }], ..Default::default() }],
             ..Default::default()
         };

@@ -49,6 +49,18 @@ pub struct TabEntry {
     pub loaded_at: f64,
     /// Last time the page stopped being loaded: hibernated or closed.
     pub unloaded_at: f64,
+    /// The [`Session::last_closed`] generation the tab was last open in. Equal to the
+    /// session's while open (or when closed by its window closing / the browser quitting):
+    /// closed entries with the session's value are its "last opened tabs". Empty once the
+    /// tab is closed by hand.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_closed: String,
+    /// Summary of the page written by an AI integration (see `ai.rs`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// The URL `description` was written for (a navigation makes it stale).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description_url: String,
 }
 
 impl TabEntry {
@@ -76,7 +88,9 @@ impl TabEntry {
 
     /// Records when the entry was opened, closed, loaded or unloaded, given whether it was
     /// open and loaded before its tab state changed.
-    pub fn stamp(&mut self, was_open: bool, was_loaded: bool, now: f64) {
+    /// `now` is `None` when tab times aren't recorded (see `TrackingSettings::tab_times`).
+    pub fn stamp(&mut self, was_open: bool, was_loaded: bool, now: Option<f64>) {
+        let Some(now) = now else { return };
         match (was_open, self.is_open()) {
             (false, true) => self.opened_at = now,
             (true, false) => self.closed_at = now,
@@ -102,6 +116,12 @@ impl TabEntry {
         }
     }
 
+    /// Whether this closed entry was open when its session's tabs were last closed together
+    /// (see [`Session::last_closed`]).
+    pub fn in_last_closed(&self, session_token: &str) -> bool {
+        !self.is_open() && !session_token.is_empty() && self.last_closed == session_token
+    }
+
     pub fn display_title(&self) -> &str {
         if self.title.trim().is_empty() { &self.url } else { &self.title }
     }
@@ -113,9 +133,41 @@ pub struct Session {
     pub id: Id,
     pub name: String,
     pub created_at: f64,
-    pub entries: Vec<TabEntry>,
+    /// Its tabs, tracking what changed since the last save.
+    pub entries: crate::entries::Entries,
     /// Saved revisions of `entries`, oldest first.
     pub snapshots: Vec<Snapshot>,
+    /// The current generation of open tabs. Every tab opened in the session gets this value
+    /// (`TabEntry::last_closed`); a new one is made when the session's tabs are restored, so
+    /// the tabs closed before stop counting as its last opened tabs.
+    pub last_closed: String,
+    /// The state revision at which the session's tabs last changed (pages ask again only
+    /// for the sessions whose value changed).
+    pub tabs_revision: u64,
+    /// How many tabs it has, and how many are open, as sent to pages (which may not have
+    /// its tabs: see `partial`) and saved (the background doesn't keep every tab: see
+    /// `Entries::hidden`).
+    pub counts: TabCounts,
+    /// The sequence number its next tab gets (saved: not all its tabs may be in memory).
+    pub next_seq: u64,
+    /// `tabs_revision` when the last automatic snapshot was considered.
+    pub snapshot_revision: u64,
+    /// Sent to a page without its tabs because they're the same as the ones the page has
+    /// (same `tabs_revision`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
+    /// In a page: its tabs aren't loaded (`entries` is empty, or holds only some open tabs);
+    /// `counts` says how many there are. Never set in the background.
+    #[serde(skip)]
+    pub partial: bool,
+}
+
+/// How many tabs a session has.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct TabCounts {
+    pub tabs: usize,
+    pub open: usize,
 }
 
 /// A saved revision of a session's tab list.
@@ -127,27 +179,84 @@ pub struct Snapshot {
     pub created_at: f64,
     /// Taken automatically (interval / before a restore). Only these are pruned.
     pub auto: bool,
-    /// Copies of the entries (never linked to live tabs).
+    /// Copies of the entries (never linked to live tabs). Empty while not loaded: the
+    /// background keeps only what describes a snapshot (below); its tabs are in the
+    /// database until a restore, a page or an export needs them.
     pub entries: Vec<TabEntry>,
+    /// How many tabs it has.
+    pub tabs: usize,
+    /// [`urls_hash`] of its tabs (automatic snapshots compare it with the session's).
+    pub urls_hash: u64,
+}
+
+/// A fingerprint of a set of URLs.
+pub fn urls_hash<'a>(urls: impl IntoIterator<Item = &'a str>) -> u64 {
+    let set: BTreeSet<&str> = urls.into_iter().collect();
+    let h = set.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, u| crate::ai::hash(u) ^ h.rotate_left(5).wrapping_mul(0x0100_0000_01b3));
+    // Kept within 53 bits: JavaScript numbers hold it exactly.
+    h & ((1 << 53) - 1)
 }
 
 impl Snapshot {
     pub fn urls(&self) -> BTreeSet<&str> {
         self.entries.iter().map(|e| e.url.as_str()).collect()
     }
+
+    /// Sets `tabs` and `urls_hash` from the tabs (taken, imported, or migrated).
+    pub fn seal(&mut self) {
+        self.tabs = self.entries.len();
+        self.urls_hash = urls_hash(self.entries.iter().map(|e| e.url.as_str()));
+    }
+
+    /// Whether its tabs are in memory (a snapshot with no tabs always is).
+    pub fn loaded(&self) -> bool {
+        self.entries.len() == self.tabs
+    }
+
+    /// What describes it, without its tabs.
+    pub fn meta(&self) -> Snapshot {
+        Snapshot { entries: Vec::new(), ..self.clone() }
+    }
 }
 
 impl Session {
     pub fn entry(&self, id: Id) -> Option<&TabEntry> {
-        self.entries.iter().find(|e| e.id == id)
+        self.entries.find(id)
     }
 
+    /// The tab with this id, to change it (it's saved at the next save).
     pub fn entry_mut(&mut self, id: Id) -> Option<&mut TabEntry> {
-        self.entries.iter_mut().find(|e| e.id == id)
+        self.entries.get_mut(id)
     }
 
+    /// The saved tabs that were open when the session's tabs were last closed (window
+    /// closed, browser quit), not reopened since.
+    pub fn last_closed_entries(&self) -> impl Iterator<Item = &TabEntry> {
+        self.entries.iter().filter(|e| e.in_last_closed(&self.last_closed))
+    }
+
+    /// How many tabs it has (also when a page doesn't have them loaded).
+    pub fn tab_count(&self) -> usize {
+        match self.entries.hidden() {
+            Some(_) => self.entries.total_len(),
+            None if self.partial => self.counts.tabs,
+            None => self.entries.len(),
+        }
+    }
+
+    /// Whether every one of its tabs is in memory.
+    pub fn loaded(&self) -> bool {
+        !self.partial && self.entries.hidden().is_none()
+    }
+
+    /// How many of its tabs are open. O(1) (see `entries.rs`).
     pub fn open_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.is_open()).count()
+        if self.partial { self.counts.open } else { self.entries.open_count() }
+    }
+
+    /// Updates `counts` from the tabs (before sending the session to pages).
+    pub fn refresh_counts(&mut self) {
+        self.counts = TabCounts { tabs: self.entries.total_len(), open: self.entries.open_count() };
     }
 
     /// The most recently accessed entry ("last open tab").
@@ -220,6 +329,37 @@ pub struct Settings {
     pub browser_ui: BrowserUiSettings,
     /// Protections against pages (pop-ups, right-click blocking, developer tools traps).
     pub guards: GuardSettings,
+    /// What is recorded and how it is stored (each can be turned off; turning one off
+    /// keeps what was recorded).
+    pub tracking: TrackingSettings,
+    /// Page summaries by a language model, and vector search.
+    pub ai: crate::ai::AiSettings,
+}
+
+/// Switches for what the extension records and writes to storage. Turning one off stops
+/// recording; nothing already saved is deleted.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct TrackingSettings {
+    /// Record when a tab was last used (each tab switch; "Last tab", the "Last used" order).
+    pub last_used: bool,
+    /// Record when tabs open, close, load and unload (time sorting and time filters).
+    pub tab_times: bool,
+    /// Remember which tabs were open when a session's tabs were last closed, to restore them.
+    pub last_closed: bool,
+    /// Keep a log of the tabs pages open.
+    pub popup_log: bool,
+    /// Keep a log of clean-ups.
+    pub cleanup_log: bool,
+    /// Save in the browser's database (IndexedDB): a change writes only the tabs that
+    /// changed. Off: everything is saved in one `storage.local` key, as before.
+    pub database: bool,
+}
+
+impl Default for TrackingSettings {
+    fn default() -> Self {
+        Self { last_used: true, tab_times: true, last_closed: true, popup_log: true, cleanup_log: true, database: true }
+    }
 }
 
 /// Workspaces in the browser's own interface (tab strip, window title).
@@ -397,6 +537,8 @@ impl Default for Settings {
             tab_list: TabListSettings::default(),
             browser_ui: BrowserUiSettings::default(),
             guards: GuardSettings::default(),
+            tracking: TrackingSettings::default(),
+            ai: crate::ai::AiSettings::default(),
         }
     }
 }
@@ -434,6 +576,10 @@ pub struct AppState {
     /// Goes up every time the state is saved. A page gets the state both in replies and
     /// from storage changes, which can arrive out of order: it keeps the newest one.
     pub revision: u64,
+    /// Windows seen closing (several of their tabs went): their other tabs are kept too.
+    /// Not saved.
+    #[serde(skip)]
+    pub closing_windows: Vec<TabId>,
 }
 
 impl Default for AppState {
@@ -456,6 +602,7 @@ impl Default for AppState {
             popup_log: Vec::new(),
             no_storage_sites: Vec::new(),
             revision: 0,
+            closing_windows: Vec::new(),
         };
         let id = s.alloc_id();
         s.sessions.push(Session { id, name: "Default".into(), ..Default::default() });

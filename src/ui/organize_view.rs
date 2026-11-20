@@ -25,6 +25,11 @@ pub struct OrganizeView {
 }
 
 impl OrganizeView {
+    /// Whether duplicates are looked for in every session.
+    pub fn needs_all_sessions(&self) -> bool {
+        self.dedupe_all_sessions
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);

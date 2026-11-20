@@ -5,7 +5,7 @@
 //! | term              | meaning                                            |
 //! |-------------------|----------------------------------------------------|
 //! | `word`            | default field/mode (UI selectable, default: title or URL contains) |
-//! | `host:github.com` | field filter: `title:`, `url:`, `host:`, `domain:`, `tag:`, `group:`, `ws:` (workspace) |
+//! | `host:github.com` | field filter: `title:`, `url:`, `host:`, `domain:`, `tag:`, `group:`, `ws:` (workspace), `desc:` (AI summary) |
 //! | `=word`, `^word$` | exact match                                        |
 //! | `^word`           | prefix match                                       |
 //! | `word$`           | suffix match                                       |
@@ -78,11 +78,13 @@ pub enum Field {
     Tag,
     Group,
     Workspace,
+    /// The AI summary of the page.
+    Description,
 }
 
 impl Field {
-    pub const ALL: [Field; 8] =
-        [Field::Any, Field::Title, Field::Url, Field::Host, Field::Domain, Field::Tag, Field::Group, Field::Workspace];
+    pub const ALL: [Field; 9] =
+        [Field::Any, Field::Title, Field::Url, Field::Host, Field::Domain, Field::Tag, Field::Group, Field::Workspace, Field::Description];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -94,6 +96,7 @@ impl Field {
             Field::Tag => "Tag",
             Field::Group => "Group",
             Field::Workspace => "Workspace",
+            Field::Description => "Summary",
         }
     }
 
@@ -106,6 +109,7 @@ impl Field {
             "tag" => Field::Tag,
             "group" | "g" => Field::Group,
             "workspace" | "ws" | "w" => Field::Workspace,
+            "desc" | "description" | "summary" => Field::Description,
             "any" => Field::Any,
             _ => return None,
         })
@@ -379,6 +383,7 @@ impl Query {
             Field::Tag => e.tags.iter().any(|tag| check(tag)),
             Field::Group => check(e.group.as_deref().unwrap_or("")),
             Field::Workspace => check(e.workspace.and_then(|w| self.workspace_names.get(&w)).map_or("", |n| n.as_str())),
+            Field::Description => check(&e.description),
         }
     }
 
@@ -853,6 +858,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn description_field() {
+        let mut e = entry("Rust", "https://a.com", &[], None);
+        assert!(!q("desc:ownership").matches(&e));
+        e.description = "A book about Ownership and borrowing".into();
+        assert!(q("desc:ownership").matches(&e));
+        assert!(q("summary:borrow").matches(&e));
+        assert!(!q("ownership").matches(&e), "plain terms stay title or URL");
     }
 
     #[test]

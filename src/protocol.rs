@@ -17,11 +17,59 @@ pub const STATE_KEY: &str = "sm_state";
 /// The sessions' snapshots (session id -> snapshots), kept apart from the state: they are
 /// large and rarely change, so ordinary saves (and the state sent to pages) leave them out.
 pub const SNAPSHOTS_KEY: &str = "sm_snapshots";
+/// Set to the revision after each save (to the database or storage.local): pages then ask
+/// for what changed in the sessions they show (GetState with `known`).
+pub const CHANGED_KEY: &str = "sm_changed";
+/// A development build kept each session's tabs under `sm_session_<id>` (a [`SessionFile`]),
+/// with STATE_KEY's `version` = [`SPLIT_VERSION`]. Read once, to migrate.
+pub const SESSION_PREFIX: &str = "sm_session_";
+/// The state's `version` when its sessions' tabs were kept apart under SESSION_PREFIX.
+pub const SPLIT_VERSION: u32 = 2;
+
+pub fn session_key(id: Id) -> String {
+    format!("{SESSION_PREFIX}{id}")
+}
+
+/// What a session key held (development build; migrated).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct SessionFile {
+    /// The state revision it was saved with.
+    pub revision: u64,
+    pub entries: Vec<crate::model::TabEntry>,
+}
+
+/// Open tabs a page wants from sessions it doesn't load whole.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OpenTabs {
+    #[default]
+    None,
+    /// Every open tab.
+    All,
+    /// The open tabs of one window (the sidebar).
+    Window(TabId),
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "cmd")]
 pub enum Command {
-    GetState,
+    /// The state. Pages ask for only what they show: the tabs of `sessions` (`None`: every
+    /// session), except those whose `tabs_revision` is the one in `known` (they're sent
+    /// `unchanged`, without tabs), and from the other sessions only the open tabs
+    /// `open_tabs` says. Every session comes with its tab `counts`.
+    GetState {
+        #[serde(default)]
+        sessions: Option<Vec<Id>>,
+        #[serde(default)]
+        open_tabs: OpenTabs,
+        /// Also the active session's tabs (a page starting doesn't know which it is).
+        #[serde(default)]
+        with_active: bool,
+        /// (session, `tabs_revision`) of the sessions the page has. (Pairs: in a tagged
+        /// enum, JSON object keys can't be read as numbers.)
+        #[serde(default)]
+        known: Vec<(Id, u64)>,
+    },
     CreateSession {
         name: String,
         make_active: bool,
@@ -59,6 +107,29 @@ pub enum Command {
     FocusLastTab {
         session: Id,
     },
+    /// Reopen the tabs that were open when the session's tabs were last closed (window
+    /// closed, browser quit), then start a new generation (see `Session::last_closed`).
+    RestoreLastClosed {
+        session: Id,
+        discarded: bool,
+    },
+    /// Write AI summaries (descriptions) of these entries' pages (open tabs only).
+    Summarize {
+        entries: Vec<EntryRef>,
+    },
+    /// Remove the AI summaries of these entries.
+    ClearDescriptions {
+        entries: Vec<EntryRef>,
+    },
+    /// Find tabs by meaning: vector search over titles, sites and AI summaries. `sessions`:
+    /// the sessions searched (`None`: all).
+    VectorSearch {
+        query: String,
+        sessions: Option<Vec<Id>>,
+        limit: u32,
+    },
+    /// Free the vector indexes of the sessions that aren't active from memory.
+    FreeSearchMemory,
     RemoveEntries {
         entries: Vec<EntryRef>,
         close_tabs: bool,
@@ -133,6 +204,17 @@ pub enum Command {
         snapshot: Id,
         mode: RestoreMode,
         open: bool,
+    },
+    /// A session's snapshots with their tabs (the state describes them without).
+    GetSnapshots {
+        session: Id,
+    },
+    /// Sessions (`None`: all) as a file to save (`Response::file`), with their snapshots if
+    /// `include_snapshots`.
+    ExportSessions {
+        sessions: Option<Vec<Id>>,
+        include_snapshots: bool,
+        filename: String,
     },
     DeleteSnapshot {
         session: Id,
@@ -223,6 +305,19 @@ pub struct Response {
     pub state: Option<AppState>,
     pub report: Option<CleanupReport>,
     pub capabilities: Option<Capabilities>,
+    /// The state revision saved when the command finished (replies other than GetState,
+    /// which carries the state itself): pages ask for what changed when it's newer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// Snapshots with their tabs ([`Command::GetSnapshots`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<Vec<crate::model::Snapshot>>,
+    /// A file to save: (name, contents) ([`Command::ExportSessions`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<(String, String)>,
+    /// Results of [`Command::VectorSearch`], best first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits: Option<Vec<crate::ai::VectorHit>>,
 }
 
 impl Response {

@@ -56,6 +56,11 @@ impl Default for MiniView {
 }
 
 impl MiniView {
+    /// Whether the search covers every session.
+    pub fn needs_all_sessions(&self) -> bool {
+        self.all_sessions
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         let p = theme::palette(ui);
         let (hits, error) = self.search.run(ui.ctx(), cx.state, &self.query, &SearchOptions::default(), None);
