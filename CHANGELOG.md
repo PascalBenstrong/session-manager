@@ -2,6 +2,14 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.15.1] - 2026-11-20
+
+### Changed
+- Snapshots are now kept in the browser's database too: each is saved once, and its tabs are only read when you restore it, open the Snapshots view of its session, or save it to a file. Your snapshots move there by themselves. Saving sessions to a file no longer needs every session loaded in the page.
+
+### Fixed
+- Tagging or grouping tabs got slower the more tabs you had saved, in every session: it now only looks at the tabs you changed.
+
 ## [0.15.0] - 2026-11-20
 
 ### New
