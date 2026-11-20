@@ -2,6 +2,21 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.15.0] - 2026-11-20
+
+### New
+- *↺ Restore* in the session header and the popup reopens the tabs that were open when the session's tabs were last closed (window closed or browser quit), unloaded or loaded. Tabs you closed yourself are left out. Restoring a session starts a new set, so older closed tabs don't come back with it.
+- AI summaries: add an AI provider in *Settings → AI & search* (OpenAI-compatible: OpenAI, Ollama, LM Studio, OpenRouter…; or Anthropic) and *✨ Summarise* selected tabs, or have pages summarised as they load. The summary is saved as the tab's description and shows on hover. Off by default: nothing is sent until you turn it on. Sites can be excluded, and how much page text is sent is limited.
+- Search by meaning: the *✨* button in the search bar finds tabs about what you type, over titles, sites and summaries. Uses the provider's embedding model if it has one, otherwise vectors computed on your computer. `desc:` searches summaries as text.
+- *Settings → Recording & storage*: switch off what you don't need — last used times, open / close / load times, the last open tabs, the pop-up and clean-up logs, and the database. Turning something off never deletes what was saved.
+
+### Changed
+- Your sessions are now kept in the browser's database (IndexedDB) instead of one storage entry: a change saves only the tabs that changed. Your sessions move there by themselves when you update (tab order included); switching *Save in the browser's database* off moves them back.
+- Much less memory and work with many tabs: the extension keeps only the active session and open tabs in memory, pages load only the sessions they show, and replies to actions no longer carry every tab. Other sessions' saved tabs are read when you view, search or change them.
+
+### Fixed
+- Closing the last tab of a window removed it from the session only as a window closing: it stayed as a saved tab and turned up in `closed:` searches. It's now removed like any closed tab.
+
 ## [0.14.0] - 2026-11-07
 
 ### New
