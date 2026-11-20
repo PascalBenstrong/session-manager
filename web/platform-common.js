@@ -423,6 +423,154 @@ export async function tabOutWithGroup(api, t, titles = new Map()) {
   return out;
 }
 
+// ---- IndexedDB ----
+// The extension's database (smPlatform.db* use the 'session-manager' one). Stores: meta
+// ('state': the state without tabs or snapshots, as JSON), tabs (key: entry id; { s:
+// session id, j: entry JSON }, indexed by session) and vectors (key: session id; its vector
+// index as JSON). The background writes; pages read (same extension origin).
+// tools/idb-conformance.js runs this against real browsers and the test fake.
+export const DB_VERSION = 1;
+
+const idbReq = (r) =>
+  new Promise((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+
+const idbDone = (tx) =>
+  new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('database write failed'));
+    tx.onabort = () => reject(tx.error || new Error('database write aborted'));
+  });
+
+/** The database `name`; `factory` gives the IndexedDB to use (read when first opened). */
+export function createDb(name, factory = () => globalThis.indexedDB) {
+  let opening = null;
+
+  /** Opened once (and again if it was closed or failed to open). */
+  function open() {
+    if (opening) return opening;
+    opening = new Promise((resolve, reject) => {
+      let req;
+      try {
+        const idb = factory();
+        if (!idb) throw new Error('IndexedDB is not available');
+        req = idb.open(name, DB_VERSION);
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
+        if (!db.objectStoreNames.contains('tabs')) db.createObjectStore('tabs').createIndex('session', 's');
+        if (!db.objectStoreNames.contains('vectors')) db.createObjectStore('vectors');
+      };
+      req.onsuccess = () => {
+        const db = req.result;
+        // Another version of the extension upgrades it: let go, open again next time.
+        db.onversionchange = () => {
+          db.close();
+          opening = null;
+        };
+        db.onclose = () => {
+          opening = null;
+        };
+        resolve(db);
+      };
+      req.onerror = () => reject(req.error || new Error('the database could not be opened'));
+      req.onblocked = () => reject(new Error('the database is in use by an older version of the extension'));
+    });
+    opening.catch(() => {
+      opening = null;
+    });
+    return opening;
+  }
+
+  return {
+    open,
+
+    /** The saved state and every tab: { header: string|null, tabs: [{ id, s, j }] }. */
+    async load() {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readonly');
+      const tabs = tx.objectStore('tabs');
+      const [header, keys, values] = await Promise.all([
+        idbReq(tx.objectStore('meta').get('state')),
+        idbReq(tabs.getAllKeys()),
+        idbReq(tabs.getAll()),
+      ]);
+      return { header: header ?? null, tabs: values.map((v, i) => ({ id: keys[i], s: v.s, j: v.j })) };
+    },
+
+    /**
+     * One transaction: puts tabs ([{ id, s, j }]), deletes tabs (ids) and sets the state.
+     * Nothing is written if any part fails.
+     */
+    async write(header, puts, dels) {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readwrite');
+      const done = idbDone(tx);
+      const store = tx.objectStore('tabs');
+      for (const p of puts) store.put({ s: p.s, j: p.j }, p.id);
+      for (const id of dels) store.delete(id);
+      tx.objectStore('meta').put(header, 'state');
+      await done;
+    },
+
+    /** Empties the state and tabs (after the state was saved in storage.local instead). */
+    async clear() {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readwrite');
+      const done = idbDone(tx);
+      tx.objectStore('meta').clear();
+      tx.objectStore('tabs').clear();
+      await done;
+    },
+
+    /**
+     * For pages: the saved state, and the tabs of the sessions whose `tabs_revision` isn't
+     * the one in `known` ({ sessionId: revision }), read in one transaction.
+     * Returns { header, sessions: [{ id, tabs: [json] }] } or null if nothing is saved.
+     */
+    async readState(known) {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readonly');
+      const header = await idbReq(tx.objectStore('meta').get('state'));
+      if (!header) return null;
+      const wanted = (JSON.parse(header).sessions || []).filter((s) => known[s.id] !== (s.tabs_revision || 0)).map((s) => s.id);
+      const index = tx.objectStore('tabs').index('session');
+      const lists = await Promise.all(wanted.map((id) => idbReq(index.getAll(id))));
+      return { header, sessions: wanted.map((id, i) => ({ id, tabs: lists[i].map((t) => t.j) })) };
+    },
+
+    async getVectors(session) {
+      const db = await open();
+      return (await idbReq(db.transaction('vectors', 'readonly').objectStore('vectors').get(session))) ?? null;
+    },
+
+    async putVectors(session, json) {
+      const db = await open();
+      const tx = db.transaction('vectors', 'readwrite');
+      const done = idbDone(tx);
+      tx.objectStore('vectors').put(json, session);
+      await done;
+    },
+
+    async deleteVectors(sessions) {
+      if (!sessions.length) return;
+      const db = await open();
+      const tx = db.transaction('vectors', 'readwrite');
+      const done = idbDone(tx);
+      for (const id of sessions) tx.objectStore('vectors').delete(id);
+      await done;
+    },
+  };
+}
+
+const smDb = createDb('session-manager');
+
 export function cookieOut(c) {
   return {
     name: c.name,
@@ -1155,6 +1303,64 @@ export function installPlatform(api, overrides = {}) {
       api.storage.onChanged.addListener((changes, area) => {
         if (area === 'local' && changes[key]) cb(changes[key].newValue ?? null);
       });
+    },
+
+    /** Several keys in one write (pages get them in one change event). */
+    async storageSetMany(items) {
+      if (Object.keys(items).length) await api.storage.local.set(items);
+    },
+
+    async storageRemove(keys) {
+      if (keys && keys.length) await api.storage.local.remove(keys);
+    },
+
+    // ---- database (IndexedDB; see createDb) ----
+    /** Throws if the database can't be opened (e.g. storage off for the profile). */
+    async dbOpen() {
+      await smDb.open();
+    },
+    dbLoad: () => smDb.load(),
+    dbWrite: (header, puts, dels) => smDb.write(header, puts, dels),
+    dbClear: () => smDb.clear(),
+    dbReadState: (known) => smDb.readState(known),
+    dbGetVectors: (session) => smDb.getVectors(session),
+    dbPutVectors: (session, json) => smDb.putVectors(session, json),
+    dbDeleteVectors: (sessions) => smDb.deleteVectors(sessions),
+
+    // ---- AI integrations ----
+    /** The title and visible text of a tab's page (top frame), at most maxChars. */
+    async pageText(tabId, maxChars) {
+      const [r] = await api.scripting.executeScript({
+        target: { tabId },
+        func: (max) => {
+          const body = document.body;
+          const text = body ? body.innerText || body.textContent || '' : '';
+          return { title: document.title || '', text: text.replace(/\s+\n/g, '\n').slice(0, max) };
+        },
+        args: [Math.max(0, maxChars | 0)],
+      });
+      if (!r || !r.result) throw new Error('the page could not be read');
+      return r.result;
+    },
+
+    /** An HTTP request (AI providers). Never throws: failures are { status: 0, body: message }. */
+    async httpRequest(req, timeoutMs) {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), timeoutMs || 60000);
+      try {
+        const r = await fetch(req.url, {
+          method: req.method || 'POST',
+          headers: req.headers || {},
+          body: req.body || undefined,
+          signal: ctl.signal,
+          credentials: 'omit',
+        });
+        return { status: r.status, body: await r.text() };
+      } catch (e) {
+        return { status: 0, body: ctl.signal.aborted ? 'timed out' : String((e && e.message) || e) };
+      } finally {
+        clearTimeout(timer);
+      }
     },
 
     // ---- alarms ----

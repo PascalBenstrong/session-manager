@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 import { createMockBrowser } from './mock-browser.js';
+import { createFakeIndexedDB } from './fake-indexeddb.js';
 
 const browserName = process.argv[2] || 'firefox';
 const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', browserName);
@@ -17,6 +18,9 @@ const {
 } = createMockBrowser();
 globalThis.browser = api;
 globalThis.chrome = api;
+// Checked against Edge and Firefox by tools/idb-real-test.mjs.
+const idb = createFakeIndexedDB();
+globalThis.indexedDB = idb;
 
 // ------------------------------------------------------------------ boot
 await import(pathToFileURL(join(dist, 'platform.js')).href);
@@ -37,7 +41,21 @@ const send = async (cmd) => {
   assert.ok(r.ok, `${cmd.cmd} failed: ${r.error}`);
   return r;
 };
-const stored = () => JSON.parse(storage.sm_state);
+/** The saved state: from the database (tabs put back in their sessions, in order), or from
+ * storage.local when the database is switched off. */
+const stored = () => {
+  if (storage.sm_state) return JSON.parse(storage.sm_state);
+  const db = idb._databases.get('session-manager');
+  const state = JSON.parse(db.stores.get('meta').records.get('state'));
+  const tabs = [...db.stores.get('tabs').records.values()];
+  for (const s of state.sessions) {
+    const pos = new Map((s.order || []).map((id, i) => [id, i]));
+    s.entries = tabs.filter((t) => t.s === s.id).map((t) => JSON.parse(t.j)).sort((a, b) => (pos.get(a.id) ?? 1e9) - (pos.get(b.id) ?? 1e9));
+  }
+  return state;
+};
+/** The tab records in the database: id -> { s, j }. */
+const dbTabs = () => idb._databases.get('session-manager').stores.get('tabs').records;
 /** Snapshots are saved apart from the state (sm_snapshots: session id -> snapshots). */
 const snapshotsOf = (sid) => JSON.parse(storage.sm_snapshots || '{}')[sid] || [];
 /** Frequent changes (playback, titles, many tabs at once) are saved within a second. */
@@ -1009,6 +1027,119 @@ await step('install/update sets the NEW badge; viewing release notes clears it',
   ev.installed.fire({ reason: 'chrome_update' });
   await tick();
   assert.equal(api.action.badge, '', 'browser updates do not flag release notes');
+});
+
+await step('saved in IndexedDB: only changed tabs are rewritten, pages are told, the off switch moves it back', async () => {
+  assert.ok(!storage.sm_state, 'nothing in storage.local');
+  const header = JSON.parse(idb._databases.get('session-manager').stores.get('meta').records.get('state'));
+  assert.ok(header.sessions.every((x) => !x.entries || x.entries.length === 0), 'the state record holds no tabs');
+  assert.equal(Number(storage.sm_changed), header.revision, 'pages are told the saved revision');
+  const before = new Map([...dbTabs()].map(([id, r]) => [id, r]));
+  const t = await api.tabs.create({ url: 'https://idb.example.com/' });
+  await tick();
+  const after = dbTabs();
+  const added = [...after.keys()].filter((id) => !before.has(id));
+  assert.equal(added.length, 1, 'one new record');
+  const rewritten = [...before.keys()].filter((id) => after.has(id) && after.get(id) !== before.get(id));
+  assert.deepEqual(rewritten, [], 'the other tabs were not rewritten');
+  const sid = after.get(added[0]).s;
+  const h = JSON.parse(idb._databases.get('session-manager').stores.get('meta').records.get('state'));
+  for (const x of h.sessions) assert.equal(x.tabs_revision === h.revision, x.id === sid, `session ${x.id} marked only if its tabs changed`);
+  // Off: everything in storage.local, the database emptied; on again: back, storage.local cleared.
+  const settings = (await send({ cmd: 'GetState' })).state.settings;
+  await send({ cmd: 'UpdateSettings', settings: { ...settings, tracking: { ...settings.tracking, database: false } } });
+  assert.ok(stored().sessions.some((x) => x.entries.some((e) => e.url === 'https://idb.example.com/')));
+  assert.equal(dbTabs().size, 0);
+  await send({ cmd: 'UpdateSettings', settings: { ...settings, tracking: { ...settings.tracking, database: true } } });
+  assert.ok(!storage.sm_state);
+  assert.ok(stored().sessions.some((x) => x.entries.some((e) => e.url === 'https://idb.example.com/')));
+  await api.tabs.remove(t.id);
+  await tick();
+  assert.ok(![...dbTabs().values()].some((r) => r.j.includes('idb.example.com')), 'a closed tab is deleted from the database');
+});
+
+await step('restore the tabs open when a session was last closed; tabs closed by hand stay out', async () => {
+  const r = await send({ cmd: 'CreateSession', name: 'Restorable', make_active: true });
+  const sid = r.state.sessions.find((s) => s.name === 'Restorable').id;
+  const win = 77;
+  const made = [];
+  for (const url of ['https://r1.example/', 'https://r2.example/', 'https://r3.example/']) {
+    made.push(await api.tabs.create({ url, windowId: win }));
+  }
+  await tick();
+  // r3 is closed by hand (removed); then the window closes with r1 and r2.
+  await api.tabs.remove(made[2].id);
+  await tick();
+  for (const t of made.slice(0, 2)) {
+    tabs.delete(t.id);
+    ev.removed.fire(t.id, { isWindowClosing: true, windowId: win });
+  }
+  await saved();
+  const session = stored().sessions.find((s) => s.id === sid);
+  assert.deepEqual(session.entries.map((e) => e.url).sort(), ['https://r1.example/', 'https://r2.example/']);
+  assert.ok(session.entries.every((e) => e.last_closed === session.last_closed && e.tab_id === null));
+  const back = await send({ cmd: 'RestoreLastClosed', session: sid, discarded: true });
+  assert.match(back.info, /Restored 2 tab/);
+  const after = stored().sessions.find((s) => s.id === sid);
+  assert.notEqual(after.last_closed, session.last_closed, 'a new generation');
+  assert.ok(after.entries.every((e) => e.tab_id !== null && e.last_closed === after.last_closed));
+  const again = await send({ cmd: 'RestoreLastClosed', session: sid, discarded: true });
+  assert.match(again.info, /No tabs to restore/);
+  await send({ cmd: 'SetActiveSession', id: stored().sessions[0].id });
+});
+
+await step('AI summaries (stubbed provider) and vector search by meaning, with search memory freed', async () => {
+  const realFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init });
+    const body = JSON.parse(init.body);
+    if (url.endsWith('/embeddings')) throw new Error('no embedding model expected');
+    assert.equal(init.headers.authorization, 'Bearer sk-test');
+    assert.match(body.messages[1].content, /Chocolate cake/);
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'A recipe for a rich chocolate cake.' } }] }), { status: 200 });
+  };
+  globalThis.document = { title: 'Baking', body: { innerText: 'Chocolate cake recipe: flour, eggs, cocoa.' } };
+  try {
+    const state = (await send({ cmd: 'GetState' })).state;
+    const sid = state.active_session;
+    // Off by default: nothing is sent.
+    const cake = await api.tabs.create({ url: 'https://bake.example/cake' });
+    await api.tabs.create({ url: 'https://code.example/rust-ownership' });
+    await tick();
+    const entry = stored().sessions.find((s) => s.id === sid).entries.find((e) => e.url === 'https://bake.example/cake');
+    const ref = { session: sid, entry: entry.id };
+    const off = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'Summarize', entries: [ref] })));
+    assert.ok(!off.ok && /AI is off/.test(off.error));
+    assert.equal(requests.length, 0);
+
+    const provider = { id: 1, name: 'Local', kind: 'OpenAiCompatible', base_url: 'http://localhost:11434/v1', api_key: 'sk-test', model: 'llama3.2' };
+    const ai = { ...state.settings.ai, enabled: true, providers: [provider], provider: 1 };
+    await send({ cmd: 'UpdateSettings', settings: { ...state.settings, ai } });
+    const r = await send({ cmd: 'Summarize', entries: [ref] });
+    assert.match(r.info, /Summarised 1/);
+    assert.equal(requests[0].url, 'http://localhost:11434/v1/chat/completions');
+    const described = stored().sessions.find((s) => s.id === sid).entries.find((e) => e.id === entry.id);
+    assert.equal(described.description, 'A recipe for a rich chocolate cake.');
+    assert.equal(described.description_url, 'https://bake.example/cake');
+
+    // Local vectors (no embedding model): the summary makes "dessert baking" find the cake.
+    const found = await send({ cmd: 'VectorSearch', query: 'chocolate dessert recipe', sessions: null, limit: 5 });
+    assert.equal(found.hits[0].entry.entry, entry.id);
+    assert.ok(idb._databases.get('session-manager').stores.get('vectors').records.get(sid), 'the index is saved per session');
+    const freed = await send({ cmd: 'FreeSearchMemory' });
+    assert.match(freed.info, /Freed the search data of \d+ inactive session/);
+    // Turned off: no search, the index stays.
+    await send({ cmd: 'UpdateSettings', settings: { ...state.settings, ai: { ...ai, vector_search: false } } });
+    const no = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'VectorSearch', query: 'cake', sessions: null, limit: 5 })));
+    assert.ok(!no.ok && /vector search is off/.test(no.error));
+    assert.ok(idb._databases.get('session-manager').stores.get('vectors').records.get(sid), 'the index stays');
+    await send({ cmd: 'UpdateSettings', settings: state.settings });
+    await api.tabs.remove(cake.id);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
 });
 
 await step('worker jobs: search on the state sent, imports, WebM errors', async () => {

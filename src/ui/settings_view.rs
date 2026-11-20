@@ -303,6 +303,44 @@ pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
             },
         );
 
+        section_card(
+            ui,
+            "Recording & storage",
+            "What is recorded as you browse, and how it's saved. Turning something off stops recording it; nothing already saved is deleted.",
+            |ui| {
+                let t = &mut s.tracking;
+                changed |= setting(
+                    ui,
+                    &mut t.last_closed,
+                    "Remember the last open tabs",
+                    "When a window closes or the browser quits, the tabs that were open can be restored in one click (↺ Restore). \
+                     Tabs you close yourself are left out.",
+                );
+                changed |= setting(
+                    ui,
+                    &mut t.last_used,
+                    "Record when tabs were last used",
+                    "Saved on every tab switch. Used by ⟲ Last tab, the \"Last used\" order and used: searches.",
+                );
+                changed |= setting(
+                    ui,
+                    &mut t.tab_times,
+                    "Record when tabs open, close, load and unload",
+                    "Used by the time orders and time searches (opened:, closed:, loaded:, unloaded:).",
+                );
+                changed |= setting(ui, &mut t.popup_log, "Log tabs opened by pages", "The list in Page guards that offers one-click rules.");
+                changed |= setting(ui, &mut t.cleanup_log, "Log clean-ups", "The recent clean-ups list in Cookies & data.");
+                changed |= setting(
+                    ui,
+                    &mut t.database,
+                    "Save in the browser's database (IndexedDB)",
+                    "A change writes only the tabs that changed. Off: everything is saved together in one place, as before                      (your tabs move there; nothing is lost).",
+                );
+            },
+        );
+
+        ai_card(ui, cx, acts, &mut s, &mut changed);
+
         let sessions = cx.state.sessions.len();
         let tabs: usize = cx.state.sessions.iter().map(|s| s.entries.len()).sum();
         section_card(ui, "About", "", |ui| {
@@ -456,4 +494,194 @@ fn code(ui: &mut egui::Ui, text: &str) {
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+/// A one-line text field whose text is kept while it's edited (the settings are copied
+/// from the state every frame). Returns the text when editing ends with a change.
+fn draft_line(ui: &mut egui::Ui, id: &str, current: &str, hint: &str, width: f32) -> Option<String> {
+    let key = egui::Id::unique(("settings-draft", id));
+    let mut text: String = ui.data_mut(|d| d.get_temp::<String>(key)).unwrap_or_else(|| current.to_string());
+    let r = ui.add(egui::TextEdit::singleline(&mut text).hint_text(hint).desired_width(width));
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(key, text.clone()));
+        return None;
+    }
+    ui.data_mut(|d| d.remove::<String>(key));
+    (r.lost_focus() && text != current).then_some(text)
+}
+
+/// Settings of the AI integrations: providers, summaries and vector search.
+fn ai_card(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions, s: &mut crate::model::Settings, changed: &mut bool) {
+    use crate::ai::{AiProvider, ProviderKind};
+    let p = theme::palette(ui);
+    section_card(
+        ui,
+        "AI & search",
+        "Summaries of your tabs' pages by a language model you choose, saved as each tab's description, and search by meaning.",
+        |ui| {
+            let ai = &mut s.ai;
+            *changed |= setting(
+                ui,
+                &mut ai.enabled,
+                "Use an AI provider",
+                "Off: nothing is ever sent. On: the text of the pages you summarise is sent to the provider below.",
+            );
+            ui.add_enabled_ui(ai.enabled, |ui| {
+                let draft_key = egui::Id::unique("ai-provider-draft");
+                let mut draft: Option<AiProvider> = ui.data_mut(|d| d.get_temp(draft_key));
+                let selected = ai.active_provider().map(|x| x.id);
+                let mut remove = None;
+                for prov in &ai.providers {
+                    ui.horizontal(|ui| {
+                        if ui.radio(selected == Some(prov.id), "").on_hover_text("Use this provider").clicked() && selected != Some(prov.id) {
+                            ai.provider = prov.id;
+                            *changed = true;
+                        }
+                        ui.label(RichText::new(&prov.name).strong());
+                        let model = if prov.model.is_empty() { "no model" } else { &prov.model };
+                        ui.label(RichText::new(format!("{} · {model}", prov.kind.label())).small().color(p.muted));
+                        if ui.small_button("✏").on_hover_text("Edit").clicked() {
+                            draft = Some(prov.clone());
+                        }
+                        if ui.small_button("🗑").on_hover_text("Remove (summaries already written stay)").clicked() {
+                            remove = Some(prov.id);
+                        }
+                    });
+                }
+                if let Some(id) = remove {
+                    ai.providers.retain(|x| x.id != id);
+                    *changed = true;
+                }
+                if ai.providers.is_empty() {
+                    note(
+                        ui,
+                        "No provider yet. OpenAI-compatible covers OpenAI, Ollama (http://localhost:11434/v1), LM Studio, OpenRouter and others.",
+                    );
+                }
+                if draft.is_none() && ui.button("＋ Add a provider").clicked() {
+                    let kind = ProviderKind::OpenAiCompatible;
+                    draft = Some(AiProvider { name: "My provider".into(), kind, base_url: kind.default_base_url().into(), ..Default::default() });
+                }
+                let mut close = false;
+                if let Some(d) = &mut draft {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        egui::Grid::new("ai-provider-form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut d.name);
+                            ui.end_row();
+                            ui.label("Kind");
+                            egui::ComboBox::from_id_salt("ai-kind").selected_text(d.kind.label()).show_ui(ui, |ui| {
+                                for k in ProviderKind::ALL {
+                                    if ui.selectable_label(d.kind == k, k.label()).clicked() && d.kind != k {
+                                        d.kind = k;
+                                        d.base_url = k.default_base_url().into();
+                                        if d.model.is_empty() {
+                                            d.model = k.default_model().into();
+                                        }
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Base URL");
+                            ui.add(egui::TextEdit::singleline(&mut d.base_url).desired_width(320.0));
+                            ui.end_row();
+                            ui.label("API key");
+                            ui.add(egui::TextEdit::singleline(&mut d.api_key).password(true).hint_text("empty for local servers").desired_width(320.0));
+                            ui.end_row();
+                            ui.label("Model");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.model)
+                                    .hint_text("e.g. llama3.2, gpt-4o-mini, claude-opus-5-5")
+                                    .desired_width(320.0),
+                            );
+                            ui.end_row();
+                            ui.label("Embedding model");
+                            ui.add_enabled_ui(d.kind == ProviderKind::OpenAiCompatible, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.embedding_model)
+                                        .hint_text("optional, e.g. nomic-embed-text; empty: local vectors")
+                                        .desired_width(320.0),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label("Instructions");
+                            ui.add(egui::TextEdit::multiline(&mut d.prompt).hint_text(crate::ai::DEFAULT_PROMPT).desired_rows(2).desired_width(320.0));
+                            ui.end_row();
+                        });
+                        ui.label(RichText::new("The API key is kept in the extension's local storage on this computer.").small().color(p.muted));
+                        ui.horizontal(|ui| {
+                            if ui.add(super::widgets::primary_button(ui, "Save provider")).clicked() {
+                                let mut d = d.clone();
+                                if d.id == 0 {
+                                    d.id = ai.providers.iter().map(|x| x.id).max().unwrap_or(0) + 1;
+                                    if ai.providers.is_empty() {
+                                        ai.provider = d.id;
+                                    }
+                                    ai.providers.push(d);
+                                } else if let Some(x) = ai.providers.iter_mut().find(|x| x.id == d.id) {
+                                    *x = d;
+                                }
+                                *changed = true;
+                                close = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                }
+                if close {
+                    draft = None;
+                }
+                ui.data_mut(|data| match draft {
+                    Some(d) => {
+                        data.insert_temp(draft_key, d);
+                    }
+                    None => data.remove::<AiProvider>(draft_key),
+                });
+
+                ui.add_space(6.0);
+                *changed |= setting(
+                    ui,
+                    &mut ai.auto_summarize,
+                    "Summarise pages automatically",
+                    "A few seconds after a tab opens a page, its text is sent for a summary. Off: only when you ask \
+                     (selected tabs → ✨ Summarise).",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Never send pages of");
+                    if let Some(text) = draft_line(ui, "ai-exclude", &ai.exclude_sites.join(", "), "bank.com, mail.example.org", 300.0) {
+                        ai.exclude_sites = text.split([',', ' ', '\n']).map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect();
+                        *changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Send at most");
+                    *changed |= ui.add(egui::DragValue::new(&mut ai.max_input_chars).range(500..=200_000).speed(100)).changed();
+                    ui.label(RichText::new("characters of each page").color(p.muted));
+                });
+            });
+            ui.separator();
+            *changed |= setting(
+                ui,
+                &mut ai.vector_search,
+                "Search by meaning (vector search)",
+                "Keeps a vector index of tab titles, sites and summaries, saved per session. Uses the provider's embedding model if it has \
+                 one, otherwise vectors computed here (nothing sent). Off: the index is kept but not used or updated.",
+            );
+            ui.add_enabled_ui(ai.vector_search, |ui| {
+                *changed |= setting(
+                    ui,
+                    &mut ai.unload_inactive,
+                    "Free other sessions' search data after searching",
+                    "After a search across sessions, the indexes of the inactive sessions leave memory (they're read again when needed).",
+                );
+                if ui.button("Free search memory now").on_hover_text("Unload the vector indexes of the inactive sessions").clicked() {
+                    acts.send(Command::FreeSearchMemory);
+                }
+            });
+            let described = cx.state.sessions.iter().flat_map(|x| &x.entries).filter(|e| !e.description.is_empty()).count();
+            ui.label(RichText::new(format!("{described} tab(s) have a summary.")).small().color(p.muted));
+        },
+    );
 }

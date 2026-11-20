@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
 
+use crate::ai::{self, VectorHit, VectorIndex};
 use crate::cleanup::{self, ALARM_PREFIX, CleanupReport, CleanupSpec, CleanupTarget, Cookie, SpecMatcher};
 use crate::dedupe::Scope;
 use crate::guards::{self, BlockRule, GuardSettings, PopupEvent};
@@ -16,8 +17,9 @@ use crate::hibernate::{self, HibernateTarget};
 use crate::media::MediaReport;
 use crate::model::{AppState, BrowserTab, EntryRef, Id, Snapshot, TabId};
 use crate::organize::{self, OrganizeKey};
+use crate::persist::{self, Source};
 use crate::platform::{self as pf, CreateTab};
-use crate::protocol::{Capabilities, Command, Response, SNAPSHOTS_KEY, STATE_KEY};
+use crate::protocol::{CHANGED_KEY, Capabilities, Command, Response, SNAPSHOTS_KEY, SPLIT_VERSION, STATE_KEY, session_key};
 use crate::state::{RestoreMode, trackable};
 use crate::tab_strip;
 
@@ -66,6 +68,36 @@ thread_local! {
     /// rules and open tab URLs they were built from (see [`on_cookie_set`]).
     static COOKIE_MATCHERS: RefCell<(Vec<CleanupSpec>, Vec<String>, Vec<SpecMatcher>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
     static GUARDS_SYNCED: RefCell<Option<GuardsWanted>> = const { RefCell::new(None) };
+    /// The extension's database (IndexedDB) could be opened.
+    static DB_OK: Cell<bool> = const { Cell::new(false) };
+    /// The tabs as saved in the database: id -> (session, hash of its JSON).
+    static TABS_SAVED: RefCell<persist::Saved> = RefCell::new(Default::default());
+    /// The database holds a state (to empty once the state is saved in storage.local).
+    static DB_HAS_DATA: Cell<bool> = const { Cell::new(false) };
+    /// storage.local keys of the state from before the database (or from while it was
+    /// off), removed once the state is saved in the database.
+    static LEGACY_KEYS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// The sessions saved last time (their search indexes go when they're deleted).
+    static SESSIONS_SEEN: RefCell<std::collections::HashSet<Id>> = RefCell::new(Default::default());
+    /// The vector indexes read so far, by session (see [`ensure_index`]).
+    static VECTORS: RefCell<std::collections::HashMap<Id, VectorIndex>> = RefCell::new(Default::default());
+    /// Entries waiting for an automatic summary, and whether the worker runs.
+    static AI_QUEUE: RefCell<std::collections::VecDeque<EntryRef>> = RefCell::new(Default::default());
+    static AI_RUNNING: Cell<bool> = const { Cell::new(false) };
+    /// Debounce generation of each tab's automatic summary.
+    static AI_PENDING: RefCell<std::collections::HashMap<TabId, u32>> = RefCell::new(Default::default());
+}
+
+/// How long after a navigation a page is read for its automatic summary.
+const AUTO_SUMMARY_DELAY_MS: u32 = 5000;
+/// How long a provider gets to answer.
+const AI_TIMEOUT_MS: u32 = 90_000;
+/// Texts embedded per provider request.
+const EMBED_BATCH: usize = 64;
+
+/// Where a development build kept a session's vector index (migrated to the database).
+fn vectors_key(session: Id) -> String {
+    format!("{}{session}", ai::VECTORS_PREFIX)
 }
 
 /// How long after opening a tab a rule can still close it (it may load its page late).
@@ -142,17 +174,7 @@ pub async fn start() -> Result<(), JsValue> {
     CAPS.with(|c| *c.borrow_mut() = pf::capabilities());
     refresh_permissions().await;
 
-    let mut state = match pf::storage_get(STATE_KEY).await {
-        Ok(Some(json)) => serde_json::from_str::<AppState>(&json).unwrap_or_else(|e| {
-            log(&format!("stored state unreadable, starting fresh: {e}"));
-            AppState::default()
-        }),
-        Ok(None) => AppState::default(),
-        Err(e) => {
-            log(&format!("could not read storage: {e}"));
-            AppState::default()
-        }
-    };
+    let mut state = load_state().await;
     // Snapshots are kept apart (older versions kept them in the state: those stay).
     if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
         match serde_json::from_str::<std::collections::BTreeMap<Id, Vec<Snapshot>>>(&json) {
@@ -169,6 +191,7 @@ pub async fn start() -> Result<(), JsValue> {
         Ok(tabs) => state.reconcile(&tabs, pf::now()),
         Err(e) => log(&format!("could not query tabs: {e}")),
     }
+    SESSIONS_SEEN.with(|seen| *seen.borrow_mut() = state.sessions.iter().map(|x| x.id).collect());
     with_state(|s| *s = state);
     persist().await;
     sync_alarms().await;
@@ -229,16 +252,19 @@ async fn check_opened_tab(tab: &BrowserTab, now: f64) -> bool {
         return false; // about:blank first; wait for the real page
     }
     OPENED.with(|o| o.borrow_mut().remove(&tab.id));
+    // Nothing to log and no rule for it: no need to look at the page that opened it.
+    let (log_it, rule) = with_state(|s| (s.settings.tracking.popup_log, guards::popup_rule_for(&s.block_rules, &tab.url)));
+    if !log_it && rule.is_none() {
+        return false;
+    }
     let opener_url = pf::get_tab(Some(opener)).await.map(|t| t.url).unwrap_or_default();
     if !matches!(crate::url::scheme(&opener_url).as_str(), "http" | "https") {
         return false;
     }
-    let rule = with_state(|s| {
-        let rule = guards::popup_rule_for(&s.block_rules, &tab.url);
-        s.push_popup(PopupEvent { at: now, opener: opener_url, url: tab.url.clone(), closed_by: rule });
-        rule
-    });
-    persist_soon();
+    if log_it {
+        with_state(|s| s.push_popup(PopupEvent { at: now, opener: opener_url, url: tab.url.clone(), closed_by: rule }));
+        persist_soon();
+    }
     if rule.is_none() {
         return false;
     }
@@ -258,11 +284,104 @@ async fn refresh_permissions() {
     }
 }
 
+/// Reads the saved state: from the database, or from storage.local (versions up to 0.14,
+/// a development build's per-session keys, or the database switched off), whichever is
+/// newer. What came from storage.local moves to the database on the first save.
+async fn load_state() -> AppState {
+    let db_ok = match pf::db_open().await {
+        Ok(()) => true,
+        Err(e) => {
+            log(&format!("the database can't be opened, saving in storage.local instead: {e}"));
+            false
+        }
+    };
+    DB_OK.with(|d| d.set(db_ok));
+
+    let mut legacy = match pf::storage_get(STATE_KEY).await {
+        Ok(Some(json)) => match serde_json::from_str::<AppState>(&json) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log(&format!("the state in storage.local is unreadable: {e}"));
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            log(&format!("could not read storage.local: {e}"));
+            None
+        }
+    };
+    if let Some(l) = &mut legacy
+        && l.version >= SPLIT_VERSION
+    {
+        let mut files = std::collections::HashMap::new();
+        for x in &l.sessions {
+            if let Ok(Some(json)) = pf::storage_get(&session_key(x.id)).await {
+                files.insert(x.id, json);
+            }
+        }
+        persist::legacy_with_session_files(l, |id| files.get(&id).cloned());
+    }
+
+    let db = if db_ok {
+        match pf::db_load().await {
+            Ok(d) => match d.header.as_deref().map(|h| persist::assemble(h, &d.tabs)) {
+                Some(Ok(x)) => Some(x),
+                Some(Err(e)) => {
+                    log(&e);
+                    None
+                }
+                None => None,
+            },
+            Err(e) => {
+                log(&format!("could not read the database: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let source = persist::newest(db.as_ref().map(|d| &d.0), legacy.as_ref());
+    // The database's tabs as they are: the first save writes only the difference (and
+    // deletes what's left over from before a switch to storage.local).
+    let (db_state, saved) = match db {
+        Some((s, saved)) => (Some(s), saved),
+        None => (None, persist::Saved::new()),
+    };
+    DB_HAS_DATA.with(|d| d.set(db_state.is_some()));
+    TABS_SAVED.with(|t| *t.borrow_mut() = saved);
+
+    if let Some(l) = &legacy {
+        let mut keys = vec![STATE_KEY.to_string()];
+        for x in &l.sessions {
+            keys.push(session_key(x.id));
+            keys.push(vectors_key(x.id));
+            // A development build's search indexes move to the database.
+            if db_ok
+                && let Ok(Some(json)) = pf::storage_get(&vectors_key(x.id)).await
+                && let Err(e) = pf::db_put_vectors(x.id, &json).await
+            {
+                log(&format!("could not move a search index to the database: {e}"));
+            }
+        }
+        LEGACY_KEYS.with(|k| *k.borrow_mut() = keys);
+    }
+    match source {
+        Source::Database => db_state.unwrap_or_default(),
+        Source::Legacy => legacy.unwrap_or_default(),
+        Source::Nothing => AppState::default(),
+    }
+}
+
 async fn persist() {
     // What a pending delayed save would write is written now.
     PERSIST_PENDING.with(|p| p.set(false));
     PERSIST_SOON.with(|p| p.set(false));
-    let json = STATE.with(|s| {
+    let use_db = DB_OK.with(Cell::get) && with_state(|s| s.settings.tracking.database);
+    // Planned without awaiting, and written first: the database runs transactions in the
+    // order they're made, so saves can't land out of order.
+    let (next, write, snapshots, gone) = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let next = REVISION.with(|r| {
             let n = r.get().max(s.revision) + 1;
@@ -270,27 +389,109 @@ async fn persist() {
             n
         });
         s.revision = next;
+        s.version = 1;
         // Snapshots are saved apart, and only when they changed.
         let snapshots = (!snapshots_saved(&s)).then(|| {
             let all: std::collections::BTreeMap<Id, &Vec<Snapshot>> = s.sessions.iter().map(|x| (x.id, &x.snapshots)).collect();
             (serde_json::to_string(&all), snapshots_fingerprint(&s))
         });
-        (without_snapshots(&mut s, |s| serde_json::to_string(s)), snapshots)
+        let write = if use_db {
+            let plan = TABS_SAVED.with(|t| persist::plan(&mut s, &t.borrow(), next));
+            persist::header_json(&mut s).map(|header| Ok((header, plan)))
+        } else {
+            without_snapshots(&mut s, serde_json::to_string).map(Err)
+        };
+        let now: std::collections::HashSet<Id> = s.sessions.iter().map(|x| x.id).collect();
+        let gone: Vec<Id> = SESSIONS_SEEN.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            let gone = seen.difference(&now).copied().collect();
+            *seen = now;
+            gone
+        });
+        (next, write, snapshots, gone)
     });
-    let (json, snapshots) = json;
+    match write {
+        Err(e) => log(&format!("could not serialize state: {e}")),
+        Ok(Ok((header, plan))) => match pf::db_write(&header, &plan.puts, &plan.dels).await {
+            Ok(()) => {
+                TABS_SAVED.with(|t| *t.borrow_mut() = plan.saved);
+                DB_HAS_DATA.with(|d| d.set(true));
+                // Pages read the new state from the database.
+                if let Err(e) = pf::storage_set(CHANGED_KEY, &next.to_string()).await {
+                    log(&format!("could not tell pages about the save: {e}"));
+                }
+                let stale = LEGACY_KEYS.with(|k| std::mem::take(&mut *k.borrow_mut()));
+                if let Err(e) = pf::storage_remove(&stale).await {
+                    log(&format!("could not remove the old state from storage.local: {e}"));
+                    LEGACY_KEYS.with(|k| *k.borrow_mut() = stale);
+                }
+            }
+            Err(e) => {
+                // Nothing is lost: the whole state goes to storage.local, which wins at
+                // the next start if it's newer.
+                log(&format!("could not save to the database, saving in storage.local: {e}"));
+                save_in_storage_local().await;
+            }
+        },
+        Ok(Err(json)) => {
+            if let Err(e) = pf::storage_set(STATE_KEY, &json).await {
+                log(&format!("could not save state: {e}"));
+            } else {
+                after_storage_local_save().await;
+            }
+        }
+    }
     if let Some((Ok(all), fingerprint)) = snapshots {
         match pf::storage_set(SNAPSHOTS_KEY, &all).await {
             Ok(()) => SNAPSHOTS_SAVED.with(|f| *f.borrow_mut() = Some(fingerprint)),
             Err(e) => log(&format!("could not save snapshots: {e}")),
         }
     }
-    match json {
-        Ok(json) => {
-            if let Err(e) = pf::storage_set(STATE_KEY, &json).await {
-                log(&format!("could not save state: {e}"));
-            }
+    // Deleted sessions' search indexes go too.
+    if !gone.is_empty() {
+        VECTORS.with(|v| gone.iter().for_each(|id| drop(v.borrow_mut().remove(id))));
+        if DB_OK.with(Cell::get)
+            && let Err(e) = pf::db_delete_vectors(&gone).await
+        {
+            log(&format!("could not delete search indexes: {e}"));
         }
+    }
+}
+
+/// Saves the whole state in storage.local (the database is off, or failed).
+async fn save_in_storage_local() {
+    let json = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.version = 1;
+        without_snapshots(&mut s, serde_json::to_string)
+    });
+    match json {
+        Ok(json) => match pf::storage_set(STATE_KEY, &json).await {
+            Ok(()) => after_storage_local_save().await,
+            Err(e) => log(&format!("could not save state: {e}")),
+        },
         Err(e) => log(&format!("could not serialize state: {e}")),
+    }
+}
+
+/// The state is in storage.local now: it moves to the database on its next save there, and
+/// with the database switched off, the database is emptied (it would be out of date).
+async fn after_storage_local_save() {
+    LEGACY_KEYS.with(|k| {
+        let mut k = k.borrow_mut();
+        if !k.iter().any(|x| x == STATE_KEY) {
+            k.push(STATE_KEY.to_string());
+        }
+    });
+    let switched_off = !with_state(|s| s.settings.tracking.database);
+    if switched_off && DB_OK.with(Cell::get) && DB_HAS_DATA.with(Cell::get) {
+        match pf::db_clear().await {
+            Ok(()) => {
+                DB_HAS_DATA.with(|d| d.set(false));
+                TABS_SAVED.with(|t| t.borrow_mut().clear());
+            }
+            Err(e) => log(&format!("could not empty the database: {e}")),
+        }
     }
 }
 
@@ -426,6 +627,7 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
                 }
                 if url_changed {
                     schedule_auto_organize();
+                    schedule_auto_summary(tab.id);
                 }
                 schedule_strip_sync();
             }
@@ -748,6 +950,45 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             }
             ok(info)
         }
+        Command::RestoreLastClosed { session, discarded } => {
+            let ids: Vec<Id> = with_state(|s| s.last_closed_refs(session).into_iter().map(|r| r.entry).collect());
+            if ids.is_empty() {
+                return ok("No tabs to restore: none were open when this session's tabs were last closed");
+            }
+            let (opened, errors) = open_entries(session, Some(&ids), discarded, false).await?;
+            if opened > 0 {
+                with_state(|s| s.renew_last_closed(session));
+                persist().await;
+            }
+            let mut info = format!("Restored {opened} tab(s) {}", if discarded { "unloaded" } else { "loaded" });
+            if !errors.is_empty() {
+                info.push_str(&format!("; {} failed (e.g. {})", errors.len(), errors[0]));
+            }
+            ok(info)
+        }
+        Command::Summarize { entries } => summarize(&entries).await,
+        Command::ClearDescriptions { entries } => {
+            let n = with_state(|s| {
+                let mut n = 0;
+                for r in &entries {
+                    if let Some(e) = s.entry_mut(*r)
+                        && !e.description.is_empty()
+                    {
+                        e.description.clear();
+                        e.description_url.clear();
+                        n += 1;
+                    }
+                }
+                n
+            });
+            persist().await;
+            ok(format!("Removed {n} summary(ies)"))
+        }
+        Command::VectorSearch { query, sessions, limit } => vector_search(&query, sessions, limit as usize).await,
+        Command::FreeSearchMemory => {
+            let freed = free_inactive_vectors();
+            ok(format!("Freed the search data of {freed} inactive session(s)"))
+        }
         Command::FocusLastTab { session } => {
             let last = with_state(|s| s.session(session).and_then(|s| s.last_accessed()).map(|e| (e.id, e.title.clone())));
             let Some((entry, title)) = last else { return Err("session has no tabs".into()) };
@@ -1021,6 +1262,10 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             };
             if open && !added.is_empty() {
                 let (opened, _) = open_entries(target, Some(&added), true, false).await?;
+                if opened > 0 {
+                    with_state(|s| s.renew_last_closed(target));
+                    persist().await;
+                }
                 info.push_str(&format!("; opened {opened} unloaded"));
             }
             ok(info)
@@ -1128,6 +1373,11 @@ async fn load_session(id: Id, discarded: bool, new_window: bool) -> Result<Respo
     // De-duplicate first, so only one copy of each page gets opened.
     let deduped = if with_state(|s| s.settings.dedupe_on_session_load) { remove_duplicates_in(&[id], None).await? } else { 0 };
     let (opened, errors) = open_entries(id, None, discarded, new_window).await?;
+    if opened > 0 {
+        // A restored session starts a new generation of open tabs.
+        with_state(|s| s.renew_last_closed(id));
+        persist().await;
+    }
     let removed = if deduped > 0 { format!("; removed {deduped} duplicate(s)") } else { String::new() };
     if opened == 0 && errors.is_empty() {
         return ok(format!("All tabs of this session are already open{removed}"));
@@ -1193,11 +1443,12 @@ async fn open_entry(r: EntryRef, discarded: bool) -> Result<(), String> {
             Err(err) => {
                 log(&format!("tab {tab_id} could not be focused ({err}); reopening"));
                 with_state(|s| {
+                    let time = s.settings.tracking.tab_times.then(pf::now);
                     if let Some(e) = s.entry_mut(r) {
                         let was_loaded = e.is_loaded();
                         e.tab_id = None;
                         e.window_id = None;
-                        e.stamp(true, was_loaded, pf::now());
+                        e.stamp(true, was_loaded, time);
                     }
                 });
                 false
@@ -1215,7 +1466,10 @@ async fn open_entry(r: EntryRef, discarded: bool) -> Result<(), String> {
         }
     }
     with_state(|s| {
-        if let Some(e) = s.entry_mut(r) {
+        let record = s.settings.tracking.last_used;
+        if let Some(e) = s.entry_mut(r)
+            && record
+        {
             e.last_accessed = pf::now();
         }
     });
@@ -1639,4 +1893,236 @@ async fn sync_alarms() {
             log(&format!("could not create alarm {name}: {e}"));
         }
     }
+}
+
+// ---------------------------------------------------------------- AI summaries
+
+/// Writes the AI summary of an entry's page. Returns false if it had a current summary
+/// already (and `force` is off).
+async fn summarize_entry(r: EntryRef, force: bool) -> Result<bool, String> {
+    let (provider, max_chars, exclude) = with_state(|s| {
+        let ai = &s.settings.ai;
+        (ai.active_provider().cloned(), ai.max_input_chars.clamp(500, 200_000) as usize, ai.exclude_sites.clone())
+    });
+    let provider = provider.ok_or("AI is off, or no provider is set up (Settings → AI)")?;
+    let e = with_state(|s| s.entry(r).cloned()).ok_or("tab no longer exists")?;
+    if !force && !e.description.is_empty() && e.description_url == e.url {
+        return Ok(false);
+    }
+    let tab = e.tab_id.ok_or("only open tabs can be summarised")?;
+    if e.discarded {
+        return Err("hibernated tabs can't be read; wake the tab first".into());
+    }
+    if !matches!(crate::url::scheme(&e.url).as_str(), "http" | "https" | "file") {
+        return Err("only web pages can be summarised".into());
+    }
+    if guards::storage_blocked(&exclude, &e.host()) {
+        return Err(format!("{} is excluded from AI summaries", e.host()));
+    }
+    let page = pf::page_text(tab, max_chars).await?;
+    let title = if page.title.trim().is_empty() { e.title.clone() } else { page.title };
+    let req = ai::summary_request(&provider, &title, &e.url, &page.text, max_chars)?;
+    let resp = pf::http_request(&req, AI_TIMEOUT_MS).await;
+    let summary = ai::parse_summary(provider.kind, &resp).map_err(|err| format!("{}: {err}", provider.name))?;
+    with_state(|s| {
+        // The tab may have navigated meanwhile: the summary is for the page that was read.
+        if let Some(cur) = s.entry_mut(r)
+            && cur.url == e.url
+        {
+            cur.description = summary;
+            cur.description_url = e.url.clone();
+        }
+    });
+    Ok(true)
+}
+
+async fn summarize(entries: &[EntryRef]) -> Result<Response, String> {
+    if with_state(|s| s.settings.ai.active_provider().is_none()) {
+        return Err("AI is off, or no provider is set up (Settings → AI)".into());
+    }
+    let (mut done, mut errors) = (0, Vec::new());
+    for r in entries {
+        match summarize_entry(*r, true).await {
+            Ok(_) => done += 1,
+            Err(e) => errors.push(e),
+        }
+    }
+    if done > 0 {
+        persist().await;
+    }
+    if done == 0 && !errors.is_empty() {
+        return Err(errors.swap_remove(0));
+    }
+    let mut info = format!("Summarised {done} tab(s)");
+    if !errors.is_empty() {
+        info.push_str(&format!("; {} failed (e.g. {})", errors.len(), errors[0]));
+    }
+    ok(info)
+}
+
+/// Summarises a tab's page shortly after it navigated (automatic summaries).
+fn schedule_auto_summary(tab: TabId) {
+    let wanted = with_state(|s| s.settings.ai.auto_summarize && s.settings.ai.active_provider().is_some());
+    if !wanted {
+        return;
+    }
+    let generation = AI_PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let g = p.get(&tab).map_or(0, |g| g.wrapping_add(1));
+        p.insert(tab, g);
+        g
+    });
+    spawn_local(async move {
+        pf::sleep(AUTO_SUMMARY_DELAY_MS).await;
+        let current = AI_PENDING.with(|p| {
+            let mut p = p.borrow_mut();
+            let current = p.get(&tab) == Some(&generation);
+            if current {
+                p.remove(&tab);
+            }
+            current
+        });
+        if !current {
+            return; // navigated again meanwhile
+        }
+        let Some(r) = with_state(|s| s.locate_tab(tab)) else { return };
+        AI_QUEUE.with(|q| {
+            let mut q = q.borrow_mut();
+            if !q.contains(&r) {
+                q.push_back(r);
+            }
+        });
+        run_summary_queue().await;
+    });
+}
+
+/// Works through the automatic summaries one at a time.
+async fn run_summary_queue() {
+    if AI_RUNNING.with(|r| r.replace(true)) {
+        return;
+    }
+    while let Some(r) = AI_QUEUE.with(|q| q.borrow_mut().pop_front()) {
+        if !with_state(|s| s.settings.ai.auto_summarize && s.settings.ai.active_provider().is_some()) {
+            AI_QUEUE.with(|q| q.borrow_mut().clear());
+            break;
+        }
+        match summarize_entry(r, false).await {
+            Ok(true) => schedule_persist(),
+            Ok(false) => {}
+            Err(e) => log(&format!("automatic summary skipped: {e}")),
+        }
+    }
+    AI_RUNNING.with(|r| r.set(false));
+}
+
+// ---------------------------------------------------------------- vector search
+
+/// Embeds texts with the provider (when the index uses its embeddings) or locally.
+async fn embed(model: &str, provider: Option<&ai::AiProvider>, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if model == ai::LOCAL_MODEL {
+        return Ok(texts.iter().map(|t| ai::local_embed(t)).collect());
+    }
+    let p = provider.ok_or("the AI provider of this index is gone")?;
+    let mut out = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(EMBED_BATCH) {
+        let req = ai::embedding_request(p, chunk).ok_or("the AI provider has no embedding model")?;
+        let resp = pf::http_request(&req, AI_TIMEOUT_MS).await;
+        out.extend(ai::parse_embeddings(&resp, chunk.len()).map_err(|e| format!("{}: {e}", p.name))?);
+    }
+    Ok(out)
+}
+
+/// Loads a session's vector index (memory, then storage) and brings it up to date with its
+/// tabs, saving it if it changed.
+async fn ensure_index(session: Id, model: &str, provider: Option<&ai::AiProvider>) -> Result<(), String> {
+    if !VECTORS.with(|v| v.borrow().contains_key(&session)) {
+        let stored = if DB_OK.with(Cell::get) { pf::db_get_vectors(session).await.ok().flatten() } else { None };
+        let stored = stored.and_then(|json| serde_json::from_str::<VectorIndex>(&json).ok());
+        let idx = stored.filter(|i| i.model == model).unwrap_or_else(|| VectorIndex::new(model));
+        VECTORS.with(|v| v.borrow_mut().insert(session, idx));
+    }
+    let (stale, removed) = VECTORS.with(|v| {
+        let mut v = v.borrow_mut();
+        let idx = v.get_mut(&session).expect("inserted");
+        if idx.model != model {
+            *idx = VectorIndex::new(model);
+        }
+        STATE.with(|st| {
+            let st = st.borrow();
+            let entries = st.session(session).map_or(&[][..], |s| s.entries.as_slice());
+            let removed = idx.retain_entries(entries);
+            let stale: Vec<(Id, String)> = idx.stale(entries).into_iter().map(|(e, text)| (e.id, text)).collect();
+            (stale, removed)
+        })
+    });
+    if stale.is_empty() && !removed {
+        return Ok(());
+    }
+    let texts: Vec<String> = stale.iter().map(|(_, t)| t.clone()).collect();
+    let vectors = embed(model, provider, &texts).await?;
+    let json = VECTORS.with(|v| {
+        let mut v = v.borrow_mut();
+        let idx = v.entry(session).or_insert_with(|| VectorIndex::new(model));
+        for ((id, text), vec) in stale.iter().zip(&vectors) {
+            idx.insert(*id, text, vec);
+        }
+        serde_json::to_string(idx)
+    });
+    if let Ok(json) = json
+        && DB_OK.with(Cell::get)
+        && let Err(e) = pf::db_put_vectors(session, &json).await
+    {
+        log(&format!("could not save the search index: {e}"));
+    }
+    Ok(())
+}
+
+/// Drops the vector indexes of the sessions that aren't active from memory. Returns how many.
+fn free_inactive_vectors() -> usize {
+    let active = with_state(|s| s.active_session);
+    VECTORS.with(|v| {
+        let mut v = v.borrow_mut();
+        let before = v.len();
+        v.retain(|id, _| *id == active);
+        before - v.len()
+    })
+}
+
+async fn vector_search(query: &str, sessions: Option<Vec<Id>>, limit: usize) -> Result<Response, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Response { ok: true, hits: Some(Vec::new()), ..Default::default() });
+    }
+    let (enabled, model, provider, unload, ids) = with_state(|s| {
+        let ai = &s.settings.ai;
+        let ids: Vec<Id> = match &sessions {
+            Some(ids) => ids.iter().copied().filter(|id| s.session(*id).is_some()).collect(),
+            None => s.sessions.iter().map(|x| x.id).collect(),
+        };
+        (ai.vector_search, ai.index_model(), ai.active_provider().cloned(), ai.unload_inactive, ids)
+    });
+    if !enabled {
+        return Err("vector search is off (Settings → AI & search)".into());
+    }
+    let limit = limit.clamp(1, 500);
+    let qv = embed(&model, provider.as_ref(), &[query.to_string()]).await?.pop().unwrap_or_default();
+    let mut hits: Vec<VectorHit> = Vec::new();
+    for session in &ids {
+        ensure_index(*session, &model, provider.as_ref()).await?;
+        VECTORS.with(|v| {
+            if let Some(idx) = v.borrow().get(session) {
+                hits.extend(
+                    idx.search(&qv, limit)
+                        .into_iter()
+                        .map(|(entry, score)| VectorHit { entry: EntryRef { session: *session, entry }, score }),
+                );
+            }
+        });
+    }
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.truncate(limit);
+    if unload {
+        free_inactive_vectors();
+    }
+    Ok(Response { ok: true, info: Some(format!("{} tab(s) found by meaning", hits.len())), hits: Some(hits), ..Default::default() })
 }

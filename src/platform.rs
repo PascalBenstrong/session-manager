@@ -171,6 +171,28 @@ extern "C" {
     pub fn set_event_handler(handler: &Function);
     #[wasm_bindgen(js_namespace = smPlatform, js_name = onStateChanged)]
     pub fn on_state_changed(key: &str, cb: &Function);
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbOpen)]
+    fn js_db_open() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoad)]
+    fn js_db_load() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbWrite)]
+    fn js_db_write(header: &str, puts: JsValue, dels: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbClear)]
+    fn js_db_clear() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbReadState)]
+    fn js_db_read_state(known: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbGetVectors)]
+    fn js_db_get_vectors(session: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbPutVectors)]
+    fn js_db_put_vectors(session: f64, json: &str) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbDeleteVectors)]
+    fn js_db_delete_vectors(sessions: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = storageRemove)]
+    fn js_storage_remove(keys: JsValue) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = pageText)]
+    fn js_page_text(tab_id: f64, max_chars: f64) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = httpRequest)]
+    fn js_http_request(req: JsValue, timeout_ms: f64) -> std::result::Result<Promise, JsValue>;
 }
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -644,6 +666,90 @@ pub async fn storage_get(key: &str) -> Result<Option<String>> {
 
 pub async fn storage_set(key: &str, value: &str) -> Result<()> {
     call(js_storage_set(key, value)).await.map(drop)
+}
+
+// ---- database (IndexedDB; see persist.rs)
+
+pub async fn db_open() -> Result<()> {
+    call(js_db_open()).await.map(drop)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct DbLoad {
+    pub header: Option<String>,
+    pub tabs: Vec<crate::persist::TabRecord>,
+}
+
+pub async fn db_load() -> Result<DbLoad> {
+    call_as(js_db_load()).await
+}
+
+pub async fn db_write(header: &str, puts: &[crate::persist::TabRecord], dels: &[crate::model::Id]) -> Result<()> {
+    call(js_db_write(header, to_js(puts), to_js(dels))).await.map(drop)
+}
+
+pub async fn db_clear() -> Result<()> {
+    call(js_db_clear()).await.map(drop)
+}
+
+/// The tabs of one session, as read by a page.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct DbSessionTabs {
+    pub id: crate::model::Id,
+    pub tabs: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct DbRead {
+    pub header: String,
+    pub sessions: Vec<DbSessionTabs>,
+}
+
+/// The saved state and the tabs of the sessions whose `tabs_revision` isn't in `known`.
+pub async fn db_read_state(known: &std::collections::BTreeMap<String, u64>) -> Result<Option<DbRead>> {
+    call_as(js_db_read_state(to_js(known))).await
+}
+
+pub async fn db_get_vectors(session: crate::model::Id) -> Result<Option<String>> {
+    Ok(call(js_db_get_vectors(session as f64)).await?.as_string())
+}
+
+pub async fn db_put_vectors(session: crate::model::Id, json: &str) -> Result<()> {
+    call(js_db_put_vectors(session as f64, json)).await.map(drop)
+}
+
+pub async fn db_delete_vectors(sessions: &[crate::model::Id]) -> Result<()> {
+    call(js_db_delete_vectors(to_js(sessions))).await.map(drop)
+}
+
+pub async fn storage_remove(keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    call(js_storage_remove(to_js(keys))).await.map(drop)
+}
+
+/// A page's title and visible text (at most `max_chars`).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct PageText {
+    pub title: String,
+    pub text: String,
+}
+
+pub async fn page_text(tab_id: TabId, max_chars: usize) -> Result<PageText> {
+    call_as(js_page_text(tab_id as f64, max_chars as f64)).await
+}
+
+/// Sends an HTTP request from the extension. Network failures come back as status 0.
+pub async fn http_request(req: &crate::ai::HttpRequest, timeout_ms: u32) -> crate::ai::HttpResponse {
+    match call_as(js_http_request(to_js(req), timeout_ms as f64)).await {
+        Ok(r) => r,
+        Err(e) => crate::ai::HttpResponse { status: 0, body: e },
+    }
 }
 
 // ---- alarms ----

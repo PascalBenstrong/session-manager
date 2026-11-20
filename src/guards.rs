@@ -209,6 +209,9 @@ impl AppState {
     }
 
     pub fn push_popup(&mut self, e: PopupEvent) {
+        if !self.settings.tracking.popup_log {
+            return;
+        }
         self.popup_log.insert(0, e);
         self.popup_log.truncate(MAX_POPUP_LOG);
     }
