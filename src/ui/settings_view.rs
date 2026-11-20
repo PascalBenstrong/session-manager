@@ -342,7 +342,7 @@ pub fn show(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions) {
         ai_card(ui, cx, acts, &mut s, &mut changed);
 
         let sessions = cx.state.sessions.len();
-        let tabs: usize = cx.state.sessions.iter().map(|s| s.entries.len()).sum();
+        let tabs: usize = cx.state.sessions.iter().map(|s| s.tab_count()).sum();
         section_card(ui, "About", "", |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Session Manager {}", crate::release_notes::VERSION)).strong());
@@ -680,8 +680,15 @@ fn ai_card(ui: &mut egui::Ui, cx: &ViewCtx, acts: &mut Actions, s: &mut crate::m
                     acts.send(Command::FreeSearchMemory);
                 }
             });
-            let described = cx.state.sessions.iter().flat_map(|x| &x.entries).filter(|e| !e.description.is_empty()).count();
-            ui.label(RichText::new(format!("{described} tab(s) have a summary.")).small().color(p.muted));
+            // Counted in the session shown (other sessions' tabs aren't loaded here).
+            if let Some(s) = cx.state.session(cx.viewed) {
+                let described = s.entries.iter().filter(|e| !e.description.is_empty()).count();
+                ui.label(
+                    RichText::new(format!("{described} of {} tab(s) in \"{}\" have a summary.", s.tab_count(), s.name))
+                        .small()
+                        .color(p.muted),
+                );
+            }
         },
     );
 }

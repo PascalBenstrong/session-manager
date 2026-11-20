@@ -37,12 +37,23 @@ pub struct TabRecord {
     /// Its position in the session (sequence number; see `entries.rs`).
     #[serde(default)]
     pub o: u64,
+    /// 1 if the tab is open (indexed: the background reads only open tabs of inactive
+    /// sessions), else 0.
+    #[serde(default)]
+    pub a: u8,
     /// The entry, as JSON.
     pub j: String,
 }
 
-/// What the database holds: each session's tab ids.
-pub type Saved = HashMap<Id, HashSet<Id>>;
+impl TabRecord {
+    fn of(s: Id, o: u64, e: &TabEntry) -> Option<Self> {
+        serde_json::to_string(e).ok().map(|j| TabRecord { id: e.id, s, o, a: e.tab_id.is_some() as u8, j })
+    }
+}
+
+/// The `version` of a state saved in the database with open tabs indexed (`TabRecord::a`)
+/// and each session's `next_seq`. Older ones are read whole and saved again.
+pub const DB_LAYOUT: u32 = 3;
 
 /// What to write to the database.
 #[derive(Debug, Default, PartialEq)]
@@ -51,51 +62,29 @@ pub struct WritePlan {
     pub clear: bool,
     pub puts: Vec<TabRecord>,
     pub dels: Vec<Id>,
+    /// Sessions deleted: all their tabs go.
+    pub del_sessions: Vec<Id>,
 }
 
-/// The tabs that changed since the last save, to write, and the removed ones, to delete.
-/// `saved` (what the database holds) is updated as if the plan was written. Sessions with
-/// changes get `tabs_revision = revision`, and the changes are forgotten: if the write
-/// fails, the next save must be [`plan_full`].
-pub fn plan_changes(state: &mut AppState, saved: &mut Saved, revision: u64) -> WritePlan {
+/// The tabs that changed since the last save, to write, and the removed ones, to delete,
+/// and the sessions deleted since `seen` (the sessions saved last time; updated). Sessions
+/// with changes get `tabs_revision = revision`, and the changes are forgotten (if the
+/// write fails, keep the plan for the next one: [`retry`]).
+pub fn plan_changes(state: &mut AppState, seen: &mut HashSet<Id>, revision: u64) -> WritePlan {
     let mut plan = WritePlan::default();
-    let put = |plan: &mut WritePlan, sid: Id, o: u64, e: &TabEntry| {
-        if let Ok(j) = serde_json::to_string(e) {
-            plan.puts.push(TabRecord { id: e.id, s: sid, o, j });
-        }
-    };
     for s in state.sessions.iter_mut().filter(|s| s.entries.has_changes()) {
         match s.entries.changes() {
-            Changes::Some(changed) => {
-                for (o, e) in changed {
-                    put(&mut plan, s.id, o, e);
-                }
-            }
-            Changes::All(all) => {
-                let now: HashSet<Id> = all.iter().map(|(_, e, _)| e.id).collect();
-                for (o, e, changed) in all {
-                    if changed {
-                        put(&mut plan, s.id, o, e);
-                    }
-                }
-                if let Some(before) = saved.get(&s.id) {
-                    plan.dels.extend(before.difference(&now));
-                }
-                saved.insert(s.id, now);
-            }
+            Changes::Some(changed) => plan.puts.extend(changed.into_iter().filter_map(|(o, e)| TabRecord::of(s.id, o, e))),
+            Changes::All(all) => plan.puts.extend(all.into_iter().filter(|x| x.2).filter_map(|(o, e, _)| TabRecord::of(s.id, o, e))),
         }
+        plan.dels.extend_from_slice(s.entries.removed());
         s.tabs_revision = revision;
         s.entries.clear_changes();
     }
-    // Deleted sessions' tabs go.
-    let live: HashSet<Id> = state.sessions.iter().map(|s| s.id).collect();
-    saved.retain(|sid, ids| {
-        let keep = live.contains(sid);
-        if !keep {
-            plan.dels.extend(ids.iter());
-        }
-        keep
-    });
+    let now: HashSet<Id> = state.sessions.iter().map(|s| s.id).collect();
+    plan.del_sessions = seen.difference(&now).copied().collect();
+    plan.del_sessions.sort_unstable();
+    *seen = now;
     // A tab moved to another session is removed from one and put in the other.
     if !plan.dels.is_empty() {
         let put: HashSet<Id> = plan.puts.iter().map(|r| r.id).collect();
@@ -106,34 +95,54 @@ pub fn plan_changes(state: &mut AppState, saved: &mut Saved, revision: u64) -> W
     plan
 }
 
-/// Every tab, to rewrite the database from scratch (after the state came from storage.local,
-/// or a failed write). Every session gets `tabs_revision = revision`; `saved` is rebuilt.
-pub fn plan_full(state: &mut AppState, saved: &mut Saved, revision: u64) -> WritePlan {
+/// Every tab, to rewrite the database from scratch (the state came from storage.local or an
+/// older layout; every tab is in memory then). Every session gets `tabs_revision`.
+pub fn plan_full(state: &mut AppState, seen: &mut HashSet<Id>, revision: u64) -> WritePlan {
+    debug_assert!(state.sessions.iter().all(|s| s.entries.hidden().is_none()), "a full rewrite needs every tab");
     let mut plan = WritePlan { clear: true, ..Default::default() };
-    saved.clear();
     for s in &mut state.sessions {
-        for (o, e) in s.entries.with_seq() {
-            if let Ok(j) = serde_json::to_string(e) {
-                plan.puts.push(TabRecord { id: e.id, s: s.id, o, j });
-            }
-        }
-        saved.insert(s.id, s.entries.iter().map(|e| e.id).collect());
+        plan.puts.extend(s.entries.with_seq().filter_map(|(o, e)| TabRecord::of(s.id, o, e)));
         s.tabs_revision = revision;
         s.entries.clear_changes();
     }
+    *seen = state.sessions.iter().map(|s| s.id).collect();
     plan
 }
 
-/// Forgets every session's changes (the whole state was saved elsewhere).
-pub fn forget_changes(state: &mut AppState) {
-    for s in &mut state.sessions {
+/// Adds a plan that failed to be written to the next one (what the next one writes about
+/// the same tabs is newer and wins).
+pub fn retry(plan: &mut WritePlan, failed: WritePlan) {
+    let puts: HashSet<Id> = plan.puts.iter().map(|r| r.id).collect();
+    let dels: HashSet<Id> = plan.dels.iter().copied().collect();
+    plan.clear |= failed.clear;
+    plan.puts.extend(failed.puts.into_iter().filter(|r| !puts.contains(&r.id) && !dels.contains(&r.id)));
+    plan.dels.extend(failed.dels.into_iter().filter(|id| !puts.contains(id) && !dels.contains(id)));
+    for s in failed.del_sessions {
+        if !plan.del_sessions.contains(&s) {
+            plan.del_sessions.push(s);
+        }
+    }
+    // The deleted sessions' tabs are cleared before the puts, which may move some elsewhere.
+}
+
+/// Forgets every session's changes (the whole state was saved elsewhere), noting which
+/// sessions changed (`tabs_revision`), so pages ask for them again.
+pub fn forget_changes(state: &mut AppState, revision: u64) {
+    for s in state.sessions.iter_mut().filter(|s| s.entries.has_changes()) {
+        s.tabs_revision = revision;
         s.entries.clear_changes();
     }
 }
 
-/// The state as saved in `meta['state']`: without the sessions' tabs and snapshots. The
-/// tabs are moved out and back whole, so nothing counts as changed.
+/// The state as saved in `meta['state']`: without the sessions' tabs and snapshots (with
+/// their counts and sequence numbers). The tabs are moved out and back whole, so nothing
+/// counts as changed.
 pub fn header_json(state: &mut AppState) -> serde_json::Result<String> {
+    state.version = DB_LAYOUT;
+    for s in &mut state.sessions {
+        s.refresh_counts();
+        s.next_seq = s.entries.next_seq();
+    }
     let taken: Vec<(Entries, Vec<crate::model::Snapshot>)> =
         state.sessions.iter_mut().map(|s| (std::mem::take(&mut s.entries), std::mem::take(&mut s.snapshots))).collect();
     let json = serde_json::to_string(state);
@@ -146,24 +155,75 @@ pub fn header_json(state: &mut AppState) -> serde_json::Result<String> {
 
 /// A session's tabs as read from the database: (position, JSON). Unreadable ones are left out.
 pub fn read_tabs<'a>(tabs: impl IntoIterator<Item = (u64, &'a str)>) -> Entries {
-    Entries::from_saved(tabs.into_iter().filter_map(|(o, j)| serde_json::from_str::<TabEntry>(j).ok().map(|e| (o, e))).collect())
+    Entries::from_saved(parse_tabs(tabs))
 }
 
-/// The state read from the database: its header with the tabs put back in their sessions,
-/// in order, with nothing marked changed, and what the database holds. Unreadable tabs are
-/// left out; tabs of sessions that no longer exist too (and are deleted at the next save).
-pub fn assemble(header: &str, tabs: &[TabRecord]) -> Result<(AppState, Saved), String> {
+/// Tabs read from the database, readable ones only.
+pub fn parse_tabs<'a>(tabs: impl IntoIterator<Item = (u64, &'a str)>) -> Vec<(u64, TabEntry)> {
+    tabs.into_iter().filter_map(|(o, j)| serde_json::from_str::<TabEntry>(j).ok().map(|e| (o, e))).collect()
+}
+
+/// The state read from the database, every tab in memory (an older layout, or tests).
+/// Unreadable tabs, and tabs of sessions that no longer exist, are left out.
+pub fn assemble(header: &str, tabs: &[TabRecord]) -> Result<AppState, String> {
     let mut state: AppState = serde_json::from_str(header).map_err(|e| format!("saved state unreadable: {e}"))?;
     let mut by_session: HashMap<Id, Vec<(u64, &str)>> = HashMap::new();
-    let mut saved = Saved::new();
     for t in tabs {
         by_session.entry(t.s).or_default().push((t.o, &t.j));
-        saved.entry(t.s).or_default().insert(t.id);
     }
     for s in &mut state.sessions {
         s.entries = read_tabs(by_session.remove(&s.id).unwrap_or_default());
     }
-    Ok((state, saved))
+    Ok(state)
+}
+
+/// The state read from the database as the background keeps it: the active session's tabs,
+/// and of the other sessions only the open ones (`tabs`: those records, in any order, maybe
+/// twice); their other tabs stay in the database (`Entries::hidden`).
+pub fn assemble_partial(header: &str, tabs: &[TabRecord]) -> Result<AppState, String> {
+    let mut state: AppState = serde_json::from_str(header).map_err(|e| format!("saved state unreadable: {e}"))?;
+    let mut by_session: HashMap<Id, Vec<(u64, &str)>> = HashMap::new();
+    let mut seen: HashSet<Id> = HashSet::new();
+    for t in tabs.iter().filter(|t| seen.insert(t.id)) {
+        by_session.entry(t.s).or_default().push((t.o, &t.j));
+    }
+    let active = state.active_session;
+    for s in &mut state.sessions {
+        let tabs = parse_tabs(by_session.remove(&s.id).unwrap_or_default());
+        s.entries = if s.id == active {
+            Entries::from_saved(tabs)
+        } else {
+            let hidden = s.counts.tabs.saturating_sub(tabs.len());
+            Entries::from_saved_part(tabs, hidden, s.next_seq)
+        };
+    }
+    Ok(state)
+}
+
+/// Takes back a session's saved tabs read from the database (all its records).
+pub fn load_session(state: &mut AppState, session: Id, tabs: &[TabRecord]) {
+    if let Some(s) = state.session_mut(session) {
+        s.entries.merge_loaded(parse_tabs(tabs.iter().filter(|t| t.s == session).map(|t| (t.o, t.j.as_str()))));
+    }
+}
+
+/// Lets the closed tabs of inactive sessions go (they're in the database), except sessions
+/// with changes not saved yet. Returns how many sessions let tabs go.
+pub fn evict_inactive(state: &mut AppState) -> usize {
+    let active = state.active_session;
+    // Also sessions already partly in memory: their tabs closed since (with their window)
+    // go too.
+    state
+        .sessions
+        .iter_mut()
+        .filter(|s| s.id != active && s.entries.iter().any(|e| !e.is_open()))
+        .map(|s| s.entries.evict_closed() as usize)
+        .sum()
+}
+
+/// The sessions whose tabs aren't all in memory.
+pub fn partial_sessions(state: &AppState) -> Vec<Id> {
+    state.sessions.iter().filter(|s| s.entries.hidden().is_some()).map(|s| s.id).collect()
 }
 
 /// Puts the tabs saved per session (`sm_session_<id>`, a development build) back into a
@@ -219,31 +279,46 @@ mod tests {
     struct Db {
         header: String,
         tabs: HashMap<Id, TabRecord>,
-        saved: Saved,
+        seen: HashSet<Id>,
     }
 
     impl Db {
         fn save(&mut self, state: &mut AppState, full: bool) -> WritePlan {
             state.revision += 1;
             let rev = state.revision;
-            let plan = if full { plan_full(state, &mut self.saved, rev) } else { plan_changes(state, &mut self.saved, rev) };
-            if plan.clear {
-                self.tabs.clear();
-            }
-            for id in &plan.dels {
-                self.tabs.remove(id);
-            }
-            for r in &plan.puts {
-                self.tabs.insert(r.id, r.clone());
-            }
+            let plan = if full { plan_full(state, &mut self.seen, rev) } else { plan_changes(state, &mut self.seen, rev) };
+            self.apply(&plan);
             self.header = header_json(state).unwrap();
             plan
         }
 
+        /// As `smPlatform.dbWrite` does: clear, deleted sessions' tabs, puts, deletes.
+        fn apply(&mut self, plan: &WritePlan) {
+            if plan.clear {
+                self.tabs.clear();
+            }
+            self.tabs.retain(|_, r| !plan.del_sessions.contains(&r.s));
+            for r in &plan.puts {
+                self.tabs.insert(r.id, r.clone());
+            }
+            for id in &plan.dels {
+                self.tabs.remove(id);
+            }
+        }
+
+        fn records(&self) -> Vec<TabRecord> {
+            self.tabs.values().cloned().collect()
+        }
+
         fn load(&self) -> AppState {
-            let (state, saved) = assemble(&self.header, &self.tabs.values().cloned().collect::<Vec<_>>()).unwrap();
-            assert_eq!(saved.values().map(|x| x.len()).sum::<usize>(), self.tabs.len());
-            state
+            assemble(&self.header, &self.records()).unwrap()
+        }
+
+        /// What the background reads at startup: the active session, and open tabs.
+        fn load_partial(&self) -> AppState {
+            let active: AppState = serde_json::from_str(&self.header).unwrap();
+            let tabs: Vec<TabRecord> = self.tabs.values().filter(|r| r.s == active.active_session || r.a == 1).cloned().collect();
+            assemble_partial(&self.header, &tabs).unwrap()
         }
     }
 
@@ -391,6 +466,114 @@ mod tests {
         assert!(plan.puts.is_empty() && plan.dels.is_empty() && !plan.clear);
     }
 
+    /// The background keeps only the active session's tabs and other sessions' open tabs:
+    /// the same changes made with every tab in memory and with inactive sessions' closed
+    /// tabs left in the database (read back only when an operation needs them) must leave
+    /// the same database.
+    #[test]
+    fn inactive_sessions_keep_only_open_tabs_and_lose_nothing() {
+        let mut full = AppState::default();
+        let a = full.active_session;
+        let b = full.create_session("B", 0.0);
+        let c = full.create_session("C", 0.0);
+        for (sid, base) in [(a, 1), (b, 10), (c, 20)] {
+            full.set_active(sid).unwrap();
+            for i in 0..4 {
+                full.on_tab_upsert(&BrowserTab { window_id: sid as i64, ..tab(base + i, &format!("https://s{sid}-{i}.com/")) }, 1.0);
+            }
+            // Two of each session's tabs closed (kept as saved tabs).
+            let refs: Vec<EntryRef> = [base, base + 1].iter().map(|t| full.locate_tab(*t).unwrap()).collect();
+            full.close_entries(&refs, 1.0);
+        }
+        full.set_active(a).unwrap();
+        let mut lazy = full.clone();
+        let (mut db_full, mut db_lazy) = (Db::default(), Db::default());
+        db_full.save(&mut full, true);
+        db_lazy.save(&mut lazy, true);
+        evict_inactive(&mut lazy);
+        assert_eq!(lazy.session(b).unwrap().entries.len(), 2, "only B's open tabs in memory");
+        assert_eq!(lazy.session(b).unwrap().tab_count(), 4, "but it knows how many it has");
+
+        // An operation, and the sessions it needs whole (read back from the database first).
+        let mut step = |what: &str, needs: &[Id], op: &dyn Fn(&mut AppState)| {
+            for sid in needs {
+                load_session(&mut lazy, *sid, &db_lazy.records());
+            }
+            op(&mut full);
+            op(&mut lazy);
+            db_full.save(&mut full, false);
+            db_lazy.save(&mut lazy, false);
+            evict_inactive(&mut lazy);
+            let mut want: Vec<_> = db_full.records();
+            let mut got: Vec<_> = db_lazy.records();
+            want.sort_by_key(|r| r.id);
+            got.sort_by_key(|r| r.id);
+            assert_eq!(got, want, "{what}: the database");
+            for s in &full.sessions {
+                let l = lazy.session(s.id).unwrap();
+                assert_eq!(l.tab_count(), s.entries.len(), "{what}: tab count of {}", s.id);
+                assert_eq!(l.open_count(), s.open_count(), "{what}: open count of {}", s.id);
+                assert!(l.id == lazy.active_session || l.entries.iter().all(|e| e.is_open()), "{what}: {} keeps only open tabs", s.id);
+            }
+            // After a restart, the background reads only what it keeps.
+            let restarted = db_lazy.load_partial();
+            for s in &full.sessions {
+                let r = restarted.session(s.id).unwrap();
+                assert_eq!(r.tab_count(), s.entries.len(), "{what}: count after a restart");
+                let open: Vec<_> = s.entries.iter().filter(|e| e.is_open()).collect();
+                if s.id != restarted.active_session {
+                    assert_eq!(r.entries.iter().collect::<Vec<_>>(), open, "{what}: open tabs after a restart");
+                }
+            }
+        };
+
+        // Browser events on an inactive session's open tabs need nothing read.
+        step("navigation in an inactive session", &[], &|s| {
+            s.on_tab_upsert(&BrowserTab { window_id: b as i64, title: "moved on".into(), ..tab(12, "https://elsewhere.com/") }, 2.0);
+        });
+        step("tab closed by hand in an inactive session", &[], &|s| {
+            s.on_tab_removed(13, false, 3.0);
+        });
+        step("its window closes", &[], &|s| {
+            s.on_tab_upsert(&BrowserTab { window_id: 77, ..tab(30, "https://a-extra.com/") }, 3.0);
+            s.on_tab_removed(22, true, 4.0);
+            s.on_tab_removed(23, true, 4.0);
+        });
+        step("tagging a saved tab of an inactive session", &[b], &|s| {
+            let r = EntryRef { session: b, entry: s.session(b).unwrap().entries[0].id };
+            s.tag_entries(&[r], "kept", true);
+        });
+        step("removing saved tabs of an inactive session", &[b], &|s| {
+            let r = EntryRef { session: b, entry: s.session(b).unwrap().entries[1].id };
+            s.remove_entries(&[r], true);
+        });
+        step("moving a tab into an inactive session", &[b], &|s| {
+            let r = s.locate_tab(3).unwrap();
+            s.move_entries(&[r], b).unwrap();
+        });
+        step("switching the active session", &[b], &|s| {
+            s.set_active(b).unwrap();
+            s.on_tab_upsert(&tab(40, "https://in-b.com/"), 5.0);
+        });
+        step("a session deleted", &[], &|s| {
+            s.delete_session(c).unwrap();
+        });
+        step("rules over every tab", &[a, b], &|s| {
+            s.save_workspace(Workspace {
+                name: "W".into(),
+                auto_add: true,
+                rules: vec![WorkspaceRule::Tag("kept".into())],
+                ..Default::default()
+            })
+            .unwrap();
+            s.auto_place(None, false);
+        });
+        step("restoring a snapshot", &[a], &|s| {
+            let snap = s.create_snapshot(a, "x", false, 6.0).unwrap();
+            s.restore_snapshot(a, snap, RestoreMode::Replace, 6.0).unwrap();
+        });
+    }
+
     #[test]
     fn a_save_serializes_only_the_changed_tabs() {
         let mut s = AppState::default();
@@ -424,8 +607,7 @@ mod tests {
         assert_eq!(order(&s), [Some(2), Some(3), Some(4), Some(1)], "a tab moved back goes last");
         assert_eq!(order(&db.load()), order(&s));
         // Loaded tabs carry on: a new one goes after them, and nothing counts as changed.
-        let (mut loaded, saved) = assemble(&db.header, &db.tabs.values().cloned().collect::<Vec<_>>()).unwrap();
-        db.saved = saved;
+        let mut loaded = db.load();
         assert!(!loaded.active().entries.has_changes());
         loaded.on_tab_upsert(&tab(5, "https://5.com/"), 2.0);
         let plan = db.save(&mut loaded, false);
@@ -441,15 +623,12 @@ mod tests {
         let mut db = Db::default();
         db.save(&mut s, true);
         let mut records: Vec<TabRecord> = db.tabs.values().cloned().collect();
-        records.push(TabRecord { id: 900, s: s.active_session, o: 5, j: "{not json".into() });
-        records.push(TabRecord { id: 901, s: 424242, o: 0, j: "{}".into() });
-        let (back, saved) = assemble(&db.header, &records).unwrap();
+        records.push(TabRecord { id: 900, s: s.active_session, o: 5, a: 0, j: "{not json".into() });
+        records.push(TabRecord { id: 901, s: 424242, o: 0, a: 0, j: "{}".into() });
+        let back = assemble(&db.header, &records).unwrap();
         assert_eq!(back.active().entries.len(), 1);
-        // The orphan is known as saved, so the next save deletes it.
-        let mut back = back;
-        let mut saved = saved;
-        let plan = plan_changes(&mut back, &mut saved, 9);
-        assert_eq!(plan.dels, [901]);
+        let part = assemble_partial(&db.header, &records).unwrap();
+        assert_eq!(part.active().entries.len(), 1);
         assert!(assemble("not json", &[]).is_err());
     }
 

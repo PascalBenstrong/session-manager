@@ -13,6 +13,14 @@
 //! appended, removed, or all replaced, so the order of the sequence numbers is the order of
 //! the list, and a change to one tab never rewrites the others' positions.
 //!
+//! Removed tabs are noted as they're removed, so a save deletes exactly those (also in a
+//! session whose saved tabs aren't all in memory: see `hidden`).
+//!
+//! In the background, an inactive session keeps only its open tabs in memory (browser
+//! events are about open tabs); its other tabs stay in the database (`hidden` counts them)
+//! until something needs them ([`Entries::merge_loaded`]), and go again after
+//! ([`Entries::evict_closed`]).
+//!
 //! Tabs are found by entry id or by browser tab id in O(1) (plus the tabs changed since the
 //! last lookup): an index follows the same change tracking. An appended tab is indexed
 //! right away, a changed tab again at the next lookup, and after tabs were removed or
@@ -39,6 +47,8 @@ struct Index {
     pending: Vec<usize>,
     /// Rebuild before the next lookup (tabs were removed or replaced).
     stale: bool,
+    /// How many tabs are open (have a browser tab).
+    open: usize,
 }
 
 /// Adds a position under a key (kept sorted: the first is the answer).
@@ -71,6 +81,7 @@ impl Index {
         put(&mut self.by_id, e.id, p);
         if let Some(t) = e.tab_id {
             put(&mut self.by_tab, t, p);
+            self.open += 1;
         }
     }
 
@@ -94,6 +105,7 @@ impl Index {
             self.keys.clear();
             self.pending.clear();
             self.stale = false;
+            self.open = 0;
             for (p, e) in list.iter().enumerate() {
                 self.add(p, e);
             }
@@ -108,11 +120,13 @@ impl Index {
             take(&mut self.by_id, old_id, p);
             if let Some(t) = old_tab {
                 take(&mut self.by_tab, t, p);
+                self.open -= 1;
             }
             self.keys[p] = (e.id, e.tab_id);
             put(&mut self.by_id, e.id, p);
             if let Some(t) = e.tab_id {
                 put(&mut self.by_tab, t, p);
+                self.open += 1;
             }
         }
     }
@@ -127,9 +141,14 @@ pub struct Entries {
     changed: Vec<bool>,
     /// Positions newly marked in `changed` (only used while not `touched`).
     dirty: RefCell<Vec<usize>>,
-    /// Tabs were added or removed, or the list is new: compare it all with what's saved.
+    /// Tabs were added or removed, or the list is new: visit them all to find what changed.
     touched: Cell<bool>,
     next_seq: u64,
+    /// Tabs removed since the last save (to delete).
+    removed: Vec<Id>,
+    /// Saved tabs not in memory (background: an inactive session's closed tabs). `None`:
+    /// every tab is here.
+    hidden: Option<usize>,
     /// Where tabs are by id and by browser tab (see the module docs).
     ix: RefCell<Index>,
 }
@@ -144,6 +163,8 @@ impl Default for Entries {
             dirty: RefCell::default(),
             touched: Cell::new(true),
             next_seq: 0,
+            removed: Vec::new(),
+            hidden: None,
             ix: RefCell::new(Index::stale()),
         }
     }
@@ -199,7 +220,7 @@ pub enum Changes<'a> {
     /// Only these existing tabs changed (with their sequence numbers).
     Some(Vec<(u64, &'a TabEntry)>),
     /// Tabs were added or removed (or the list is new): every tab with its sequence number
-    /// and whether it changed; what's saved but not listed was removed.
+    /// and whether it changed.
     All(Vec<(u64, &'a TabEntry, bool)>),
 }
 
@@ -217,8 +238,95 @@ impl Entries {
             dirty: RefCell::default(),
             touched: Cell::new(false),
             next_seq,
+            removed: Vec::new(),
+            hidden: None,
             ix: RefCell::new(Index::stale()),
         }
+    }
+
+    /// Some of a session's saved tabs (its open ones), with how many others stay in the
+    /// database, and the sequence number the session is at.
+    pub fn from_saved_part(items: Vec<(u64, TabEntry)>, hidden: usize, next_seq: u64) -> Self {
+        let mut e = Self::from_saved(items);
+        e.hidden = Some(hidden);
+        e.next_seq = e.next_seq.max(next_seq);
+        e
+    }
+
+    /// Saved tabs not in memory (`None`: all are here).
+    pub fn hidden(&self) -> Option<usize> {
+        self.hidden
+    }
+
+    /// How many tabs the session has, here or not.
+    pub fn total_len(&self) -> usize {
+        self.list.len() + self.hidden.unwrap_or(0)
+    }
+
+    /// The sequence number the next tab gets.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Lets the closed tabs go (they're in the database), keeping the open ones. Only when
+    /// nothing is waiting to be saved; returns whether it did. Nothing counts as removed.
+    pub fn evict_closed(&mut self) -> bool {
+        if self.has_changes() {
+            return false;
+        }
+        let before = self.list.len();
+        let (list, seq) = (std::mem::take(&mut self.list), std::mem::take(&mut self.seq));
+        for (e, s) in list.into_iter().zip(seq) {
+            if e.tab_id.is_some() {
+                self.list.push(e);
+                self.seq.push(s);
+            }
+        }
+        self.changed = vec![false; self.list.len()];
+        self.hidden = Some(self.hidden.unwrap_or(0) + before - self.list.len());
+        self.ix.get_mut().stale = true;
+        true
+    }
+
+    /// Takes back the session's saved tabs read from the database (all of them, in any
+    /// order), keeping what's in memory: tabs here win (they may have changed since), tabs
+    /// removed here stay removed, and what's waiting to be saved still is.
+    pub fn merge_loaded(&mut self, loaded: Vec<(u64, TabEntry)>) {
+        if self.hidden.is_none() {
+            return;
+        }
+        let here: std::collections::HashSet<Id> = self.list.iter().map(|e| e.id).collect();
+        let removed: std::collections::HashSet<Id> = self.removed.iter().copied().collect();
+        let mut all: Vec<(u64, TabEntry, bool)> = Vec::with_capacity(loaded.len() + self.list.len());
+        let (list, seq, changed) = (std::mem::take(&mut self.list), std::mem::take(&mut self.seq), std::mem::take(&mut self.changed));
+        for ((e, s), c) in list.into_iter().zip(seq).zip(changed) {
+            all.push((s, e, c));
+        }
+        for (s, e) in loaded {
+            if !here.contains(&e.id) && !removed.contains(&e.id) {
+                all.push((s, e, false));
+            }
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
+        let any_changed = all.iter().any(|x| x.2);
+        for (s, e, c) in all {
+            self.next_seq = self.next_seq.max(s + 1);
+            self.seq.push(s);
+            self.list.push(e);
+            self.changed.push(c);
+        }
+        self.hidden = None;
+        // Positions moved: what changed is found by visiting every tab.
+        self.dirty.get_mut().clear();
+        if any_changed {
+            self.touched.set(true);
+        }
+        self.ix.get_mut().stale = true;
+    }
+
+    /// Tabs removed since the last save.
+    pub fn removed(&self) -> &[Id] {
+        &self.removed
     }
 
     /// The position of the tab with this entry id.
@@ -256,6 +364,25 @@ impl Entries {
         }
     }
 
+    /// How many tabs are open. O(1) (plus re-indexing tabs changed since the last lookup).
+    pub fn open_count(&self) -> usize {
+        let mut ix = self.ix.borrow_mut();
+        ix.sync(&self.list);
+        ix.open
+    }
+
+    /// The open tabs (with a browser tab), in order: O(open tabs), not O(tabs).
+    pub fn open_tabs(&self) -> Vec<&TabEntry> {
+        let mut positions: Vec<usize> = {
+            let mut ix = self.ix.borrow_mut();
+            ix.sync(&self.list);
+            ix.by_tab.values().flatten().copied().collect()
+        };
+        positions.sort_unstable();
+        positions.dedup();
+        positions.into_iter().filter_map(|p| self.list.get(p)).filter(|e| e.tab_id.is_some()).collect()
+    }
+
     /// The tab with this entry id.
     pub fn find(&self, id: Id) -> Option<&TabEntry> {
         self.position(id).map(|p| &self.list[p])
@@ -284,6 +411,7 @@ impl Entries {
                 self.seq.push(s);
                 self.changed.push(c);
             } else {
+                self.removed.push(e.id);
                 gone.push(e);
             }
         }
@@ -300,12 +428,16 @@ impl Entries {
         self.changed.remove(index);
         self.touched.set(true);
         self.ix.get_mut().stale = true;
-        self.list.remove(index)
+        let e = self.list.remove(index);
+        self.removed.push(e.id);
+        e
     }
 
     /// Replaces every tab (they're all saved again).
     pub fn replace_all(&mut self, entries: Vec<TabEntry>) {
+        debug_assert!(self.hidden.is_none(), "load a session before replacing its tabs");
         *self.ix.get_mut() = Index::default();
+        self.removed.extend(self.list.iter().map(|e| e.id));
         self.list.clear();
         self.seq.clear();
         self.changed.clear();
@@ -317,6 +449,8 @@ impl Entries {
 
     /// Takes every tab out.
     pub fn take_all(&mut self) -> Vec<TabEntry> {
+        debug_assert!(self.hidden.is_none(), "load a session before taking its tabs");
+        self.removed.extend(self.list.iter().map(|e| e.id));
         self.seq.clear();
         self.changed.clear();
         self.touched.set(true);
@@ -362,7 +496,7 @@ impl Entries {
 
     /// Whether anything changed since the last save. O(1).
     pub fn has_changes(&self) -> bool {
-        self.touched.get() || !self.dirty.borrow().is_empty()
+        self.touched.get() || !self.dirty.borrow().is_empty() || !self.removed.is_empty()
     }
 
     /// What changed since the last save: O(changed tabs), or O(tabs) after tabs were added
@@ -395,6 +529,7 @@ impl Entries {
             }
         }
         self.dirty.get_mut().clear();
+        self.removed.clear();
         self.touched.set(false);
     }
 
@@ -574,6 +709,9 @@ mod tests {
                 6 => list.clear_changes(),
                 _ => {}
             }
+            assert_eq!(list.open_count(), list.iter().filter(|x| x.tab_id.is_some()).count(), "open count in round {round}");
+            let open: Vec<Id> = list.open_tabs().iter().map(|x| x.id).collect();
+            assert_eq!(open, list.iter().filter(|x| x.tab_id.is_some()).map(|x| x.id).collect::<Vec<_>>(), "open tabs in round {round}");
             for probe in 0..160u64 {
                 assert_eq!(list.position(probe), list.iter().position(|x| x.id == probe), "id {probe} in round {round}");
                 let t = probe as i64 * 5 % 400;
@@ -581,6 +719,40 @@ mod tests {
                 assert_eq!(list.position_of_tab(t), list.iter().position(|x| x.tab_id == Some(t)), "tab {t} in round {round}");
             }
         }
+    }
+
+    #[test]
+    fn closed_tabs_go_and_come_back() {
+        let open = |id: Id| TabEntry { tab_id: Some(id as i64), ..e(id) };
+        let saved = vec![(0, e(1)), (1, open(2)), (2, e(3)), (3, open(4)), (4, e(5))];
+        let mut list = Entries::from_saved(saved.clone());
+        assert!(list.evict_closed());
+        assert_eq!(list.iter().map(|x| x.id).collect::<Vec<_>>(), [2, 4]);
+        assert_eq!((list.hidden(), list.total_len()), (Some(3), 5));
+        assert!(!list.has_changes(), "letting tabs go isn't a change");
+        assert_eq!(list.position(1), None);
+        assert_eq!(list.position_of_tab(4), Some(1));
+
+        // Meanwhile: an open tab changes, another is removed.
+        list.get_mut(2).unwrap().title = "changed here".into();
+        list.retain(|x| x.id != 4);
+        assert_eq!(list.removed(), [4]);
+        // Back from the database (which still has the old tab 2 and tab 4).
+        list.merge_loaded(saved);
+        assert_eq!(list.iter().map(|x| x.id).collect::<Vec<_>>(), [1, 2, 3, 5], "in order; the removed tab stays removed");
+        assert_eq!(list.hidden(), None);
+        assert_eq!(list.find(2).unwrap().title, "changed here", "what changed here wins");
+        match list.changes() {
+            Changes::All(all) => assert_eq!(all.iter().filter(|x| x.2).map(|x| x.1.id).collect::<Vec<_>>(), [2]),
+            Changes::Some(_) => panic!("positions moved: every tab is visited"),
+        }
+        assert_eq!(list.removed(), [4], "still to delete");
+        // Not let go while something waits to be saved.
+        assert!(!list.evict_closed());
+        list.clear_changes();
+        assert!(list.evict_closed());
+        list.push(e(9));
+        assert_eq!(list.with_seq().last().map(|(s, _)| s), Some(5), "numbering goes on after the hidden tabs");
     }
 
     #[test]

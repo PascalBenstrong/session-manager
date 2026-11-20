@@ -667,18 +667,28 @@ impl AppState {
     }
 
     /// Snapshots every non-empty session whose URLs changed since its latest snapshot.
+    /// Sessions not all in memory are skipped: load [`AppState::snapshot_candidates`] first.
     pub fn auto_snapshot_all(&mut self, now: f64) -> usize {
         let due: Vec<Id> = self
             .sessions
             .iter()
-            .filter(|s| !s.entries.is_empty())
+            .filter(|s| s.entries.hidden().is_none() && !s.entries.is_empty())
             .filter(|s| s.snapshots.last().is_none_or(|last| last.urls() != s.urls()))
             .map(|s| s.id)
             .collect();
         for id in &due {
             let _ = self.create_snapshot(*id, "Automatic", true, now);
         }
+        for s in self.sessions.iter_mut().filter(|s| s.entries.hidden().is_none()) {
+            s.snapshot_revision = s.tabs_revision;
+        }
         due.len()
+    }
+
+    /// Sessions not all in memory whose tabs changed since their last automatic snapshot
+    /// was considered: the ones to read back before [`AppState::auto_snapshot_all`].
+    pub fn snapshot_candidates(&self) -> Vec<Id> {
+        self.sessions.iter().filter(|s| s.entries.hidden().is_some() && s.tabs_revision != s.snapshot_revision).map(|s| s.id).collect()
     }
 
     // ---- import ----

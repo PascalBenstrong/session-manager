@@ -176,11 +176,14 @@ extern "C" {
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoad)]
     fn js_db_load() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbWrite)]
-    fn js_db_write(header: &str, puts: JsValue, dels: JsValue, clear: bool) -> std::result::Result<Promise, JsValue>;
+    fn js_db_write(header: &str, puts: JsValue, dels: JsValue, clear: bool, del_sessions: JsValue)
+    -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoadPartial)]
+    fn js_db_load_partial() -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoadSessions)]
+    fn js_db_load_sessions(sessions: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbClear)]
     fn js_db_clear() -> std::result::Result<Promise, JsValue>;
-    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbReadState)]
-    fn js_db_read_state(known: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbGetVectors)]
     fn js_db_get_vectors(session: f64) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbPutVectors)]
@@ -685,42 +688,23 @@ pub async fn db_load() -> Result<DbLoad> {
     call_as(js_db_load()).await
 }
 
-/// One transaction: empties the tabs first if `clear`, then puts and deletes tabs and sets
-/// the state.
-pub async fn db_write(header: &str, puts: &[crate::persist::TabRecord], dels: &[crate::model::Id], clear: bool) -> Result<()> {
-    call(js_db_write(header, to_js(puts), to_js(dels), clear)).await.map(drop)
+/// Writes a plan (see `persist.rs`) and the state, in one transaction.
+pub async fn db_write(header: &str, plan: &crate::persist::WritePlan) -> Result<()> {
+    call(js_db_write(header, to_js(&plan.puts), to_js(&plan.dels), plan.clear, to_js(&plan.del_sessions))).await.map(drop)
+}
+
+/// The state, the active session's tabs and every open tab (what the background keeps).
+pub async fn db_load_partial() -> Result<DbLoad> {
+    call_as(js_db_load_partial()).await
+}
+
+/// Every tab of these sessions.
+pub async fn db_load_sessions(sessions: &[crate::model::Id]) -> Result<Vec<crate::persist::TabRecord>> {
+    call_as(js_db_load_sessions(to_js(sessions))).await
 }
 
 pub async fn db_clear() -> Result<()> {
     call(js_db_clear()).await.map(drop)
-}
-
-/// A tab as read by a page: its position and JSON.
-#[derive(Deserialize, Default)]
-#[serde(default)]
-pub struct DbTab {
-    pub o: u64,
-    pub j: String,
-}
-
-/// The tabs of one session, as read by a page.
-#[derive(Deserialize, Default)]
-#[serde(default)]
-pub struct DbSessionTabs {
-    pub id: crate::model::Id,
-    pub tabs: Vec<DbTab>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-pub struct DbRead {
-    pub header: String,
-    pub sessions: Vec<DbSessionTabs>,
-}
-
-/// The saved state and the tabs of the sessions whose `tabs_revision` isn't in `known`.
-pub async fn db_read_state(known: &std::collections::BTreeMap<String, u64>) -> Result<Option<DbRead>> {
-    call_as(js_db_read_state(to_js(known))).await
 }
 
 pub async fn db_get_vectors(session: crate::model::Id) -> Result<Option<String>> {

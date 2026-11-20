@@ -192,6 +192,12 @@ type ListedKey = (u64, bool, Id, Option<u64>, TabSort, bool);
 type WorkspaceCounts = (Vec<EntryRef>, usize, usize);
 
 impl TabsView {
+    /// Whether the view shows every session's tabs: searching all sessions, or a
+    /// workspace's settings (its rules are checked against every saved tab).
+    pub fn needs_all_sessions(&self) -> bool {
+        self.all_sessions || self.ws_open.is_some()
+    }
+
     /// The results of a vector search sent by this view.
     pub fn vector_results(&mut self, hits: Vec<VectorHit>) {
         if let Some((query, _, _)) = &self.meaning_sent {

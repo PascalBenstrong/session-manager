@@ -25,7 +25,7 @@ mod widgets;
 
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,8 +35,9 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::dedupe::{DedupeOptions, DuplicateGroup, Scope, find_duplicates};
 use crate::model::{AppState, EntryRef, Id, Session, Snapshot, TabId};
+use crate::page_state::{self, Want};
 use crate::platform as pf;
-use crate::protocol::{CHANGED_KEY, Capabilities, Command, Response, SNAPSHOTS_KEY, STATE_KEY};
+use crate::protocol::{CHANGED_KEY, Capabilities, Command, OpenTabs, Response, SNAPSHOTS_KEY};
 use widgets::{badge, icon_button, nav_item, primary_button, segmented, text_input};
 
 /// Width from which the sidebar layout is used.
@@ -65,16 +66,12 @@ pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
 #[derive(Default)]
 struct Inbox {
     responses: Vec<Response>,
-    /// The newest state the background saved, not read yet: only the newest is parsed (once
-    /// per frame), however many arrive meanwhile. Kept as the JS string until then.
-    pushed_state: Option<JsValue>,
     /// The newest snapshots saved (SNAPSHOTS_KEY), not read yet; same as `pushed_state`.
     pushed_snapshots: Option<JsValue>,
-    /// The newest revision saved to the database (CHANGED_KEY), not read yet.
+    /// The newest revision the background saved (CHANGED_KEY), not acted on yet.
     changed: Option<u64>,
-    /// A read of the database finished: the state read (with the tabs of the sessions that
-    /// changed), or the error.
-    db_read: Option<Result<Option<pf::DbRead>, String>>,
+    /// The reply to this page's GetState (see `sync_state`).
+    state_reply: Option<Response>,
     /// The window of a sidebar page.
     window_id: Option<TabId>,
     /// Messages for the toast: (text, error).
@@ -263,11 +260,15 @@ pub struct App {
     pending: u32,
     state: Option<Rc<AppState>>,
     snapshots: BTreeMap<Id, Vec<Snapshot>>,
-    /// The newest revision saved to the database that isn't shown yet; whether it's being
-    /// read; whether the next read reads every session.
-    db_wanted: Option<u64>,
-    db_reading: bool,
-    db_full_read: bool,
+    /// What this page has of the state (see `page_state.rs`): what it asked for last, what
+    /// it's asking for now (one request at a time), a newer revision saved since, and
+    /// whether to ask for everything again.
+    state_asked: Option<Want>,
+    state_asking: Option<Want>,
+    state_newer: Option<u64>,
+    state_full_again: bool,
+    /// Snapshots are read (and followed) only once a view needs them.
+    snapshots_loading: bool,
     caps: Capabilities,
     status: Option<Status>,
     view: View,
@@ -298,18 +299,8 @@ impl App {
         let inbox = Rc::new(RefCell::new(Inbox::default()));
         // The capture window shows nothing of the state.
         if !capture {
-            let pushed = inbox.clone();
-            let ctx = cc.egui_ctx.clone();
-            let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
-                if v.is_string() {
-                    pushed.borrow_mut().pushed_state = Some(v);
-                    ctx.request_repaint();
-                }
-            });
-            pf::on_state_changed(STATE_KEY, cb.as_ref().unchecked_ref());
-            cb.forget();
-            // Saved in the database: the background says which revision; the tabs that
-            // changed are read from it (see `read_database`).
+            // After each save the background says which revision: the page then asks for
+            // what changed in what it shows (see `sync_state`).
             let inbox = inbox.clone();
             let ctx = cc.egui_ctx.clone();
             let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
@@ -321,31 +312,6 @@ impl App {
             });
             pf::on_state_changed(CHANGED_KEY, cb.as_ref().unchecked_ref());
             cb.forget();
-        }
-        // Only the manager and the popup show snapshots.
-        if !sidebar && !inspector && !capture {
-            // Snapshots: read once, then followed like the state.
-            let pushed = inbox.clone();
-            let ctx = cc.egui_ctx.clone();
-            let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
-                if v.is_string() {
-                    pushed.borrow_mut().pushed_snapshots = Some(v);
-                    ctx.request_repaint();
-                }
-            });
-            pf::on_state_changed(SNAPSHOTS_KEY, cb.as_ref().unchecked_ref());
-            cb.forget();
-            let inbox = inbox.clone();
-            let ctx = cc.egui_ctx.clone();
-            spawn_local(async move {
-                if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
-                    let mut inbox = inbox.borrow_mut();
-                    if inbox.pushed_snapshots.is_none() {
-                        inbox.pushed_snapshots = Some(JsValue::from_str(&json));
-                    }
-                    ctx.request_repaint();
-                }
-            });
         }
         if sidebar {
             let inbox = inbox.clone();
@@ -371,9 +337,11 @@ impl App {
             pending: 0,
             state: None,
             snapshots: BTreeMap::new(),
-            db_wanted: None,
-            db_reading: false,
-            db_full_read: false,
+            state_asked: None,
+            state_asking: None,
+            state_newer: None,
+            state_full_again: false,
+            snapshots_loading: false,
             caps: Capabilities::default(),
             status: None,
             view: View::Tabs,
@@ -391,7 +359,7 @@ impl App {
             organize: Default::default(),
             cleanup: Default::default(),
         };
-        app.send(Command::GetState);
+        app.sync_state();
         app
     }
 
@@ -465,8 +433,106 @@ impl App {
         });
     }
 
+    /// Reads the snapshots and follows them (only once a view shows them: they hold copies of
+    /// every session's tabs).
+    fn load_snapshots(&mut self) {
+        if self.snapshots_loading {
+            return;
+        }
+        self.snapshots_loading = true;
+        let pushed = self.inbox.clone();
+        let ctx = self.ctx.clone();
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
+            if v.is_string() {
+                pushed.borrow_mut().pushed_snapshots = Some(v);
+                ctx.request_repaint();
+            }
+        });
+        pf::on_state_changed(SNAPSHOTS_KEY, cb.as_ref().unchecked_ref());
+        cb.forget();
+        let inbox = self.inbox.clone();
+        let ctx = self.ctx.clone();
+        spawn_local(async move {
+            if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
+                let mut inbox = inbox.borrow_mut();
+                if inbox.pushed_snapshots.is_none() {
+                    inbox.pushed_snapshots = Some(JsValue::from_str(&json));
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// What this page shows of the state: the tabs of the session viewed and the active
+    /// one, every session's only while a view needs them all; open tabs of the other
+    /// sessions for the sidebar (its window) and the page guards view (all).
+    fn want(&self) -> Want {
+        if self.inspector.is_some() || self.capture.is_some() {
+            return Want { sessions: Some(BTreeSet::new()), with_active: false, open_tabs: OpenTabs::None };
+        }
+        let all = if self.popup {
+            self.mini.needs_all_sessions()
+        } else if self.sidebar {
+            false
+        } else {
+            match self.view {
+                View::Tabs => self.tabs.needs_all_sessions(),
+                View::Organize => self.organize.needs_all_sessions(),
+                // Saving all sessions to a file.
+                View::Backup => true,
+                _ => false,
+            }
+        };
+        let sessions = (!all).then(|| {
+            let mut ids = BTreeSet::new();
+            if let Some(s) = &self.state {
+                ids.insert(s.active_session);
+                ids.insert(self.viewed_session.unwrap_or(s.active_session));
+            }
+            ids
+        });
+        let open_tabs = if self.sidebar {
+            self.window_id.map_or(OpenTabs::None, OpenTabs::Window)
+        } else if !self.popup && self.view == View::Guards {
+            OpenTabs::All
+        } else {
+            OpenTabs::None
+        };
+        Want { sessions, with_active: true, open_tabs }
+    }
+
+    /// Asks the background for the state when what the page shows changed, or a newer
+    /// state was saved: only the tabs it shows that changed (see `page_state.rs`).
+    fn sync_state(&mut self) {
+        if self.state_asking.is_some() {
+            return;
+        }
+        let want = self.want();
+        let newer = self.state_newer.is_some_and(|r| self.state.as_ref().is_none_or(|s| r > s.revision));
+        if self.state.is_some() && !newer && !self.state_full_again && self.state_asked.as_ref() == Some(&want) {
+            return;
+        }
+        let known = if self.state_full_again { BTreeMap::new() } else { page_state::known(self.state.as_deref()) };
+        let cmd = Command::GetState {
+            sessions: want.sessions.as_ref().map(|s| s.iter().copied().collect()),
+            with_active: want.with_active,
+            open_tabs: want.open_tabs,
+            known: known.into_iter().collect(),
+        };
+        self.state_newer = None;
+        self.state_full_again = false;
+        self.state_asking = Some(want);
+        let inbox = self.inbox.clone();
+        let ctx = self.ctx.clone();
+        spawn_local(async move {
+            let resp = pf::send_command(&cmd).await;
+            inbox.borrow_mut().state_reply = Some(resp);
+            ctx.request_repaint();
+        });
+    }
+
     fn drain_inbox(&mut self) {
-        let (responses, pushed, notices, db_read) = {
+        let (responses, notices, state_reply) = {
             let mut inbox = self.inbox.borrow_mut();
             if let Some(w) = inbox.window_id.take() {
                 self.window_id = Some(w);
@@ -477,50 +543,46 @@ impl App {
                 self.snapshots = all;
             }
             if let Some(rev) = inbox.changed.take() {
-                self.db_wanted = Some(self.db_wanted.map_or(rev, |w| w.max(rev)));
+                self.state_newer = Some(self.state_newer.map_or(rev, |w| w.max(rev)));
             }
-            let db_read = inbox.db_read.take();
-            (std::mem::take(&mut inbox.responses), inbox.pushed_state.take(), std::mem::take(&mut inbox.notices), db_read)
+            (std::mem::take(&mut inbox.responses), std::mem::take(&mut inbox.notices), inbox.state_reply.take())
         };
-        if let Some(read) = db_read {
-            self.db_reading = false;
-            match read {
-                Ok(Some(read)) => self.db_read_done(read),
-                // Nothing in the database (it's off, or couldn't be opened): stop asking.
-                Ok(None) => self.db_wanted = None,
-                Err(e) => {
-                    // Tried again at the next change, not every frame.
-                    self.db_wanted = None;
-                    self.set_status(format!("Could not read the saved tabs: {e}"), true);
-                }
-            }
-        }
         for (text, error) in notices {
             self.set_status(text, error);
         }
-        // With the database switched off, the whole state is saved in STATE_KEY.
-        if let Some(json) = pushed.and_then(|v| v.as_string())
-            && let Ok(s) = serde_json::from_str::<AppState>(&json)
-        {
-            self.accept_state(s);
+        if let Some(r) = state_reply {
+            let asked = self.state_asking.take();
+            if let Some(c) = r.capabilities.clone() {
+                self.caps = c;
+            }
+            match r.state {
+                Some(s) => {
+                    let asked_for = asked.clone().unwrap_or_default();
+                    match page_state::merge(self.state.as_deref(), s, &asked_for) {
+                        Some(s) => {
+                            self.accept_state(s);
+                            self.state_asked = asked;
+                        }
+                        // It kept tabs this page doesn't have: ask for everything again.
+                        None => self.state_full_again = true,
+                    }
+                }
+                None => self.set_status(r.error.unwrap_or_else(|| "Could not get the state".into()), true),
+            }
         }
         for r in responses {
             self.pending = self.pending.saturating_sub(1);
-            if let Some(s) = r.state {
-                self.accept_state(s);
-            }
             if let Some(c) = r.capabilities {
                 self.caps = c;
             }
             if let Some(hits) = r.hits {
                 self.tabs.vector_results(hits);
             }
-            // The command saved a newer state: read what changed from the database. (With
-            // the database off, the whole state comes from storage.local instead.)
+            // The command saved a newer state: ask for what changed.
             if let Some(rev) = r.revision
-                && self.state.as_ref().is_some_and(|s| s.settings.tracking.database && rev > s.revision)
+                && self.state.as_ref().is_some_and(|s| rev > s.revision)
             {
-                self.db_wanted = Some(self.db_wanted.map_or(rev, |w| w.max(rev)));
+                self.state_newer = Some(self.state_newer.map_or(rev, |w| w.max(rev)));
             }
             if let Some(e) = r.error {
                 // Keep the popup open so the error can be read.
@@ -537,7 +599,6 @@ impl App {
         if self.close_when_done && self.pending == 0 {
             close_window();
         }
-        self.read_database();
         if let Some(state) = &self.state
             && self.viewed_session.is_none_or(|id| state.session(id).is_none())
         {
@@ -545,61 +606,11 @@ impl App {
         }
     }
 
-    /// Reads the state saved in the database, when it's newer than the one shown: only the
-    /// tabs of the sessions that changed (`tabs_revision`), one read at a time.
-    fn read_database(&mut self) {
-        let Some(wanted) = self.db_wanted else { return };
-        if self.state.as_ref().is_some_and(|s| s.revision >= wanted) {
-            self.db_wanted = None;
-            return;
-        }
-        if self.db_reading {
-            return;
-        }
-        self.db_reading = true;
-        let known: BTreeMap<String, u64> = if self.db_full_read {
-            BTreeMap::new()
-        } else {
-            self.state.iter().flat_map(|s| s.sessions.iter().map(|x| (x.id.to_string(), x.tabs_revision))).collect()
-        };
-        self.db_full_read = false;
-        let inbox = self.inbox.clone();
-        let ctx = self.ctx.clone();
-        spawn_local(async move {
-            let read = pf::db_read_state(&known).await;
-            inbox.borrow_mut().db_read = Some(read);
-            ctx.request_repaint();
-        });
-    }
-
-    /// Builds the state read from the database: the sessions read, and the others' tabs
-    /// from the state shown (they didn't change).
-    fn db_read_done(&mut self, read: pf::DbRead) {
-        let Ok(mut s) = serde_json::from_str::<AppState>(&read.header) else {
-            self.set_status("The saved state is unreadable", true);
-            return;
-        };
-        let mut fresh: BTreeMap<Id, Vec<pf::DbTab>> = read.sessions.into_iter().map(|x| (x.id, x.tabs)).collect();
-        for x in s.sessions.iter_mut() {
-            x.entries = match fresh.remove(&x.id) {
-                Some(list) => crate::persist::read_tabs(list.iter().map(|t| (t.o, t.j.as_str()))),
-                None => match self.state.as_ref().and_then(|cur| cur.session(x.id)).filter(|c| c.tabs_revision == x.tabs_revision) {
-                    Some(cur) => cur.entries.clone(),
-                    None => {
-                        // The state shown moved on meanwhile: read everything again.
-                        self.db_full_read = true;
-                        return;
-                    }
-                },
-            };
-        }
-        self.accept_state(s);
-    }
-
     /// Takes a state from the background unless it's older than the one shown (replies and
     /// storage changes can arrive out of order).
     fn accept_state(&mut self, s: AppState) {
         if self.state.as_ref().is_none_or(|cur| s.revision >= cur.revision) {
+            publish_page_state(&s);
             self.state = Some(Rc::new(s));
             STATE_GENERATION.with(|g| g.set(g.get() + 1));
         }
@@ -658,12 +669,12 @@ impl App {
             for s in &state.sessions {
                 let active = s.id == state.active_session;
                 let icon = if active { "★" } else { "▢" };
-                let count = s.entries.len().to_string();
+                let count = s.tab_count().to_string();
                 let resp = nav_item(ui, icon, &s.name, s.id == viewed, Some((&count, active)));
                 let resp = resp.on_hover_text(format!(
                     "{} open · {} unloaded{}",
                     s.open_count(),
-                    s.entries.len() - s.open_count(),
+                    s.tab_count() - s.open_count(),
                     if active { "\nActive: new tabs are added here" } else { "" }
                 ));
                 if resp.clicked() {
@@ -732,9 +743,9 @@ impl App {
                 ui.label(
                     RichText::new(format!(
                         "{} tabs · {} open · {} unloaded",
-                        session.entries.len(),
+                        session.tab_count(),
                         session.open_count(),
-                        session.entries.len() - session.open_count()
+                        session.tab_count() - session.open_count()
                     ))
                     .color(p.muted),
                 );
@@ -772,11 +783,11 @@ impl App {
     /// Set active / Load / Last tab. Laid out right-to-left.
     fn session_actions(&mut self, ui: &mut egui::Ui, state: &AppState, session: &Session, labels: bool) {
         let is_active = session.id == state.active_session;
-        let closed = session.entries.len() - session.open_count();
+        let closed = session.tab_count() - session.open_count();
 
         let last = if labels { egui::Button::new("⟲  Last tab") } else { egui::Button::new("⟲") };
         if ui
-            .add_enabled(!session.entries.is_empty(), last)
+            .add_enabled(session.tab_count() > 0, last)
             .on_hover_text("Find and focus the most recently used tab of this session")
             .clicked()
         {
@@ -886,7 +897,7 @@ impl App {
             let can_delete = state.sessions.len() > 1;
             if ui.add_enabled(can_delete, egui::Button::new("🗑 Delete session…")).clicked() {
                 self.confirm(
-                    format!("Delete session \"{}\" and forget its {} tab(s)? Open tabs stay open.", session.name, session.entries.len()),
+                    format!("Delete session \"{}\" and forget its {} tab(s)? Open tabs stay open.", session.name, session.tab_count()),
                     Command::DeleteSession { id: session.id, close_tabs: false },
                 );
                 ui.close();
@@ -923,12 +934,8 @@ impl App {
                 .height(360.0)
                 .show_ui(ui, |ui| {
                     for s in &state.sessions {
-                        let label = format!(
-                            "{}  ·  {}/{}",
-                            widgets::session_label(s, s.id == state.active_session),
-                            s.open_count(),
-                            s.entries.len()
-                        );
+                        let label =
+                            format!("{}  ·  {}/{}", widgets::session_label(s, s.id == state.active_session), s.open_count(), s.tab_count());
                         if ui.selectable_label(s.id == session.id, label).clicked() {
                             self.viewed_session = Some(s.id);
                             self.rename_buf = None;
@@ -1080,6 +1087,10 @@ impl App {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         self.drain_inbox();
+        if !self.popup && !self.sidebar && self.view == View::Backup {
+            self.load_snapshots();
+        }
+        self.sync_state();
         if let Some(mut inspector) = self.inspector.take() {
             let mut acts = Actions::default();
             inspector.ui(ui, &mut acts, self.state.as_deref());
@@ -1148,6 +1159,9 @@ impl App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin)).show(ui, |ui| {
             let cx = ViewCtx { state: &state, caps: &self.caps, viewed: session.id, snapshots: &self.snapshots };
             match self.view {
+                View::Tabs if session.partial => {
+                    ui.centered_and_justified(|ui| ui.spinner());
+                }
                 View::Tabs => self.tabs.show(ui, &cx, &mut acts),
                 View::Organize => self.organize.show(ui, &cx, &mut acts),
                 View::Cleanup => self.cleanup.show(ui, &cx, &mut acts),
@@ -1190,4 +1204,17 @@ fn close_window() {
     if let Some(w) = web_sys::window() {
         let _ = w.close();
     }
+}
+
+/// What the page holds, for tests in real browsers (the UI is drawn on a canvas):
+/// `globalThis.smPageState = { revision, sessions: [{ id, partial, tabs, count }] }` —
+/// `tabs` loaded, `count` it has. Small: no tab data.
+fn publish_page_state(s: &AppState) {
+    let summary = serde_json::json!({
+        "revision": s.revision,
+        "sessions": s.sessions.iter().map(|x| serde_json::json!({
+            "id": x.id, "partial": x.partial, "tabs": x.entries.len(), "count": x.tab_count(),
+        })).collect::<Vec<_>>(),
+    });
+    let _ = js_sys::Reflect::set(&js_sys::global(), &JsValue::from_str("smPageState"), &pf::to_js(&summary));
 }

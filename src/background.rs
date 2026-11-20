@@ -17,9 +17,10 @@ use crate::hibernate::{self, HibernateTarget};
 use crate::media::MediaReport;
 use crate::model::{AppState, BrowserTab, EntryRef, Id, Snapshot, TabId};
 use crate::organize::{self, OrganizeKey};
+use crate::page_state;
 use crate::persist::{self, Source};
 use crate::platform::{self as pf, CreateTab};
-use crate::protocol::{CHANGED_KEY, Capabilities, Command, Response, SNAPSHOTS_KEY, SPLIT_VERSION, STATE_KEY, session_key};
+use crate::protocol::{CHANGED_KEY, Capabilities, Command, OpenTabs, Response, SNAPSHOTS_KEY, SPLIT_VERSION, STATE_KEY, session_key};
 use crate::state::{RestoreMode, trackable};
 use crate::tab_strip;
 
@@ -70,8 +71,12 @@ thread_local! {
     static GUARDS_SYNCED: RefCell<Option<GuardsWanted>> = const { RefCell::new(None) };
     /// The extension's database (IndexedDB) could be opened.
     static DB_OK: Cell<bool> = const { Cell::new(false) };
-    /// The tab ids of each session in the database (to find what to delete).
-    static TABS_SAVED: RefCell<persist::Saved> = RefCell::new(Default::default());
+    /// A write to the database that failed, written with the next save.
+    static RETRY: RefCell<Option<persist::WritePlan>> = const { RefCell::new(None) };
+    /// Commands running (inactive sessions' tabs they read back are let go after).
+    static IN_FLIGHT: Cell<u32> = const { Cell::new(0) };
+    /// Until when inactive sessions' closed tabs stay in memory (after a browser restart).
+    static KEEP_UNTIL: Cell<f64> = const { Cell::new(0.0) };
     /// The database is out of date (the state came from storage.local, was saved there, or
     /// a write failed): the next save rewrites it whole instead of writing the changes.
     static NEED_FULL: Cell<bool> = const { Cell::new(true) };
@@ -90,6 +95,10 @@ thread_local! {
     /// Debounce generation of each tab's automatic summary.
     static AI_PENDING: RefCell<std::collections::HashMap<TabId, u32>> = RefCell::new(Default::default());
 }
+
+/// After a browser restart, inactive sessions' closed tabs stay in memory this long: the
+/// browser may still be restoring tabs, which find their saved tab.
+const STARTUP_KEEP_MS: f64 = 30_000.0;
 
 /// How long after a navigation a page is read for its automatic summary.
 const AUTO_SUMMARY_DELAY_MS: u32 = 5000;
@@ -135,17 +144,30 @@ struct Reply<'a> {
     state: &'a AppState,
 }
 
-/// A command's reply. Only GetState (a page starting) carries the whole state, O(tabs);
-/// other replies carry the revision saved, O(1): pages read what changed from the
-/// database (or get the state from storage.local with the database off).
-fn reply_json(resp: &mut Response, full: bool) -> serde_json::Result<String> {
+/// What a page asked GetState for (see `page_state.rs`).
+type PageAsk = (Option<Vec<Id>>, bool, OpenTabs, std::collections::BTreeMap<Id, u64>);
+
+/// A command's reply. GetState carries the state as the page asked for it: only the tabs of
+/// the sessions it shows that changed since it last asked (see `page_state.rs`). Other
+/// replies carry the revision saved, O(1): pages then ask for what changed.
+fn reply_json(resp: &mut Response, ask: Option<PageAsk>) -> serde_json::Result<String> {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
-        if full {
-            return without_snapshots(&mut s, |s| serde_json::to_string(&Reply { response: resp, state: s }));
+        let Some((mut sessions, with_active, open_tabs, known)) = ask else {
+            resp.revision = Some(s.revision);
+            return serde_json::to_string(resp);
+        };
+        if with_active && let Some(ids) = &mut sessions {
+            ids.push(s.active_session);
         }
-        resp.revision = Some(s.revision);
-        serde_json::to_string(resp)
+        let taken: Vec<Vec<Snapshot>> = s.sessions.iter_mut().map(|x| std::mem::take(&mut x.snapshots)).collect();
+        let json = page_state::with_page_view(&mut s, sessions.as_deref(), open_tabs, &known, |s| {
+            serde_json::to_string(&Reply { response: resp, state: s })
+        });
+        for (x, snaps) in s.sessions.iter_mut().zip(taken) {
+            x.snapshots = snaps;
+        }
+        json
     })
 }
 
@@ -199,8 +221,21 @@ pub async fn start() -> Result<(), JsValue> {
     }
     state.normalize();
     match pf::query_tabs().await {
-        Ok(tabs) => state.reconcile(&tabs, pf::now()),
-        Err(e) => log(&format!("could not query tabs: {e}")),
+        Ok(tabs) => {
+            // Tabs open at the last save that aren't there: the browser restarted (it may
+            // still be restoring tabs, which find their saved tab: keep closed tabs a while).
+            let now_open: std::collections::HashSet<TabId> = tabs.iter().map(|t| t.id).collect();
+            let gone =
+                state.sessions.iter().any(|s| s.entries.open_tabs().iter().any(|e| e.tab_id.is_some_and(|t| !now_open.contains(&t))));
+            if gone {
+                KEEP_UNTIL.with(|k| k.set(pf::now() + STARTUP_KEEP_MS));
+            }
+            state.reconcile(&tabs, pf::now());
+        }
+        Err(e) => {
+            log(&format!("could not query tabs: {e}"));
+            KEEP_UNTIL.with(|k| k.set(pf::now() + STARTUP_KEEP_MS));
+        }
     }
     SESSIONS_SEEN.with(|seen| *seen.borrow_mut() = state.sessions.iter().map(|x| x.id).collect());
     with_state(|s| *s = state);
@@ -216,6 +251,11 @@ pub async fn start() -> Result<(), JsValue> {
     sync_guards().await;
     sync_stream_holds().await;
     sync_stream_config().await;
+    // Once the browser is done restoring tabs, inactive sessions' closed tabs go.
+    spawn_local(async {
+        pf::sleep(STARTUP_KEEP_MS as u32 + 1000).await;
+        evict_inactive();
+    });
     Ok(())
 }
 
@@ -334,35 +374,16 @@ async fn load_state() -> AppState {
         persist::legacy_with_session_files(l, |id| files.get(&id).cloned());
     }
 
-    let db = if db_ok {
-        match pf::db_load().await {
-            Ok(d) => match d.header.as_deref().map(|h| persist::assemble(h, &d.tabs)) {
-                Some(Ok(x)) => Some(x),
-                Some(Err(e)) => {
-                    log(&e);
-                    None
-                }
-                None => None,
-            },
-            Err(e) => {
-                log(&format!("could not read the database: {e}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // The database: what the background keeps (the active session, open tabs), unless it was
+    // saved with an older layout (then everything, saved again).
+    let db = if db_ok { read_database().await } else { None };
 
     let source = persist::newest(db.as_ref().map(|d| &d.0), legacy.as_ref());
-    let (db_state, saved) = match db {
-        Some((s, saved)) => (Some(s), saved),
-        None => (None, persist::Saved::new()),
-    };
-    DB_HAS_DATA.with(|d| d.set(db_state.is_some()));
-    TABS_SAVED.with(|t| *t.borrow_mut() = saved);
+    let layout_ok = db.as_ref().is_some_and(|d| d.1);
+    DB_HAS_DATA.with(|d| d.set(db.is_some()));
     // Read from the database: saves write what changes from here. Otherwise the database
     // is rewritten whole by the first save (also clearing what's left from before).
-    NEED_FULL.with(|n| n.set(source != Source::Database));
+    NEED_FULL.with(|n| n.set(source != Source::Database || !layout_ok));
 
     if let Some(l) = &legacy {
         let mut keys = vec![STATE_KEY.to_string()];
@@ -380,9 +401,134 @@ async fn load_state() -> AppState {
         LEGACY_KEYS.with(|k| *k.borrow_mut() = keys);
     }
     match source {
-        Source::Database => db_state.unwrap_or_default(),
+        Source::Database => db.map(|d| d.0).unwrap_or_default(),
         Source::Legacy => legacy.unwrap_or_default(),
         Source::Nothing => AppState::default(),
+    }
+}
+
+/// The state in the database as the background keeps it, and whether it has the current
+/// layout (else it's read whole, to be saved again).
+async fn read_database() -> Option<(AppState, bool)> {
+    let part = match pf::db_load_partial().await {
+        Ok(d) => d,
+        Err(e) => {
+            log(&format!("could not read the database: {e}"));
+            return None;
+        }
+    };
+    let header = part.header?;
+    match persist::assemble_partial(&header, &part.tabs) {
+        Ok(state) if state.version >= persist::DB_LAYOUT => Some((state, true)),
+        Ok(_) => match pf::db_load().await.map_err(|e| e.to_string()).and_then(|d| persist::assemble(&header, &d.tabs)) {
+            Ok(state) => Some((state, false)),
+            Err(e) => {
+                log(&format!("could not read the database: {e}"));
+                None
+            }
+        },
+        Err(e) => {
+            log(&e);
+            None
+        }
+    }
+}
+
+/// The sessions a command works on whose tabs must all be in memory.
+enum Need {
+    Nothing,
+    Some(Vec<Id>),
+    All,
+}
+
+fn needed(cmd: &Command) -> Need {
+    let of = |refs: &[EntryRef]| {
+        let mut ids: Vec<Id> = refs.iter().map(|r| r.session).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Need::Some(ids)
+    };
+    match cmd {
+        Command::GetState { sessions: None, .. } => Need::All,
+        Command::GetState { sessions: Some(ids), .. } => Need::Some(ids.clone()),
+        Command::SetActiveSession { id } | Command::LoadSession { id, .. } => Need::Some(vec![*id]),
+        Command::FocusLastTab { session }
+        | Command::RestoreLastClosed { session, .. }
+        | Command::CreateSnapshot { session, .. }
+        | Command::RestoreSnapshot { session, .. } => Need::Some(vec![*session]),
+        Command::OpenEntry { entry, .. } => Need::Some(vec![entry.session]),
+        Command::OpenEntries { entries, .. }
+        | Command::RemoveEntries { entries, .. }
+        | Command::CloseEntries { entries }
+        | Command::TagEntries { entries, .. }
+        | Command::SetGroup { entries, .. }
+        | Command::AssignWorkspace { entries, .. }
+        | Command::Summarize { entries }
+        | Command::ClearDescriptions { entries } => of(entries),
+        Command::MoveEntries { entries, target } => {
+            let mut refs = entries.clone();
+            refs.push(EntryRef { session: *target, entry: 0 });
+            of(&refs)
+        }
+        Command::AutoPlaceEntries { entries: Some(entries) } => of(entries),
+        Command::AutoPlaceEntries { entries: None }
+        | Command::ApplyAutoRules
+        | Command::SaveWorkspace { .. }
+        | Command::DeleteWorkspace { .. } => Need::All,
+        Command::RemoveDuplicates { scope: Scope::All, .. } => Need::All,
+        Command::RemoveDuplicates { scope: Scope::Session(id), .. } => Need::Some(vec![*id]),
+        Command::ImportUrls { target: crate::state::ImportTarget::Session(id), .. } => Need::Some(vec![*id]),
+        _ => Need::Nothing,
+    }
+}
+
+/// Reads back from the database the tabs of these sessions (`None`: all) that aren't all in
+/// memory. Tabs in memory win over what's read (they may be newer); if a save happened
+/// while reading, it's read again (a tab removed and saved meanwhile mustn't come back).
+async fn ensure_loaded(sessions: Option<&[Id]>) -> Result<(), String> {
+    for _ in 0..3 {
+        let wanted: Vec<Id> = with_state(|s| match sessions {
+            None => persist::partial_sessions(s),
+            Some(ids) => ids.iter().copied().filter(|id| s.session(*id).is_some_and(|x| x.entries.hidden().is_some())).collect(),
+        });
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        if !DB_OK.with(Cell::get) {
+            return Err("the saved tabs can't be read (the database can't be opened)".into());
+        }
+        let saved_before = REVISION.with(Cell::get);
+        let records = pf::db_load_sessions(&wanted).await?;
+        if REVISION.with(Cell::get) != saved_before {
+            continue;
+        }
+        with_state(|s| {
+            for id in &wanted {
+                persist::load_session(s, *id, &records);
+            }
+            s.drop_dangling_workspaces();
+        });
+        return Ok(());
+    }
+    Err("the saved tabs kept changing while being read; try again".into())
+}
+
+/// Whether inactive sessions' closed tabs may be let go now: they're all saved, no command
+/// is using them, and the browser isn't restoring tabs (those find their saved tab).
+fn may_evict() -> bool {
+    DB_OK.with(Cell::get)
+        && with_state(|s| s.settings.tracking.database)
+        && !NEED_FULL.with(Cell::get)
+        && RETRY.with(|r| r.borrow().is_none())
+        && IN_FLIGHT.with(Cell::get) == 0
+        && STARTUP_DEDUPE.with(|d| d.get()).is_none()
+        && pf::now() > KEEP_UNTIL.with(Cell::get)
+}
+
+/// Lets inactive sessions' closed tabs go from memory (they're in the database).
+fn evict_inactive() {
+    if may_evict() {
+        with_state(persist::evict_inactive);
     }
 }
 
@@ -391,6 +537,13 @@ async fn persist() {
     PERSIST_PENDING.with(|p| p.set(false));
     PERSIST_SOON.with(|p| p.set(false));
     let use_db = DB_OK.with(Cell::get) && with_state(|s| s.settings.tracking.database);
+    // storage.local holds everything in one key: every tab must be in memory.
+    if !use_db
+        && with_state(|s| !persist::partial_sessions(s).is_empty())
+        && let Err(e) = ensure_loaded(None).await
+    {
+        return log(&format!("not saved (the saved tabs couldn't be read back): {e}"));
+    }
     // Planned without awaiting, and written first: the database runs transactions in the
     // order they're made, so saves can't land out of order.
     let (next, write, snapshots, gone) = STATE.with(|s| {
@@ -401,42 +554,43 @@ async fn persist() {
             n
         });
         s.revision = next;
-        s.version = 1;
         // Snapshots are saved apart, and only when they changed.
         let snapshots = (!snapshots_saved(&s)).then(|| {
             let all: std::collections::BTreeMap<Id, &Vec<Snapshot>> = s.sessions.iter().map(|x| (x.id, &x.snapshots)).collect();
             (serde_json::to_string(&all), snapshots_fingerprint(&s))
         });
+        let now: std::collections::HashSet<Id> = s.sessions.iter().map(|x| x.id).collect();
+        let gone: Vec<Id> = SESSIONS_SEEN.with(|seen| seen.borrow().difference(&now).copied().collect());
         let write = if use_db {
             // Only the tabs that changed (tracked as they change), unless the database is
-            // out of date.
+            // out of date. A write that failed goes with this one.
             let full = NEED_FULL.with(|n| n.replace(false));
-            let plan = TABS_SAVED.with(|t| {
-                let mut t = t.borrow_mut();
-                if full { persist::plan_full(&mut s, &mut t, next) } else { persist::plan_changes(&mut s, &mut t, next) }
+            let mut plan = SESSIONS_SEEN.with(|seen| {
+                let mut seen = seen.borrow_mut();
+                if full { persist::plan_full(&mut s, &mut seen, next) } else { persist::plan_changes(&mut s, &mut seen, next) }
             });
+            if let Some(failed) = RETRY.with(|r| r.borrow_mut().take())
+                && !full
+            {
+                persist::retry(&mut plan, failed);
+            }
             persist::header_json(&mut s).map(|header| Ok((header, plan)))
         } else {
             // Everything in one key; the database will be rewritten whole when it's back.
-            persist::forget_changes(&mut s);
+            persist::forget_changes(&mut s, next);
             NEED_FULL.with(|n| n.set(true));
+            SESSIONS_SEEN.with(|seen| *seen.borrow_mut() = now);
+            s.version = 1;
             without_snapshots(&mut s, serde_json::to_string).map(Err)
         };
-        let now: std::collections::HashSet<Id> = s.sessions.iter().map(|x| x.id).collect();
-        let gone: Vec<Id> = SESSIONS_SEEN.with(|seen| {
-            let mut seen = seen.borrow_mut();
-            let gone = seen.difference(&now).copied().collect();
-            *seen = now;
-            gone
-        });
         (next, write, snapshots, gone)
     });
     match write {
         Err(e) => log(&format!("could not serialize state: {e}")),
-        Ok(Ok((header, plan))) => match pf::db_write(&header, &plan.puts, &plan.dels, plan.clear).await {
+        Ok(Ok((header, plan))) => match pf::db_write(&header, &plan).await {
             Ok(()) => {
                 DB_HAS_DATA.with(|d| d.set(true));
-                // Pages read the new state from the database.
+                // Pages ask for what changed.
                 if let Err(e) = pf::storage_set(CHANGED_KEY, &next.to_string()).await {
                     log(&format!("could not tell pages about the save: {e}"));
                 }
@@ -446,12 +600,22 @@ async fn persist() {
                     LEGACY_KEYS.with(|k| *k.borrow_mut() = stale);
                 }
             }
-            Err(e) => {
+            Err(e) if with_state(|s| persist::partial_sessions(s).is_empty()) => {
                 // Nothing is lost: the whole state goes to storage.local, which wins at
                 // the next start if it's newer, and the database is rewritten next time.
                 NEED_FULL.with(|n| n.set(true));
                 log(&format!("could not save to the database, saving in storage.local: {e}"));
                 save_in_storage_local().await;
+            }
+            Err(e) => {
+                // Not every tab is in memory, so storage.local can't take the state: what
+                // failed is written with the next save.
+                log(&format!("could not save to the database (will try again with the next save): {e}"));
+                if plan.clear {
+                    NEED_FULL.with(|n| n.set(true));
+                } else {
+                    RETRY.with(|r| *r.borrow_mut() = Some(plan));
+                }
             }
         },
         Ok(Err(json)) => {
@@ -477,6 +641,7 @@ async fn persist() {
             log(&format!("could not delete search indexes: {e}"));
         }
     }
+    evict_inactive();
 }
 
 /// Saves the whole state in storage.local (the database is off, or failed).
@@ -498,6 +663,11 @@ async fn save_in_storage_local() {
 /// The state is in storage.local now: it moves to the database on its next save there, and
 /// with the database switched off, the database is emptied (it would be out of date).
 async fn after_storage_local_save() {
+    // Pages ask for what changed (as with the database).
+    let revision = with_state(|s| s.revision);
+    if let Err(e) = pf::storage_set(CHANGED_KEY, &revision.to_string()).await {
+        log(&format!("could not tell pages about the save: {e}"));
+    }
     LEGACY_KEYS.with(|k| {
         let mut k = k.borrow_mut();
         if !k.iter().any(|x| x == STATE_KEY) {
@@ -509,7 +679,6 @@ async fn after_storage_local_save() {
         match pf::db_clear().await {
             Ok(()) => {
                 DB_HAS_DATA.with(|d| d.set(false));
-                TABS_SAVED.with(|t| t.borrow_mut().clear());
                 NEED_FULL.with(|n| n.set(true));
             }
             Err(e) => log(&format!("could not empty the database: {e}")),
@@ -738,9 +907,15 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         }
         Event::CookieSet { cookie } => on_cookie_set(cookie).await,
         Event::Alarm { name } if name == SNAPSHOT_ALARM => {
-            if with_state(|s| s.auto_snapshot_all(now)) > 0 {
-                persist().await;
+            // Inactive sessions are read back only if their tabs changed since.
+            let changed = with_state(|s| s.snapshot_candidates());
+            IN_FLIGHT.with(|n| n.set(n.get() + 1));
+            if let Err(e) = ensure_loaded(Some(&changed)).await {
+                log(&format!("automatic snapshots: {e}"));
             }
+            with_state(|s| s.auto_snapshot_all(now));
+            IN_FLIGHT.with(|n| n.set(n.get().saturating_sub(1)));
+            persist().await;
         }
         Event::Alarm { name } => {
             if let Some(id) = name.strip_prefix(ALARM_PREFIX).and_then(|s| s.parse::<Id>().ok())
@@ -752,8 +927,18 @@ async fn handle_event(ev: JsValue) -> Result<JsValue, String> {
         Event::Message { payload } => {
             let json = match serde_json::from_str::<Command>(&payload) {
                 Ok(cmd) => {
-                    let full = cmd == Command::GetState;
-                    reply_json(&mut execute(cmd).await, full)
+                    let ask = match &cmd {
+                        Command::GetState { sessions, with_active, open_tabs, known } => {
+                            Some((sessions.clone(), *with_active, *open_tabs, known.iter().copied().collect()))
+                        }
+                        _ => None,
+                    };
+                    // Tabs read back for it stay until the reply is written, then go.
+                    IN_FLIGHT.with(|n| n.set(n.get() + 1));
+                    let json = reply_json(&mut execute(cmd).await, ask);
+                    IN_FLIGHT.with(|n| n.set(n.get().saturating_sub(1)));
+                    evict_inactive();
+                    json
                 }
                 Err(e) => serde_json::to_string(&Response::err(format!("bad command: {e}"))),
             }
@@ -854,9 +1039,17 @@ fn schedule_startup_dedupe() {
         if STARTUP_DEDUPE.with(|d| d.get()).map(|(g, _)| g) != Some(generation) {
             return;
         }
+        // Duplicates are looked for in every session's saved tabs.
+        IN_FLIGHT.with(|n| n.set(n.get() + 1));
+        if let Err(e) = ensure_loaded(None).await {
+            log(&format!("startup de-duplication: {e}"));
+        }
         STARTUP_DEDUPE.with(|d| d.set(None));
         let sessions: Vec<Id> = with_state(|s| s.sessions.iter().map(|s| s.id).collect());
-        match remove_duplicates_in(&sessions, Some(started)).await {
+        let result = remove_duplicates_in(&sessions, Some(started)).await;
+        IN_FLIGHT.with(|n| n.set(n.get().saturating_sub(1)));
+        evict_inactive();
+        match result {
             Ok(0) => {}
             Ok(n) => log(&format!("removed {n} duplicate tab(s) after browser startup")),
             Err(e) => log(&format!("startup de-duplication failed: {e}")),
@@ -894,12 +1087,28 @@ async fn remove_duplicates_in(sessions: &[Id], restored_since: Option<f64>) -> R
 // ---------------------------------------------------------------- commands
 
 async fn execute(cmd: Command) -> Response {
-    if cmd != Command::GetState {
+    if !matches!(cmd, Command::GetState { .. }) {
         // Most commands change what the tab strip should show; the sync is debounced and
         // does nothing when nothing changed.
         schedule_strip_sync();
     }
-    let result = run_command(cmd).await;
+    // The sessions it works on, read back if their tabs aren't all in memory.
+    let need = match (&cmd, needed(&cmd)) {
+        // Sessions the page already has as they are aren't sent: no need to read them back.
+        (Command::GetState { known, .. }, Need::Some(ids)) => Need::Some(with_state(|s| {
+            ids.into_iter().filter(|id| s.session(*id).is_none_or(|x| !known.contains(&(*id, x.tabs_revision)))).collect()
+        })),
+        (_, need) => need,
+    };
+    let loaded = match need {
+        Need::Nothing => Ok(()),
+        Need::Some(ids) => ensure_loaded(Some(&ids)).await,
+        Need::All => ensure_loaded(None).await,
+    };
+    let result = match loaded {
+        Ok(()) => run_command(cmd).await,
+        Err(e) => Err(e),
+    };
     let mut resp = match result {
         Ok(r) => r,
         Err(e) => Response::err(e),
@@ -915,7 +1124,7 @@ fn ok(info: impl Into<String>) -> Result<Response, String> {
 async fn run_command(cmd: Command) -> Result<Response, String> {
     let now = pf::now();
     match cmd {
-        Command::GetState => Ok(Response { ok: true, ..Default::default() }),
+        Command::GetState { .. } => Ok(Response { ok: true, ..Default::default() }),
         Command::CreateSession { name, make_active } => {
             let id = with_state(|s| {
                 let id = s.create_session(&name, now);
@@ -2060,6 +2269,8 @@ async fn embed(model: &str, provider: Option<&ai::AiProvider>, texts: &[String])
 /// Loads a session's vector index (memory, then storage) and brings it up to date with its
 /// tabs, saving it if it changed.
 async fn ensure_index(session: Id, model: &str, provider: Option<&ai::AiProvider>) -> Result<(), String> {
+    // Its tabs are read back (and go again once the command is done).
+    ensure_loaded(Some(&[session])).await?;
     if !VECTORS.with(|v| v.borrow().contains_key(&session)) {
         let stored = if DB_OK.with(Cell::get) { pf::db_get_vectors(session).await.ok().flatten() } else { None };
         let stored = stored.and_then(|json| serde_json::from_str::<VectorIndex>(&json).ok());

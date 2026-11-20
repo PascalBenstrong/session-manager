@@ -141,9 +141,33 @@ pub struct Session {
     /// (`TabEntry::last_closed`); a new one is made when the session's tabs are restored, so
     /// the tabs closed before stop counting as its last opened tabs.
     pub last_closed: String,
-    /// The state revision at which the session's tabs last changed in the database (pages
-    /// read again only the sessions whose value changed).
+    /// The state revision at which the session's tabs last changed (pages ask again only
+    /// for the sessions whose value changed).
     pub tabs_revision: u64,
+    /// How many tabs it has, and how many are open, as sent to pages (which may not have
+    /// its tabs: see `partial`) and saved (the background doesn't keep every tab: see
+    /// `Entries::hidden`).
+    pub counts: TabCounts,
+    /// The sequence number its next tab gets (saved: not all its tabs may be in memory).
+    pub next_seq: u64,
+    /// `tabs_revision` when the last automatic snapshot was considered.
+    pub snapshot_revision: u64,
+    /// Sent to a page without its tabs because they're the same as the ones the page has
+    /// (same `tabs_revision`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
+    /// In a page: its tabs aren't loaded (`entries` is empty, or holds only some open tabs);
+    /// `counts` says how many there are. Never set in the background.
+    #[serde(skip)]
+    pub partial: bool,
+}
+
+/// How many tabs a session has.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct TabCounts {
+    pub tabs: usize,
+    pub open: usize,
 }
 
 /// A saved revision of a session's tab list.
@@ -181,8 +205,28 @@ impl Session {
         self.entries.iter().filter(|e| e.in_last_closed(&self.last_closed))
     }
 
+    /// How many tabs it has (also when a page doesn't have them loaded).
+    pub fn tab_count(&self) -> usize {
+        match self.entries.hidden() {
+            Some(_) => self.entries.total_len(),
+            None if self.partial => self.counts.tabs,
+            None => self.entries.len(),
+        }
+    }
+
+    /// Whether every one of its tabs is in memory.
+    pub fn loaded(&self) -> bool {
+        !self.partial && self.entries.hidden().is_none()
+    }
+
+    /// How many of its tabs are open. O(1) (see `entries.rs`).
     pub fn open_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.is_open()).count()
+        if self.partial { self.counts.open } else { self.entries.open_count() }
+    }
+
+    /// Updates `counts` from the tabs (before sending the session to pages).
+    pub fn refresh_counts(&mut self) {
+        self.counts = TabCounts { tabs: self.entries.total_len(), open: self.entries.open_count() };
     }
 
     /// The most recently accessed entry ("last open tab").

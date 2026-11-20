@@ -17,6 +17,7 @@ pub mod media;
 pub mod model;
 pub mod netlog;
 pub mod organize;
+pub mod page_state;
 pub mod pattern;
 pub mod persist;
 pub mod protocol;

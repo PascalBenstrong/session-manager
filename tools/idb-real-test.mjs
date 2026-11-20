@@ -85,7 +85,7 @@ async function compareConformance(evalJson) {
  * The extension end to end. `page` evaluates in an extension page; `reload` restarts the
  * extension and returns a fresh page evaluator.
  */
-async function extensionChecks(page, reload, api) {
+async function extensionChecks(page, reload, api, openPage) {
   const command = async (p, cmd) => {
     const r = JSON.parse(await p(`smPlatform.sendMessage(${JSON.stringify(JSON.stringify(cmd))})`));
     if (!r.ok) throw new Error(`${cmd.cmd}: ${r.error}`);
@@ -132,6 +132,15 @@ async function extensionChecks(page, reload, api) {
   check('migration: tabs open at the last save can be restored (last open tabs)',
     old.entries.filter((e) => e.tab_id == null && e.last_closed && e.last_closed === old.last_closed).map((e) => e.id).join() === '12');
 
+  // ---- the manager page holds only what it shows, and follows changes
+  const manager = await openPage('manager.html');
+  const pageState = () => manager('JSON.stringify(globalThis.smPageState ?? null)').then(JSON.parse);
+  const shown = await until('the manager page state', async () => (await pageState())?.sessions?.length && pageState());
+  const reading0 = shown.sessions.find((x) => x.id === st.sessions.find((y) => y.name === 'Reading').id);
+  const old0 = shown.sessions.find((x) => x.id === old.id);
+  check('page: the session shown is loaded', !old0.partial && old0.tabs === old0.count && old0.count >= 3, JSON.stringify(old0));
+  check('page: other sessions are not loaded, only counted', reading0.partial && reading0.tabs === 0 && reading0.count === 1, JSON.stringify(reading0));
+
   // ---- saving only what changed
   const before = await dbState(page);
   await command(page, { cmd: 'TagEntries', entries: [{ session: old.id, entry: 4 }], tag: 'changed', add: true });
@@ -148,6 +157,12 @@ async function extensionChecks(page, reload, api) {
   const changedKey = await local(page, 'sm_changed');
   check('pages are told about the save (sm_changed)', Number(changedKey) === after.header.revision, String(changedKey));
   check('the other tabs were left as they were', before.tabs.length === after.tabs.length);
+  const followed = await until('the page to follow the change', async () => {
+    const p = await pageState();
+    return p.revision >= after.header.revision && p;
+  }).catch(() => null);
+  check('page: follows a change made elsewhere (new revision, still only its sessions)',
+    followed && followed.sessions.find((x) => x.id === reading.id).partial, JSON.stringify(followed));
 
   // ---- pages read it from IndexedDB (another page's view of the change)
   const read = JSON.parse(await page(`smPlatform.dbReadState({ ${old.id}: 0, ${reading.id}: ${reading.tabs_revision} }).then(JSON.stringify)`));
@@ -197,8 +212,8 @@ async function chromium() {
     return null;
   });
   console.log(`extension ${extId} loaded in ${which}`);
-  const open = async () => {
-    const { targetId } = await cdp.send('Target.createTarget', { url: `chrome-extension://${extId}/inspector.html` });
+  const open = async (path = 'inspector.html') => {
+    const { targetId } = await cdp.send('Target.createTarget', { url: `chrome-extension://${extId}/${path}` });
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
     const evaluate = async (expression) => {
       const r = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
@@ -222,7 +237,7 @@ async function chromium() {
     });
     return open();
   };
-  await extensionChecks(page, reload, 'chrome');
+  await extensionChecks(page, reload, 'chrome', open);
 }
 
 async function connect(url) {
@@ -276,10 +291,11 @@ async function firefox() {
   console.log(`extension ${extension} installed in firefox`);
   const base = `moz-extension://${uuid}`;
   const chromeWin = (await bidi.send('browsingContext.getTree', { 'moz:scope': 'chrome' })).contexts[0].context;
-  const open = async () => {
+  const open = async (path = 'inspector.html') => {
     const known = new Set((await bidi.send('browsingContext.getTree', {})).contexts.map((c) => c.context));
     await bidi.send('script.evaluate', {
-      expression: `gBrowser.addTab(${JSON.stringify(`${base}/inspector.html`)}, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() }) && true`,
+      // Selected: pages in background tabs don't draw frames (the UI updates as it draws).
+      expression: `(gBrowser.selectedTab = gBrowser.addTab(${JSON.stringify(`${base}/${path}`)}, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() })) && true`,
       target: { context: chromeWin },
       awaitPromise: false,
     });
@@ -307,7 +323,7 @@ async function firefox() {
     await sleep(2500);
     return open();
   };
-  await extensionChecks(page, reload, 'browser');
+  await extensionChecks(page, reload, 'browser', open);
 }
 
 async function connectBidi(url) {

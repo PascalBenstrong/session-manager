@@ -67,21 +67,28 @@ class FakeIndex {
   get keyPath() {
     return this.objectStore._data().indexes.get(this.name);
   }
+  _rows(key) {
+    const path = this.keyPath;
+    const rows = [];
+    for (const [pk, v] of this.objectStore._data().records) {
+      const ik = v != null ? v[path] : undefined;
+      if (!validKey(ik)) continue; // not indexed
+      if (key === undefined || cmp(ik, key) === 0) rows.push([ik, pk, v]);
+    }
+    return rows.sort((a, b) => cmp(a[0], b[0]) || cmp(a[1], b[1]));
+  }
   getAll(key) {
     const tx = this.objectStore.transaction;
     tx._check();
     if (key !== undefined && !validKey(key)) throw domError('DataError');
-    return tx._request(this, () => {
-      const path = this.keyPath;
-      const rows = [];
-      for (const [pk, v] of this.objectStore._data().records) {
-        const ik = v != null ? v[path] : undefined;
-        if (!validKey(ik)) continue; // not indexed
-        if (key === undefined || cmp(ik, key) === 0) rows.push([ik, pk, v]);
-      }
-      rows.sort((a, b) => cmp(a[0], b[0]) || cmp(a[1], b[1]));
-      return rows.map((r) => structuredClone(r[2]));
-    });
+    return tx._request(this, () => this._rows(key).map((r) => structuredClone(r[2])));
+  }
+  /** Primary keys, in the same order as getAll. */
+  getAllKeys(key) {
+    const tx = this.objectStore.transaction;
+    tx._check();
+    if (key !== undefined && !validKey(key)) throw domError('DataError');
+    return tx._request(this, () => this._rows(key).map((r) => r[1]));
   }
 }
 

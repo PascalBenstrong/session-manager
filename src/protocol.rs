@@ -17,8 +17,8 @@ pub const STATE_KEY: &str = "sm_state";
 /// The sessions' snapshots (session id -> snapshots), kept apart from the state: they are
 /// large and rarely change, so ordinary saves (and the state sent to pages) leave them out.
 pub const SNAPSHOTS_KEY: &str = "sm_snapshots";
-/// Set to the revision after each save to the database: pages then read the state from it
-/// (see `persist.rs`). With the database off, pages follow STATE_KEY instead.
+/// Set to the revision after each save (to the database or storage.local): pages then ask
+/// for what changed in the sessions they show (GetState with `known`).
 pub const CHANGED_KEY: &str = "sm_changed";
 /// A development build kept each session's tabs under `sm_session_<id>` (a [`SessionFile`]),
 /// with STATE_KEY's `version` = [`SPLIT_VERSION`]. Read once, to migrate.
@@ -39,10 +39,37 @@ pub struct SessionFile {
     pub entries: Vec<crate::model::TabEntry>,
 }
 
+/// Open tabs a page wants from sessions it doesn't load whole.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OpenTabs {
+    #[default]
+    None,
+    /// Every open tab.
+    All,
+    /// The open tabs of one window (the sidebar).
+    Window(TabId),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "cmd")]
 pub enum Command {
-    GetState,
+    /// The state. Pages ask for only what they show: the tabs of `sessions` (`None`: every
+    /// session), except those whose `tabs_revision` is the one in `known` (they're sent
+    /// `unchanged`, without tabs), and from the other sessions only the open tabs
+    /// `open_tabs` says. Every session comes with its tab `counts`.
+    GetState {
+        #[serde(default)]
+        sessions: Option<Vec<Id>>,
+        #[serde(default)]
+        open_tabs: OpenTabs,
+        /// Also the active session's tabs (a page starting doesn't know which it is).
+        #[serde(default)]
+        with_active: bool,
+        /// (session, `tabs_revision`) of the sessions the page has. (Pairs: in a tagged
+        /// enum, JSON object keys can't be read as numbers.)
+        #[serde(default)]
+        known: Vec<(Id, u64)>,
+    },
     CreateSession {
         name: String,
         make_active: bool,
@@ -268,7 +295,7 @@ pub struct Response {
     pub report: Option<CleanupReport>,
     pub capabilities: Option<Capabilities>,
     /// The state revision saved when the command finished (replies other than GetState,
-    /// which carries the state itself): pages newer than it have nothing to read.
+    /// which carries the state itself): pages ask for what changed when it's newer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
     /// Results of [`Command::VectorSearch`], best first.

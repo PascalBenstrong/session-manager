@@ -148,6 +148,7 @@ export async function idbConformance(idb, createDb) {
     note('read: index with a string key', byX);
     note('read: records without the index property are still stored', tabKeys);
     note('read: index getAll() lists only indexed records', (await req(db.transaction('tabs').objectStore('tabs').index('session').getAll())).map((v) => v.j));
+    note('read: index getAllKeys(2), same order as getAll', await req(db.transaction('tabs').objectStore('tabs').index('session').getAllKeys(2)));
   }
 
   // ---- transaction lifetime
@@ -250,6 +251,38 @@ export async function idbConformance(idb, createDb) {
   await api.clear();
   note('api: cleared', await api.load());
   note('api: vectors survive clear', await api.getVectors(2));
+
+  // Upgrading a version 1 database (records without `a`) to the extension's version.
+  const UP = 'sm-conformance-upgrade';
+  await req(idb.deleteDatabase(UP));
+  const v1 = await new Promise((ok, fail) => {
+    const r = idb.open(UP, 1);
+    r.onupgradeneeded = () => {
+      r.result.createObjectStore('meta');
+      r.result.createObjectStore('tabs').createIndex('session', 's');
+      r.result.createObjectStore('vectors');
+    };
+    r.onsuccess = () => ok(r.result);
+    r.onerror = () => fail(r.error);
+  });
+  {
+    const tx = v1.transaction('tabs', 'readwrite');
+    const w = done(tx);
+    tx.objectStore('tabs').put({ s: 1, o: 0, j: 'old, no a' }, 1);
+    tx.objectStore('tabs').put({ s: 2, o: 0, a: 1, j: 'open' }, 2);
+    await w;
+  }
+  v1.close();
+  const up = createDb(UP, () => idb);
+  const upDb = await up.open();
+  note('api: upgraded: version, stores, indexes', [upDb.version, [...upDb.objectStoreNames], [...upDb.transaction('tabs').objectStore('tabs').indexNames]]);
+  await up.write(JSON.stringify({ active_session: 1, sessions: [] }), [{ id: 3, s: 2, o: 1, a: 0, j: 'closed' }, { id: 4, s: 3, o: 0, a: 1, j: 'open in 3' }], [], false, []);
+  note('api: loadPartial: the active session and open tabs', await up.loadPartial());
+  note('api: loadSessions', await up.loadSessions([2, 9]));
+  await up.write(JSON.stringify({ active_session: 1, sessions: [] }), [{ id: 5, s: 2, o: 2, a: 0, j: 'put after the delete' }], [], false, [2]);
+  note('api: a session deleted, then a tab put in it in the same write', await up.load());
+  upDb.close();
+  await req(idb.deleteDatabase(UP));
 
   // A second connection (another page) sees what the first wrote.
   const reader = createDb(API, () => idb);

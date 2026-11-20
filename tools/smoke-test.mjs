@@ -1163,6 +1163,79 @@ await step('command replies stay small with many tabs (only GetState carries the
   await tick();
 });
 
+await step('GetState sends a page only what it shows, and only what changed', async () => {
+  const get = async (args) => {
+    const r = JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'GetState', ...args })));
+    assert.ok(r.ok && r.state, `GetState ${JSON.stringify(args)}: ${r.error}`);
+    return r.state;
+  };
+  const all = await get({});
+  const sid = all.active_session;
+  const other = (await send({ cmd: 'CreateSession', name: 'Partial', make_active: false })).state.sessions.find((x) => x.name === 'Partial').id;
+  const t = await api.tabs.create({ url: 'https://partial-a.example/', windowId: 5 });
+  await tick();
+  // Only the session asked for has tabs; every session says how many it has.
+  const one = await get({ sessions: [other] });
+  const mine = one.sessions.find((x) => x.id === sid);
+  assert.equal(mine.entries.length, 0, 'tabs of sessions not asked for are not sent');
+  assert.equal(mine.counts.tabs, all.sessions.find((x) => x.id === sid).entries.length + 1);
+  assert.ok(mine.counts.open > 0);
+  // Open tabs of one window from the other sessions (the sidebar).
+  const side = await get({ sessions: [other], open_tabs: { Window: 5 } });
+  assert.deepEqual(side.sessions.find((x) => x.id === sid).entries.map((e) => e.url), ['https://partial-a.example/']);
+  // Asked again with what it knows: unchanged sessions come without tabs.
+  const full = await get({ sessions: [sid] });
+  const known = [[sid, full.sessions.find((x) => x.id === sid).tabs_revision]];
+  const again = await get({ sessions: [sid], known });
+  assert.ok(again.sessions.find((x) => x.id === sid).unchanged, 'unchanged: not sent again');
+  assert.equal(again.sessions.find((x) => x.id === sid).entries.length, 0);
+  // A change is announced (sm_changed) and then sent.
+  const before = Number(storage.sm_changed);
+  tabs.get(t.id).title = 'Changed title';
+  ev.updated.fire(t.id, { title: 'Changed title' }, clone(tabs.get(t.id)));
+  await tick();
+  assert.ok(Number(storage.sm_changed) > before, 'pages are told');
+  const after = await get({ sessions: [sid], known });
+  const s = after.sessions.find((x) => x.id === sid);
+  assert.ok(!s.unchanged && s.entries.some((e) => e.title === 'Changed title'));
+  await api.tabs.remove(t.id);
+  await tick();
+});
+
+await step('inactive sessions keep only open tabs in memory; their saved tabs are read back when needed', async () => {
+  const get = async (args) => JSON.parse(await pf.sendMessage(JSON.stringify({ cmd: 'GetState', ...args }))).state;
+  const first = (await get({})).active_session;
+  const lazyId = (await send({ cmd: 'CreateSession', name: 'Lazy', make_active: true })).state.sessions.find((x) => x.name === 'Lazy').id;
+  const t1 = await api.tabs.create({ url: 'https://lazy-saved.example/', windowId: 9 });
+  const t2 = await api.tabs.create({ url: 'https://lazy-open.example/', windowId: 9 });
+  await tick();
+  const lazy = (await get({})).sessions.find((x) => x.id === lazyId);
+  const saved = lazy.entries.find((e) => e.url === 'https://lazy-saved.example/');
+  await send({ cmd: 'CloseEntries', entries: [{ session: lazyId, entry: saved.id }] });
+  await send({ cmd: 'SetActiveSession', id: first });
+  // Black box: change the saved tab in the database only. If the background still had it in
+  // memory, it would answer from memory; it reads it back from the database instead.
+  const rec = dbTabs().get(saved.id);
+  dbTabs().set(saved.id, { ...rec, j: JSON.stringify({ ...JSON.parse(rec.j), title: 'only in the database' }) });
+  const back = (await get({ sessions: [lazyId] })).sessions.find((x) => x.id === lazyId);
+  assert.equal(back.entries.find((e) => e.id === saved.id).title, 'only in the database', 'read back from the database');
+  assert.equal(back.counts.tabs, 2);
+  // Its open tab is still followed while the session is inactive.
+  tabs.get(t2.id).title = 'Still followed';
+  ev.updated.fire(t2.id, { title: 'Still followed' }, clone(tabs.get(t2.id)));
+  await tick();
+  const rec2 = [...dbTabs().values()].find((r) => r.j.includes('lazy-open'));
+  assert.equal(JSON.parse(rec2.j).title, 'Still followed');
+  assert.equal(rec2.a, 1, 'indexed as open');
+  // Changing a saved tab of the inactive session reads it back, changes it, saves it.
+  await send({ cmd: 'TagEntries', entries: [{ session: lazyId, entry: saved.id }], tag: 'lazy', add: true });
+  const tagged = JSON.parse(dbTabs().get(saved.id).j);
+  assert.deepEqual(tagged.tags, ['lazy']);
+  assert.equal(tagged.title, 'only in the database', 'nothing older came back');
+  await api.tabs.remove([t1.id, t2.id].filter((id) => tabs.has(id)));
+  await tick();
+});
+
 await step('worker jobs: search on the state sent, imports, WebM errors', async () => {
   // What web/worker.js runs (the worker loads this same wasm module).
   const run = (op, text, bytes = new Uint8Array()) => glue.worker_run(op, text, bytes);

@@ -426,10 +426,12 @@ export async function tabOutWithGroup(api, t, titles = new Map()) {
 // ---- IndexedDB ----
 // The extension's database (smPlatform.db* use the 'session-manager' one). Stores: meta
 // ('state': the state without tabs or snapshots, as JSON), tabs (key: entry id; { s:
-// session id, j: entry JSON }, indexed by session) and vectors (key: session id; its vector
-// index as JSON). The background writes; pages read (same extension origin).
+// session id, o: position, a: 1 if open else 0, j: entry JSON }, indexed by session and by
+// `a`) and vectors (key: session id; its vector index as JSON). Only the background writes.
+// Version 2 added the index of open tabs (the background reads only those of inactive
+// sessions).
 // tools/idb-conformance.js runs this against real browsers and the test fake.
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 const idbReq = (r) =>
   new Promise((resolve, reject) => {
@@ -464,7 +466,11 @@ export function createDb(name, factory = () => globalThis.indexedDB) {
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
-        if (!db.objectStoreNames.contains('tabs')) db.createObjectStore('tabs').createIndex('session', 's');
+        const tabs = db.objectStoreNames.contains('tabs') ? req.transaction.objectStore('tabs') : db.createObjectStore('tabs');
+        if (!tabs.indexNames.contains('session')) tabs.createIndex('session', 's');
+        // Records saved before (version 1) have no `a`: the background reads them all once
+        // and saves them again (the state says which layout it was saved with).
+        if (!tabs.indexNames.contains('open')) tabs.createIndex('open', 'a');
         if (!db.objectStoreNames.contains('vectors')) db.createObjectStore('vectors');
       };
       req.onsuccess = () => {
@@ -501,21 +507,55 @@ export function createDb(name, factory = () => globalThis.indexedDB) {
         idbReq(tabs.getAllKeys()),
         idbReq(tabs.getAll()),
       ]);
-      return { header: header ?? null, tabs: values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, j: v.j })) };
+      return { header: header ?? null, tabs: values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, a: v.a ?? 0, j: v.j })) };
     },
 
     /**
-     * One transaction: empties the tabs first if `clear`, puts tabs ([{ id, s, o, j }]: id,
-     * session, position, JSON), deletes tabs (ids) and sets the state. Nothing is written if
-     * any part fails.
+     * The state, the active session's tabs and the open tabs of every session, in one
+     * transaction: what the background keeps in memory. { header, tabs: [{ id, s, o, a, j }] }
+     * (a tab can be listed twice).
      */
-    async write(header, puts, dels, clear = false) {
+    async loadPartial() {
+      const db = await open();
+      const tx = db.transaction(['meta', 'tabs'], 'readonly');
+      const header = await idbReq(tx.objectStore('meta').get('state'));
+      if (!header) return { header: null, tabs: [] };
+      const active = JSON.parse(header).active_session;
+      const tabs = tx.objectStore('tabs');
+      const [sk, sv, ok, ov] = await Promise.all([
+        idbReq(tabs.index('session').getAllKeys(active)),
+        idbReq(tabs.index('session').getAll(active)),
+        idbReq(tabs.index('open').getAllKeys(1)),
+        idbReq(tabs.index('open').getAll(1)),
+      ]);
+      const rec = (keys, values) => values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, a: v.a ?? 0, j: v.j }));
+      return { header, tabs: rec(sk, sv).concat(rec(ok, ov)) };
+    },
+
+    /** Every tab of these sessions: [{ id, s, o, a, j }]. */
+    async loadSessions(sessions) {
+      const db = await open();
+      const index = db.transaction('tabs', 'readonly').objectStore('tabs').index('session');
+      const lists = await Promise.all(sessions.map((id) => Promise.all([idbReq(index.getAllKeys(id)), idbReq(index.getAll(id))])));
+      return lists.flatMap(([keys, values]) => values.map((v, i) => ({ id: keys[i], s: v.s, o: v.o ?? 0, a: v.a ?? 0, j: v.j })));
+    },
+
+    /**
+     * One transaction: empties the tabs first if `clear`, deletes every tab of the sessions
+     * `delSessions`, puts tabs ([{ id, s, o, a, j }]), deletes tabs (ids) and sets the
+     * state. Nothing is written if any part fails.
+     */
+    async write(header, puts, dels, clear = false, delSessions = []) {
       const db = await open();
       const tx = db.transaction(['meta', 'tabs'], 'readwrite');
       const done = idbDone(tx);
       const store = tx.objectStore('tabs');
       if (clear) store.clear();
-      for (const p of puts) store.put({ s: p.s, o: p.o ?? 0, j: p.j }, p.id);
+      if (delSessions.length) {
+        const keys = await Promise.all(delSessions.map((id) => idbReq(store.index('session').getAllKeys(id))));
+        for (const k of keys.flat()) store.delete(k);
+      }
+      for (const p of puts) store.put({ s: p.s, o: p.o ?? 0, a: p.a ?? 0, j: p.j }, p.id);
       for (const id of dels) store.delete(id);
       tx.objectStore('meta').put(header, 'state');
       await done;
@@ -1322,7 +1362,9 @@ export function installPlatform(api, overrides = {}) {
       await smDb.open();
     },
     dbLoad: () => smDb.load(),
-    dbWrite: (header, puts, dels, clear) => smDb.write(header, puts, dels, clear),
+    dbWrite: (header, puts, dels, clear, delSessions) => smDb.write(header, puts, dels, clear, delSessions),
+    dbLoadPartial: () => smDb.loadPartial(),
+    dbLoadSessions: (sessions) => smDb.loadSessions(sessions),
     dbClear: () => smDb.clear(),
     dbReadState: (known) => smDb.readState(known),
     dbGetVectors: (session) => smDb.getVectors(session),
