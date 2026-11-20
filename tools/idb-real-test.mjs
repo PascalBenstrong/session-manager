@@ -110,7 +110,9 @@ async function extensionChecks(page, reload, api, openPage) {
     next_id: 30,
     revision: 1_000_000,
   };
-  await page(`smPlatform.dbClear().then(() => ${api}.storage.local.set({ sm_state: ${JSON.stringify(JSON.stringify(legacy))} })).then(() => true)`);
+  // ...and its snapshots, kept apart in storage.local (as 0.14 and 0.15 did).
+  const legacySnaps = { 1: [{ id: 25, name: 'Before', created_at: 1, auto: false, entries: [{ id: 26, url: 'https://snap.example/', title: 'S' }] }] };
+  await page(`smPlatform.dbClear().then(() => ${api}.storage.local.set({ sm_state: ${JSON.stringify(JSON.stringify(legacy))}, sm_snapshots: ${JSON.stringify(JSON.stringify(legacySnaps))} })).then(() => true)`);
   page = await reload();
   const migrated = await until('the migrated state in IndexedDB', async () => {
     const d = await dbState(page);
@@ -123,12 +125,20 @@ async function extensionChecks(page, reload, api, openPage) {
     isDeepStrictEqual(urls(1), ['https://old.example/a', 'https://old.example/b', 'https://old.example/c']) && isDeepStrictEqual(urls(2), ['https://read.example/']),
     JSON.stringify(migrated.tabs.map(({ id, s, o, url }) => ({ id, s, o, url }))));
   check('migration: the state record holds no tabs', migrated.header.sessions.every((s) => !s.entries || s.entries.length === 0));
+  const snapRecords = JSON.parse(await page('smPlatform.dbLoadSnapshots([1]).then(JSON.stringify)'));
+  check('migration: snapshots are in the database, with their tabs',
+    snapRecords.length === 1 && JSON.parse(snapRecords[0].j).entries[0].url === 'https://snap.example/', JSON.stringify(snapRecords));
+  check('migration: the old snapshots key is removed', (await until('sm_snapshots removed', async () => (await local(page, 'sm_snapshots')) === null ? 'gone' : null)) === 'gone');
   check('migration: the old storage.local state is removed', (await until('sm_state removed', async () => (await local(page, 'sm_state')) === null ? 'gone' : null)) === 'gone');
   const st = (await command(page, { cmd: 'GetState' })).state;
   const old = st.sessions.find((s) => s.name === 'Old work');
   const seededOrder = (ids) => ids.filter((id) => seeded.has(id));
   check('migration: the tab order is kept (not id order)', isDeepStrictEqual(seededOrder(old?.entries.map((e) => e.id) ?? []), [10, 4, 12]), JSON.stringify(old?.entries.map((e) => e.id)));
   check('migration: the revision continues', st.revision > legacy.revision, String(st.revision));
+  const described = old.snapshots.find((x) => x.id === 25);
+  check('snapshots: the state describes them without their tabs', described && described.tabs === 1 && described.entries.length === 0, JSON.stringify(described));
+  const full = (await command(page, { cmd: 'GetSnapshots', session: old.id })).snapshots;
+  check('snapshots: their tabs are read when asked for', full?.[0]?.entries?.[0]?.url === 'https://snap.example/');
   check('migration: tabs open at the last save can be restored (last open tabs)',
     old.entries.filter((e) => e.tab_id == null && e.last_closed && e.last_closed === old.last_closed).map((e) => e.id).join() === '12');
 

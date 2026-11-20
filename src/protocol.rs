@@ -205,6 +205,17 @@ pub enum Command {
         mode: RestoreMode,
         open: bool,
     },
+    /// A session's snapshots with their tabs (the state describes them without).
+    GetSnapshots {
+        session: Id,
+    },
+    /// Sessions (`None`: all) as a file to save (`Response::file`), with their snapshots if
+    /// `include_snapshots`.
+    ExportSessions {
+        sessions: Option<Vec<Id>>,
+        include_snapshots: bool,
+        filename: String,
+    },
     DeleteSnapshot {
         session: Id,
         snapshot: Id,
@@ -298,6 +309,12 @@ pub struct Response {
     /// which carries the state itself): pages ask for what changed when it's newer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+    /// Snapshots with their tabs ([`Command::GetSnapshots`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<Vec<crate::model::Snapshot>>,
+    /// A file to save: (name, contents) ([`Command::ExportSessions`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<(String, String)>,
     /// Results of [`Command::VectorSearch`], best first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hits: Option<Vec<crate::ai::VectorHit>>,

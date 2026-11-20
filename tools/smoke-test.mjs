@@ -62,8 +62,9 @@ const stored = () => {
 };
 /** The tab records in the database: id -> { s, j }. */
 const dbTabs = () => idb._databases.get('session-manager').stores.get('tabs').records;
-/** Snapshots are saved apart from the state (sm_snapshots: session id -> snapshots). */
-const snapshotsOf = (sid) => JSON.parse(storage.sm_snapshots || '{}')[sid] || [];
+/** A session's snapshots, with their tabs, as saved in the database (snapshots store). */
+const snapshotsOf = (sid) =>
+  [...idb._databases.get('session-manager').stores.get('snapshots').records.values()].filter((r) => r.s === sid).map((r) => JSON.parse(r.j)).sort((a, b) => a.id - b.id);
 /** Frequent changes (playback, titles, many tabs at once) are saved within a second. */
 const saved = () => new Promise((r) => setTimeout(r, 1100));
 let passed = 0;
@@ -229,7 +230,8 @@ await step('snapshots: save, replace (with open), merge, new session', async () 
   const snap = snapshotsOf(sid).at(-1);
   assert.equal(snap.name, 'v1');
   assert.ok(snap.entries.every((e) => e.tab_id == null), 'snapshots hold no live tabs');
-  assert.ok(stored().sessions.every((s) => !s.snapshots || s.snapshots.length === 0), 'the saved state leaves the snapshots out');
+  const described = stored().sessions.find((s) => s.id === sid).snapshots.find((x) => x.id === snap.id);
+  assert.ok(described && described.entries.length === 0 && described.tabs === snap.entries.length, 'the saved state describes snapshots, without their tabs');
 
   // change the session: close one tab, open another
   const victim = stored().sessions.find((s) => s.id === sid).entries.find((e) => e.tab_id != null);
@@ -283,7 +285,7 @@ await step('automatic snapshots run from an alarm', async () => {
   const settings = { ...stored().settings, auto_snapshot_minutes: 30 };
   await send({ cmd: 'UpdateSettings', settings });
   assert.equal(alarms.get('sm-snapshot').periodInMinutes, 30);
-  const total = () => Object.values(JSON.parse(storage.sm_snapshots || '{}')).reduce((n, list) => n + list.length, 0);
+  const total = () => idb._databases.get('session-manager').stores.get('snapshots').records.size;
   const n0 = total();
   ev.alarm.fire({ name: 'sm-snapshot' });
   await tick();

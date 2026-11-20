@@ -179,13 +179,43 @@ pub struct Snapshot {
     pub created_at: f64,
     /// Taken automatically (interval / before a restore). Only these are pruned.
     pub auto: bool,
-    /// Copies of the entries (never linked to live tabs).
+    /// Copies of the entries (never linked to live tabs). Empty while not loaded: the
+    /// background keeps only what describes a snapshot (below); its tabs are in the
+    /// database until a restore, a page or an export needs them.
     pub entries: Vec<TabEntry>,
+    /// How many tabs it has.
+    pub tabs: usize,
+    /// [`urls_hash`] of its tabs (automatic snapshots compare it with the session's).
+    pub urls_hash: u64,
+}
+
+/// A fingerprint of a set of URLs.
+pub fn urls_hash<'a>(urls: impl IntoIterator<Item = &'a str>) -> u64 {
+    let set: BTreeSet<&str> = urls.into_iter().collect();
+    let h = set.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, u| crate::ai::hash(u) ^ h.rotate_left(5).wrapping_mul(0x0100_0000_01b3));
+    // Kept within 53 bits: JavaScript numbers hold it exactly.
+    h & ((1 << 53) - 1)
 }
 
 impl Snapshot {
     pub fn urls(&self) -> BTreeSet<&str> {
         self.entries.iter().map(|e| e.url.as_str()).collect()
+    }
+
+    /// Sets `tabs` and `urls_hash` from the tabs (taken, imported, or migrated).
+    pub fn seal(&mut self) {
+        self.tabs = self.entries.len();
+        self.urls_hash = urls_hash(self.entries.iter().map(|e| e.url.as_str()));
+    }
+
+    /// Whether its tabs are in memory (a snapshot with no tabs always is).
+    pub fn loaded(&self) -> bool {
+        self.entries.len() == self.tabs
+    }
+
+    /// What describes it, without its tabs.
+    pub fn meta(&self) -> Snapshot {
+        Snapshot { entries: Vec::new(), ..self.clone() }
     }
 }
 

@@ -37,7 +37,7 @@ use crate::dedupe::{DedupeOptions, DuplicateGroup, Scope, find_duplicates};
 use crate::model::{AppState, EntryRef, Id, Session, Snapshot, TabId};
 use crate::page_state::{self, Want};
 use crate::platform as pf;
-use crate::protocol::{CHANGED_KEY, Capabilities, Command, OpenTabs, Response, SNAPSHOTS_KEY};
+use crate::protocol::{CHANGED_KEY, Capabilities, Command, OpenTabs, Response};
 use widgets::{badge, icon_button, nav_item, primary_button, segmented, text_input};
 
 /// Width from which the sidebar layout is used.
@@ -66,8 +66,8 @@ pub async fn start(canvas_id: &str, mode: &str) -> Result<(), JsValue> {
 #[derive(Default)]
 struct Inbox {
     responses: Vec<Response>,
-    /// The newest snapshots saved (SNAPSHOTS_KEY), not read yet; same as `pushed_state`.
-    pushed_snapshots: Option<JsValue>,
+    /// The reply to GetSnapshots, with what it was asked for (see `sync_snapshots`).
+    snapshots_reply: Option<((Id, Vec<Id>), Response)>,
     /// The newest revision the background saved (CHANGED_KEY), not acted on yet.
     changed: Option<u64>,
     /// The reply to this page's GetState (see `sync_state`).
@@ -226,18 +226,18 @@ pub(crate) struct ViewCtx<'a> {
     pub state: &'a AppState,
     pub caps: &'a Capabilities,
     pub viewed: Id,
-    /// The sessions' snapshots (not in `state`: they are kept apart, see SNAPSHOTS_KEY).
+    /// The snapshots of the session shown, with their tabs, once asked for (the state
+    /// describes every session's snapshots without their tabs).
     pub snapshots: &'a BTreeMap<Id, Vec<Snapshot>>,
 }
 
 impl ViewCtx<'_> {
-    pub fn snapshots_of(&self, session: Id) -> &[Snapshot] {
-        self.snapshots.get(&session).map_or(&[], Vec::as_slice)
-    }
-
-    /// A copy of a session with its snapshots (to export it).
-    pub fn with_snapshots(&self, session: &Session) -> Session {
-        Session { snapshots: self.snapshots_of(session.id).to_vec(), ..session.clone() }
+    /// A session's snapshots: with their tabs if they were asked for, else what describes them.
+    pub fn snapshots_of<'b>(&'b self, session: &'b Session) -> &'b [Snapshot] {
+        match self.snapshots.get(&session.id) {
+            Some(full) if full.iter().map(|x| x.id).eq(session.snapshots.iter().map(|x| x.id)) => full,
+            _ => &session.snapshots,
+        }
     }
 }
 
@@ -267,8 +267,10 @@ pub struct App {
     state_asking: Option<Want>,
     state_newer: Option<u64>,
     state_full_again: bool,
-    /// Snapshots are read (and followed) only once a view needs them.
-    snapshots_loading: bool,
+    /// The snapshots shown (one session's, with their tabs): for which session and snapshot
+    /// list, and whether they're being asked for.
+    snapshots_key: Option<(Id, Vec<Id>)>,
+    snapshots_asking: bool,
     caps: Capabilities,
     status: Option<Status>,
     view: View,
@@ -341,7 +343,8 @@ impl App {
             state_asking: None,
             state_newer: None,
             state_full_again: false,
-            snapshots_loading: false,
+            snapshots_key: None,
+            snapshots_asking: false,
             caps: Capabilities::default(),
             status: None,
             view: View::Tabs,
@@ -433,33 +436,26 @@ impl App {
         });
     }
 
-    /// Reads the snapshots and follows them (only once a view shows them: they hold copies of
-    /// every session's tabs).
-    fn load_snapshots(&mut self) {
-        if self.snapshots_loading {
+    /// Asks for the snapshots (with their tabs) of the session shown in the Snapshots view,
+    /// when they changed. Only that session's: the others' stay in the database.
+    fn sync_snapshots(&mut self) {
+        if self.popup || self.sidebar || self.view != View::Backup || self.snapshots_asking {
             return;
         }
-        self.snapshots_loading = true;
-        let pushed = self.inbox.clone();
-        let ctx = self.ctx.clone();
-        let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
-            if v.is_string() {
-                pushed.borrow_mut().pushed_snapshots = Some(v);
-                ctx.request_repaint();
-            }
-        });
-        pf::on_state_changed(SNAPSHOTS_KEY, cb.as_ref().unchecked_ref());
-        cb.forget();
+        let Some(state) = &self.state else { return };
+        let viewed = self.viewed_session.unwrap_or(state.active_session);
+        let Some(session) = state.session(viewed) else { return };
+        let key: (Id, Vec<Id>) = (viewed, session.snapshots.iter().map(|x| x.id).collect());
+        if self.snapshots_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.snapshots_asking = true;
         let inbox = self.inbox.clone();
         let ctx = self.ctx.clone();
         spawn_local(async move {
-            if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
-                let mut inbox = inbox.borrow_mut();
-                if inbox.pushed_snapshots.is_none() {
-                    inbox.pushed_snapshots = Some(JsValue::from_str(&json));
-                }
-                ctx.request_repaint();
-            }
+            let resp = pf::send_command(&Command::GetSnapshots { session: viewed }).await;
+            inbox.borrow_mut().snapshots_reply = Some((key, resp));
+            ctx.request_repaint();
         });
     }
 
@@ -478,8 +474,6 @@ impl App {
             match self.view {
                 View::Tabs => self.tabs.needs_all_sessions(),
                 View::Organize => self.organize.needs_all_sessions(),
-                // Saving all sessions to a file.
-                View::Backup => true,
                 _ => false,
             }
         };
@@ -537,10 +531,12 @@ impl App {
             if let Some(w) = inbox.window_id.take() {
                 self.window_id = Some(w);
             }
-            if let Some(json) = inbox.pushed_snapshots.take().and_then(|v| v.as_string())
-                && let Ok(all) = serde_json::from_str::<BTreeMap<Id, Vec<Snapshot>>>(&json)
-            {
-                self.snapshots = all;
+            if let Some((key, r)) = inbox.snapshots_reply.take() {
+                self.snapshots_asking = false;
+                if let Some(snaps) = r.snapshots {
+                    self.snapshots = BTreeMap::from([(key.0, snaps)]);
+                    self.snapshots_key = Some(key);
+                }
             }
             if let Some(rev) = inbox.changed.take() {
                 self.state_newer = Some(self.state_newer.map_or(rev, |w| w.max(rev)));
@@ -577,6 +573,11 @@ impl App {
             }
             if let Some(hits) = r.hits {
                 self.tabs.vector_results(hits);
+            }
+            if let Some((name, text)) = r.file.as_ref()
+                && let Err(e) = pf::download_text(name, text, "application/json")
+            {
+                self.set_status(format!("Could not save the file: {e}"), true);
             }
             // The command saved a newer state: ask for what changed.
             if let Some(rev) = r.revision
@@ -1087,10 +1088,8 @@ impl App {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         self.drain_inbox();
-        if !self.popup && !self.sidebar && self.view == View::Backup {
-            self.load_snapshots();
-        }
         self.sync_state();
+        self.sync_snapshots();
         if let Some(mut inspector) = self.inspector.take() {
             let mut acts = Actions::default();
             inspector.ui(ui, &mut acts, self.state.as_deref());

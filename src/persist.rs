@@ -11,8 +11,13 @@
 //! existing tabs changed, plus O(tabs of a session) for a session whose tabs were added or
 //! removed (its ids are compared with the saved ones to find what to delete). The state
 //! record doesn't hold the tabs or their order, so it doesn't grow with them. Each
-//! session's `tabs_revision` tells pages which sessions' tabs to read again. Snapshots stay
-//! in `storage.local` (`SNAPSHOTS_KEY`).
+//! session's `tabs_revision` tells pages which sessions' tabs to read again.
+//!
+//! Snapshots are in the database too (`snapshots[snapshot id]`: `{ s: session id, j:
+//! snapshot JSON }`, indexed by session), written with the same transaction. They don't
+//! change once taken: a save writes the new ones and deletes the removed ones. The state
+//! keeps only what describes them (`Snapshot::meta`); their tabs are read for a restore,
+//! a page or an export. Earlier versions kept them all in `storage.local` (`SNAPSHOTS_KEY`).
 //!
 //! Earlier versions kept everything in `storage.local`: the state with its tabs under
 //! `STATE_KEY` (up to 0.14), and in a development build each session's tabs under
@@ -55,9 +60,22 @@ impl TabRecord {
 /// and each session's `next_seq`. Older ones are read whole and saved again.
 pub const DB_LAYOUT: u32 = 3;
 
+/// A snapshot as stored in the database.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SnapRecord {
+    pub id: Id,
+    /// Its session.
+    pub s: Id,
+    /// The snapshot with its tabs, as JSON.
+    pub j: String,
+}
+
 /// What to write to the database.
 #[derive(Debug, Default, PartialEq)]
 pub struct WritePlan {
+    /// Snapshots taken since the last save, and snapshots deleted.
+    pub snap_puts: Vec<SnapRecord>,
+    pub snap_dels: Vec<Id>,
     /// Empty the tabs first (the database is out of date: everything is written).
     pub clear: bool,
     pub puts: Vec<TabRecord>,
@@ -112,6 +130,10 @@ pub fn plan_full(state: &mut AppState, seen: &mut HashSet<Id>, revision: u64) ->
 /// Adds a plan that failed to be written to the next one (what the next one writes about
 /// the same tabs is newer and wins).
 pub fn retry(plan: &mut WritePlan, failed: WritePlan) {
+    let snap_puts: HashSet<Id> = plan.snap_puts.iter().map(|r| r.id).collect();
+    let snap_dels: HashSet<Id> = plan.snap_dels.iter().copied().collect();
+    plan.snap_puts.extend(failed.snap_puts.into_iter().filter(|r| !snap_puts.contains(&r.id) && !snap_dels.contains(&r.id)));
+    plan.snap_dels.extend(failed.snap_dels.into_iter().filter(|id| !snap_puts.contains(id) && !snap_dels.contains(id)));
     let puts: HashSet<Id> = plan.puts.iter().map(|r| r.id).collect();
     let dels: HashSet<Id> = plan.dels.iter().copied().collect();
     plan.clear |= failed.clear;
@@ -123,6 +145,57 @@ pub fn retry(plan: &mut WritePlan, failed: WritePlan) {
         }
     }
     // The deleted sessions' tabs are cleared before the puts, which may move some elsewhere.
+}
+
+/// Adds to `plan` the snapshots to write (not in the database yet: `saved`) and to delete
+/// (in the database, no longer in the state). `saved` is updated as if the plan was written.
+pub fn plan_snapshots(state: &AppState, saved: &mut HashSet<Id>, plan: &mut WritePlan) {
+    let mut now: HashSet<Id> = HashSet::new();
+    for s in &state.sessions {
+        for snap in &s.snapshots {
+            now.insert(snap.id);
+            // Not saved yet: its tabs are in memory (it was just taken, imported or migrated).
+            if !saved.contains(&snap.id)
+                && snap.loaded()
+                && let Ok(j) = serde_json::to_string(snap)
+            {
+                plan.snap_puts.push(SnapRecord { id: snap.id, s: s.id, j });
+                saved.insert(snap.id);
+            }
+        }
+    }
+    let gone: Vec<Id> = saved.iter().filter(|id| !now.contains(id)).copied().collect();
+    for id in gone {
+        saved.remove(&id);
+        plan.snap_dels.push(id);
+    }
+    plan.snap_dels.sort_unstable();
+}
+
+/// Lets the tabs of saved snapshots go from memory (they're in the database).
+pub fn strip_snapshots(state: &mut AppState, saved: &HashSet<Id>) {
+    for snap in state.sessions.iter_mut().flat_map(|s| s.snapshots.iter_mut()) {
+        if saved.contains(&snap.id) && !snap.entries.is_empty() {
+            snap.entries = Vec::new();
+        }
+    }
+}
+
+/// Snapshots read from the database (records), with their tabs.
+pub fn read_snapshots(records: &[SnapRecord]) -> Vec<(Id, crate::model::Snapshot)> {
+    records.iter().filter_map(|r| serde_json::from_str::<crate::model::Snapshot>(&r.j).ok().map(|x| (r.s, x))).collect()
+}
+
+/// Puts the tabs of snapshots read from the database into the state's snapshots.
+pub fn load_snapshots(state: &mut AppState, records: &[SnapRecord]) {
+    let mut by_id: HashMap<Id, crate::model::Snapshot> = read_snapshots(records).into_iter().map(|(_, x)| (x.id, x)).collect();
+    for snap in state.sessions.iter_mut().flat_map(|s| s.snapshots.iter_mut()) {
+        if !snap.loaded()
+            && let Some(full) = by_id.remove(&snap.id)
+        {
+            snap.entries = full.entries;
+        }
+    }
 }
 
 /// Forgets every session's changes (the whole state was saved elsewhere), noting which
@@ -143,14 +216,28 @@ pub fn header_json(state: &mut AppState) -> serde_json::Result<String> {
         s.refresh_counts();
         s.next_seq = s.entries.next_seq();
     }
-    let taken: Vec<(Entries, Vec<crate::model::Snapshot>)> =
-        state.sessions.iter_mut().map(|s| (std::mem::take(&mut s.entries), std::mem::take(&mut s.snapshots))).collect();
-    let json = serde_json::to_string(state);
-    for (s, (entries, snapshots)) in state.sessions.iter_mut().zip(taken) {
-        s.entries = entries;
-        s.snapshots = snapshots;
+    with_snapshot_meta(state, |state| {
+        let taken: Vec<Entries> = state.sessions.iter_mut().map(|s| std::mem::take(&mut s.entries)).collect();
+        let json = serde_json::to_string(state);
+        for (s, entries) in state.sessions.iter_mut().zip(taken) {
+            s.entries = entries;
+        }
+        json
+    })
+}
+
+/// Runs `f` with the snapshots' tabs moved out (what describes them stays), and puts them
+/// back: what's saved in the state and sent to pages.
+pub fn with_snapshot_meta<T>(state: &mut AppState, f: impl FnOnce(&mut AppState) -> T) -> T {
+    let taken: Vec<Vec<Vec<TabEntry>>> =
+        state.sessions.iter_mut().map(|s| s.snapshots.iter_mut().map(|x| std::mem::take(&mut x.entries)).collect()).collect();
+    let out = f(state);
+    for (s, snaps) in state.sessions.iter_mut().zip(taken) {
+        for (x, entries) in s.snapshots.iter_mut().zip(snaps) {
+            x.entries = entries;
+        }
     }
-    json
+    out
 }
 
 /// A session's tabs as read from the database: (position, JSON). Unreadable ones are left out.
@@ -651,6 +738,52 @@ mod tests {
         split.sessions[0].entries = Entries::default();
         legacy_with_session_files(&mut split, |id| (id == sid).then(|| file.clone()));
         assert_eq!(split.active().entries, old.active().entries);
+    }
+
+    #[test]
+    fn snapshots_are_written_once_and_their_tabs_let_go() {
+        let mut s = AppState::default();
+        s.on_tab_upsert(&tab(1, "https://a.com/"), 1.0);
+        s.on_tab_upsert(&tab(2, "https://b.com/"), 1.0);
+        let sid = s.active_session;
+        let mut saved = HashSet::new();
+        let first = s.create_snapshot(sid, "one", false, 2.0).unwrap();
+        let mut plan = WritePlan::default();
+        plan_snapshots(&s, &mut saved, &mut plan);
+        assert_eq!(plan.snap_puts.len(), 1);
+        let back = read_snapshots(&plan.snap_puts);
+        assert_eq!(back[0].1.entries.len(), 2, "written with its tabs");
+        assert_eq!(back[0].1.tabs, 2);
+        strip_snapshots(&mut s, &saved);
+        let meta = s.active().snapshot(first).unwrap();
+        assert!(meta.entries.is_empty() && meta.tabs == 2 && !meta.loaded());
+        // The state holds what describes it, not its tabs.
+        let header = header_json(&mut s).unwrap();
+        assert!(header.contains("\"tabs\":2") && !header.contains("https://"));
+
+        // Nothing new: nothing written. Automatic snapshots compare fingerprints, not tabs.
+        let mut plan = WritePlan::default();
+        plan_snapshots(&s, &mut saved, &mut plan);
+        assert!(plan.snap_puts.is_empty() && plan.snap_dels.is_empty());
+        assert_eq!(s.auto_snapshot_all(3.0), 0, "same URLs as the last snapshot (not loaded)");
+        s.on_tab_upsert(&tab(3, "https://c.com/"), 3.0);
+        assert_eq!(s.auto_snapshot_all(4.0), 1);
+
+        // A restore needs the tabs back.
+        assert!(s.restore_snapshot(sid, first, crate::state::RestoreMode::Merge, 5.0).is_err());
+        load_snapshots(
+            &mut s,
+            &back.iter().map(|(sid, x)| SnapRecord { id: x.id, s: *sid, j: serde_json::to_string(x).unwrap() }).collect::<Vec<_>>(),
+        );
+        assert!(s.active().snapshot(first).unwrap().loaded());
+        assert!(s.restore_snapshot(sid, first, crate::state::RestoreMode::Merge, 5.0).is_ok());
+
+        // Deleted: deleted from the database.
+        s.delete_snapshot(sid, first).unwrap();
+        let mut plan = WritePlan::default();
+        plan_snapshots(&s, &mut saved, &mut plan);
+        assert_eq!(plan.snap_dels, [first]);
+        assert_eq!(plan.snap_puts.len(), 1, "the automatic one");
     }
 
     #[test]

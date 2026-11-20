@@ -71,6 +71,8 @@ thread_local! {
     static GUARDS_SYNCED: RefCell<Option<GuardsWanted>> = const { RefCell::new(None) };
     /// The extension's database (IndexedDB) could be opened.
     static DB_OK: Cell<bool> = const { Cell::new(false) };
+    /// The snapshots in the database.
+    static SNAPS_SAVED: RefCell<std::collections::HashSet<Id>> = RefCell::new(Default::default());
     /// A write to the database that failed, written with the next save.
     static RETRY: RefCell<Option<persist::WritePlan>> = const { RefCell::new(None) };
     /// Commands running (inactive sessions' tabs they read back are let go after).
@@ -160,14 +162,12 @@ fn reply_json(resp: &mut Response, ask: Option<PageAsk>) -> serde_json::Result<S
         if with_active && let Some(ids) = &mut sessions {
             ids.push(s.active_session);
         }
-        let taken: Vec<Vec<Snapshot>> = s.sessions.iter_mut().map(|x| std::mem::take(&mut x.snapshots)).collect();
-        let json = page_state::with_page_view(&mut s, sessions.as_deref(), open_tabs, &known, |s| {
-            serde_json::to_string(&Reply { response: resp, state: s })
-        });
-        for (x, snaps) in s.sessions.iter_mut().zip(taken) {
-            x.snapshots = snaps;
-        }
-        json
+        // Snapshots: what describes them (their tabs are asked for with GetSnapshots).
+        persist::with_snapshot_meta(&mut s, |s| {
+            page_state::with_page_view(s, sessions.as_deref(), open_tabs, &known, |s| {
+                serde_json::to_string(&Reply { response: resp, state: s })
+            })
+        })
     })
 }
 
@@ -208,7 +208,8 @@ pub async fn start() -> Result<(), JsValue> {
     refresh_permissions().await;
 
     let mut state = load_state().await;
-    // Snapshots are kept apart (older versions kept them in the state: those stay).
+    // Snapshots kept in storage.local (up to 0.15, or with the database off) join their
+    // sessions; with the database, they move into it at the first save.
     if let Ok(Some(json)) = pf::storage_get(SNAPSHOTS_KEY).await {
         match serde_json::from_str::<std::collections::BTreeMap<Id, Vec<Snapshot>>>(&json) {
             Ok(mut all) => {
@@ -218,6 +219,7 @@ pub async fn start() -> Result<(), JsValue> {
             }
             Err(e) => log(&format!("stored snapshots unreadable: {e}")),
         }
+        LEGACY_KEYS.with(|k| k.borrow_mut().push(SNAPSHOTS_KEY.to_string()));
     }
     state.normalize();
     match pf::query_tabs().await {
@@ -400,6 +402,12 @@ async fn load_state() -> AppState {
         }
         LEGACY_KEYS.with(|k| *k.borrow_mut() = keys);
     }
+    // The snapshots the database has (the state describes them).
+    if source == Source::Database
+        && let Some((s, _)) = &db
+    {
+        SNAPS_SAVED.with(|saved| *saved.borrow_mut() = s.sessions.iter().flat_map(|x| x.snapshots.iter().map(|n| n.id)).collect());
+    }
     match source {
         Source::Database => db.map(|d| d.0).unwrap_or_default(),
         Source::Legacy => legacy.unwrap_or_default(),
@@ -528,8 +536,49 @@ fn may_evict() -> bool {
 /// Lets inactive sessions' closed tabs go from memory (they're in the database).
 fn evict_inactive() {
     if may_evict() {
-        with_state(persist::evict_inactive);
+        with_state(|s| {
+            persist::evict_inactive(s);
+            SNAPS_SAVED.with(|saved| persist::strip_snapshots(s, &saved.borrow()));
+        });
     }
+}
+
+/// Reads back from the database the tabs of the snapshots of these sessions (`None`: all)
+/// that aren't in memory.
+async fn ensure_snapshots(sessions: Option<&[Id]>) -> Result<(), String> {
+    let wanted: Vec<Id> = with_state(|s| {
+        s.sessions
+            .iter()
+            .filter(|x| sessions.is_none_or(|ids| ids.contains(&x.id)))
+            .filter(|x| x.snapshots.iter().any(|n| !n.loaded()))
+            .map(|x| x.id)
+            .collect()
+    });
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    if !DB_OK.with(Cell::get) {
+        return Err("the snapshots can't be read (the database can't be opened)".into());
+    }
+    let records = pf::db_load_snapshots(&wanted).await?;
+    with_state(|s| persist::load_snapshots(s, &records));
+    Ok(())
+}
+
+/// Copies of these sessions (`None`: all) with their tabs, and their snapshots' if
+/// `with_snapshots`, read back as needed (for saving to a file).
+async fn sessions_for_export(sessions: Option<&[Id]>, with_snapshots: bool) -> Result<Vec<crate::model::Session>, String> {
+    ensure_loaded(sessions).await?;
+    if with_snapshots {
+        ensure_snapshots(sessions).await?;
+    }
+    Ok(with_state(|s| {
+        s.sessions
+            .iter()
+            .filter(|x| sessions.is_none_or(|ids| ids.contains(&x.id)))
+            .map(|x| crate::model::Session { snapshots: if with_snapshots { x.snapshots.clone() } else { Vec::new() }, ..x.clone() })
+            .collect()
+    }))
 }
 
 async fn persist() {
@@ -537,12 +586,14 @@ async fn persist() {
     PERSIST_PENDING.with(|p| p.set(false));
     PERSIST_SOON.with(|p| p.set(false));
     let use_db = DB_OK.with(Cell::get) && with_state(|s| s.settings.tracking.database);
-    // storage.local holds everything in one key: every tab must be in memory.
-    if !use_db
-        && with_state(|s| !persist::partial_sessions(s).is_empty())
-        && let Err(e) = ensure_loaded(None).await
-    {
-        return log(&format!("not saved (the saved tabs couldn't be read back): {e}"));
+    // storage.local holds everything (snapshots in their own key): all of it must be in memory.
+    if !use_db {
+        if let Err(e) = ensure_loaded(None).await {
+            return log(&format!("not saved (the saved tabs couldn't be read back): {e}"));
+        }
+        if let Err(e) = ensure_snapshots(None).await {
+            return log(&format!("not saved (the snapshots couldn't be read back): {e}"));
+        }
     }
     // Planned without awaiting, and written first: the database runs transactions in the
     // order they're made, so saves can't land out of order.
@@ -554,8 +605,8 @@ async fn persist() {
             n
         });
         s.revision = next;
-        // Snapshots are saved apart, and only when they changed.
-        let snapshots = (!snapshots_saved(&s)).then(|| {
+        // Without the database, snapshots are saved apart in storage.local, when they changed.
+        let snapshots = (!use_db && !snapshots_saved(&s)).then(|| {
             let all: std::collections::BTreeMap<Id, &Vec<Snapshot>> = s.sessions.iter().map(|x| (x.id, &x.snapshots)).collect();
             (serde_json::to_string(&all), snapshots_fingerprint(&s))
         });
@@ -569,11 +620,16 @@ async fn persist() {
                 let mut seen = seen.borrow_mut();
                 if full { persist::plan_full(&mut s, &mut seen, next) } else { persist::plan_changes(&mut s, &mut seen, next) }
             });
-            if let Some(failed) = RETRY.with(|r| r.borrow_mut().take())
-                && !full
-            {
+            if let Some(failed) = RETRY.with(|r| r.borrow_mut().take()) {
+                // A full rewrite has every tab; only snapshots of a failed write still count.
+                let failed = if full {
+                    persist::WritePlan { snap_puts: failed.snap_puts, snap_dels: failed.snap_dels, ..Default::default() }
+                } else {
+                    failed
+                };
                 persist::retry(&mut plan, failed);
             }
+            SNAPS_SAVED.with(|saved| persist::plan_snapshots(&s, &mut saved.borrow_mut(), &mut plan));
             persist::header_json(&mut s).map(|header| Ok((header, plan)))
         } else {
             // Everything in one key; the database will be rewritten whole when it's back.
@@ -590,6 +646,8 @@ async fn persist() {
         Ok(Ok((header, plan))) => match pf::db_write(&header, &plan).await {
             Ok(()) => {
                 DB_HAS_DATA.with(|d| d.set(true));
+                // The snapshots written are in the database: their tabs can go.
+                with_state(|s| SNAPS_SAVED.with(|saved| persist::strip_snapshots(s, &saved.borrow())));
                 // Pages ask for what changed.
                 if let Err(e) = pf::storage_set(CHANGED_KEY, &next.to_string()).await {
                     log(&format!("could not tell pages about the save: {e}"));
@@ -600,7 +658,11 @@ async fn persist() {
                     LEGACY_KEYS.with(|k| *k.borrow_mut() = stale);
                 }
             }
-            Err(e) if with_state(|s| persist::partial_sessions(s).is_empty()) => {
+            Err(e)
+                if with_state(|s| {
+                    persist::partial_sessions(s).is_empty() && s.sessions.iter().flat_map(|x| &x.snapshots).all(|x| x.loaded())
+                }) =>
+            {
                 // Nothing is lost: the whole state goes to storage.local, which wins at
                 // the next start if it's newer, and the database is rewritten next time.
                 NEED_FULL.with(|n| n.set(true));
@@ -613,6 +675,8 @@ async fn persist() {
                 log(&format!("could not save to the database (will try again with the next save): {e}"));
                 if plan.clear {
                     NEED_FULL.with(|n| n.set(true));
+                    let snaps = persist::WritePlan { snap_puts: plan.snap_puts, snap_dels: plan.snap_dels, ..Default::default() };
+                    RETRY.with(|r| *r.borrow_mut() = Some(snaps));
                 } else {
                     RETRY.with(|r| *r.borrow_mut() = Some(plan));
                 }
@@ -680,6 +744,7 @@ async fn after_storage_local_save() {
             Ok(()) => {
                 DB_HAS_DATA.with(|d| d.set(false));
                 NEED_FULL.with(|n| n.set(true));
+                SNAPS_SAVED.with(|saved| saved.borrow_mut().clear());
             }
             Err(e) => log(&format!("could not empty the database: {e}")),
         }
@@ -1487,6 +1552,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             ok(format!("Snapshot \"{name}\" saved"))
         }
         Command::RestoreSnapshot { session, snapshot, mode, open } => {
+            ensure_snapshots(Some(&[session])).await?;
             let (target, added) = with_state(|s| s.restore_snapshot(session, snapshot, mode, now))?;
             persist().await;
             let mut info = match mode {
@@ -1503,6 +1569,16 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
                 info.push_str(&format!("; opened {opened} unloaded"));
             }
             ok(info)
+        }
+        Command::GetSnapshots { session } => {
+            ensure_snapshots(Some(&[session])).await?;
+            let snaps = with_state(|s| s.session(session).map(|x| x.snapshots.clone())).ok_or("no such session")?;
+            Ok(Response { ok: true, snapshots: Some(snaps), ..Default::default() })
+        }
+        Command::ExportSessions { sessions, include_snapshots, filename } => {
+            let list = sessions_for_export(sessions.as_deref(), include_snapshots).await?;
+            let json = crate::transfer::export_sessions(&list, include_snapshots, now);
+            Ok(Response { ok: true, file: Some((filename, json)), ..Default::default() })
         }
         Command::DeleteSnapshot { session, snapshot } => {
             with_state(|s| s.delete_snapshot(session, snapshot))?;

@@ -76,6 +76,10 @@ impl AppState {
             for e in s.snapshots.iter_mut().flat_map(|x| x.entries.iter_mut()) {
                 e.fav_icon_url = None;
             }
+            // Snapshots saved before they described themselves (tab count, fingerprint).
+            for snap in s.snapshots.iter_mut().filter(|x| x.tabs != x.entries.len() && !x.entries.is_empty()) {
+                snap.seal();
+            }
             // Only tabs that have one change (and get saved again).
             for mut e in s.entries.iter_mut().filter(|e| e.fav_icon_url.is_some()) {
                 e.fav_icon_url = None;
@@ -588,7 +592,9 @@ impl AppState {
             "" => format!("Snapshot {}", s.snapshots.len() + 1),
             n => n.to_string(),
         };
-        s.snapshots.push(Snapshot { id, name, created_at: now, auto, entries });
+        let mut snap = Snapshot { id, name, created_at: now, auto, entries, ..Default::default() };
+        snap.seal();
+        s.snapshots.push(snap);
         // Prune the oldest automatic snapshots.
         let autos = s.snapshots.iter().filter(|x| x.auto).count();
         if autos > max_auto {
@@ -620,6 +626,9 @@ impl AppState {
     pub fn restore_snapshot(&mut self, session: Id, snapshot: Id, mode: RestoreMode, now: f64) -> Result<(Id, Vec<Id>), String> {
         let current = self.session(session).ok_or("no such session")?;
         let snap = current.snapshot(snapshot).ok_or("no such snapshot")?.clone();
+        if !snap.loaded() {
+            return Err("the snapshot's tabs aren't loaded".into());
+        }
         let session_name = current.name.clone();
         match mode {
             RestoreMode::NewSession => {
@@ -673,7 +682,9 @@ impl AppState {
             .sessions
             .iter()
             .filter(|s| s.entries.hidden().is_none() && !s.entries.is_empty())
-            .filter(|s| s.snapshots.last().is_none_or(|last| last.urls() != s.urls()))
+            .filter(|s| {
+                s.snapshots.last().is_none_or(|last| last.urls_hash != crate::model::urls_hash(s.entries.iter().map(|e| e.url.as_str())))
+            })
             .map(|s| s.id)
             .collect();
         for id in &due {
@@ -743,6 +754,7 @@ impl AppState {
                     e.workspace = None;
                     e.workspace_manual = false;
                 }
+                snap.seal();
             }
             let target = self.session_mut(id).expect("created");
             target.entries.replace_all(entries);

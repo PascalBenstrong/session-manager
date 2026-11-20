@@ -176,8 +176,17 @@ extern "C" {
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoad)]
     fn js_db_load() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbWrite)]
-    fn js_db_write(header: &str, puts: JsValue, dels: JsValue, clear: bool, del_sessions: JsValue)
-    -> std::result::Result<Promise, JsValue>;
+    fn js_db_write(
+        header: &str,
+        puts: JsValue,
+        dels: JsValue,
+        clear: bool,
+        del_sessions: JsValue,
+        snap_puts: JsValue,
+        snap_dels: JsValue,
+    ) -> std::result::Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoadSnapshots)]
+    fn js_db_load_snapshots(sessions: JsValue) -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoadPartial)]
     fn js_db_load_partial() -> std::result::Result<Promise, JsValue>;
     #[wasm_bindgen(catch, js_namespace = smPlatform, js_name = dbLoadSessions)]
@@ -690,7 +699,22 @@ pub async fn db_load() -> Result<DbLoad> {
 
 /// Writes a plan (see `persist.rs`) and the state, in one transaction.
 pub async fn db_write(header: &str, plan: &crate::persist::WritePlan) -> Result<()> {
-    call(js_db_write(header, to_js(&plan.puts), to_js(&plan.dels), plan.clear, to_js(&plan.del_sessions))).await.map(drop)
+    call(js_db_write(
+        header,
+        to_js(&plan.puts),
+        to_js(&plan.dels),
+        plan.clear,
+        to_js(&plan.del_sessions),
+        to_js(&plan.snap_puts),
+        to_js(&plan.snap_dels),
+    ))
+    .await
+    .map(drop)
+}
+
+/// The snapshots (with their tabs) of these sessions.
+pub async fn db_load_snapshots(sessions: &[crate::model::Id]) -> Result<Vec<crate::persist::SnapRecord>> {
+    call_as(js_db_load_snapshots(to_js(sessions))).await
 }
 
 /// The state, the active session's tabs and every open tab (what the background keeps).

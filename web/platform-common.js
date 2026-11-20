@@ -429,9 +429,10 @@ export async function tabOutWithGroup(api, t, titles = new Map()) {
 // session id, o: position, a: 1 if open else 0, j: entry JSON }, indexed by session and by
 // `a`) and vectors (key: session id; its vector index as JSON). Only the background writes.
 // Version 2 added the index of open tabs (the background reads only those of inactive
-// sessions).
+// sessions); version 3 the snapshots (key: snapshot id; { s: session id, j: snapshot JSON },
+// indexed by session).
 // tools/idb-conformance.js runs this against real browsers and the test fake.
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 const idbReq = (r) =>
   new Promise((resolve, reject) => {
@@ -472,6 +473,7 @@ export function createDb(name, factory = () => globalThis.indexedDB) {
         // and saves them again (the state says which layout it was saved with).
         if (!tabs.indexNames.contains('open')) tabs.createIndex('open', 'a');
         if (!db.objectStoreNames.contains('vectors')) db.createObjectStore('vectors');
+        if (!db.objectStoreNames.contains('snapshots')) db.createObjectStore('snapshots').createIndex('session', 's');
       };
       req.onsuccess = () => {
         const db = req.result;
@@ -545,29 +547,44 @@ export function createDb(name, factory = () => globalThis.indexedDB) {
      * `delSessions`, puts tabs ([{ id, s, o, a, j }]), deletes tabs (ids) and sets the
      * state. Nothing is written if any part fails.
      */
-    async write(header, puts, dels, clear = false, delSessions = []) {
+    async write(header, puts, dels, clear = false, delSessions = [], snapPuts = [], snapDels = []) {
       const db = await open();
-      const tx = db.transaction(['meta', 'tabs'], 'readwrite');
+      const tx = db.transaction(['meta', 'tabs', 'snapshots'], 'readwrite');
       const done = idbDone(tx);
       const store = tx.objectStore('tabs');
+      const snaps = tx.objectStore('snapshots');
       if (clear) store.clear();
       if (delSessions.length) {
+        // A deleted session's tabs and snapshots.
         const keys = await Promise.all(delSessions.map((id) => idbReq(store.index('session').getAllKeys(id))));
         for (const k of keys.flat()) store.delete(k);
+        const snapKeys = await Promise.all(delSessions.map((id) => idbReq(snaps.index('session').getAllKeys(id))));
+        for (const k of snapKeys.flat()) snaps.delete(k);
       }
       for (const p of puts) store.put({ s: p.s, o: p.o ?? 0, a: p.a ?? 0, j: p.j }, p.id);
       for (const id of dels) store.delete(id);
+      for (const p of snapPuts) snaps.put({ s: p.s, j: p.j }, p.id);
+      for (const id of snapDels) snaps.delete(id);
       tx.objectStore('meta').put(header, 'state');
       await done;
     },
 
-    /** Empties the state and tabs (after the state was saved in storage.local instead). */
+    /** The snapshots (with their tabs) of these sessions: [{ id, s, j }]. */
+    async loadSnapshots(sessions) {
+      const db = await open();
+      const index = db.transaction('snapshots', 'readonly').objectStore('snapshots').index('session');
+      const lists = await Promise.all(sessions.map((id) => Promise.all([idbReq(index.getAllKeys(id)), idbReq(index.getAll(id))])));
+      return lists.flatMap(([keys, values]) => values.map((v, i) => ({ id: keys[i], s: v.s, j: v.j })));
+    },
+
+    /** Empties the state, tabs and snapshots (after the state was saved in storage.local instead). */
     async clear() {
       const db = await open();
-      const tx = db.transaction(['meta', 'tabs'], 'readwrite');
+      const tx = db.transaction(['meta', 'tabs', 'snapshots'], 'readwrite');
       const done = idbDone(tx);
       tx.objectStore('meta').clear();
       tx.objectStore('tabs').clear();
+      tx.objectStore('snapshots').clear();
       await done;
     },
 
@@ -1362,7 +1379,8 @@ export function installPlatform(api, overrides = {}) {
       await smDb.open();
     },
     dbLoad: () => smDb.load(),
-    dbWrite: (header, puts, dels, clear, delSessions) => smDb.write(header, puts, dels, clear, delSessions),
+    dbWrite: (header, puts, dels, clear, delSessions, snapPuts, snapDels) => smDb.write(header, puts, dels, clear, delSessions, snapPuts, snapDels),
+    dbLoadSnapshots: (sessions) => smDb.loadSnapshots(sessions),
     dbLoadPartial: () => smDb.loadPartial(),
     dbLoadSessions: (sessions) => smDb.loadSessions(sessions),
     dbClear: () => smDb.clear(),
