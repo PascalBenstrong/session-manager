@@ -55,6 +55,10 @@ pub struct TabEntry {
     /// tab is closed by hand.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub last_closed: String,
+    /// The tab was loaded (not hibernated) when it was last closed with the entry kept, so
+    /// "restore as they were" opens it loaded again (else unloaded).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub closed_loaded: bool,
     /// Summary of the page written by an AI integration (see `ai.rs`).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,

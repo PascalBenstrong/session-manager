@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "session-manager"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "console_error_panic_hook",
  "eframe",
