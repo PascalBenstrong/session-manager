@@ -2,6 +2,11 @@
 
 All notable changes to Session Manager. This file is compiled into the extension and shown on its "What's new" page.
 
+## [0.16.0] - 2026-11-21
+
+### New
+- *↺ Restore* can bring the tabs back *as they were*: tabs that were loaded when they closed load again, and hibernated ones come back unloaded. The menu shows how many of each. Tabs closed before this version come back unloaded.
+
 ## [0.15.1] - 2026-11-20
 
 ### Changed

@@ -802,6 +802,7 @@ pub fn entry_from_tab(id: Id, tab: &BrowserTab, now: f64) -> TabEntry {
         loaded_at: if tab.discarded { 0.0 } else { now },
         unloaded_at: 0.0,
         last_closed: String::new(),
+        closed_loaded: false,
         description: String::new(),
         description_url: String::new(),
     }
@@ -810,6 +811,9 @@ pub fn entry_from_tab(id: Id, tab: &BrowserTab, now: f64) -> TabEntry {
 /// The tab of an entry is gone, but the entry stays as a saved (closed) tab.
 fn keep_closed(e: &mut TabEntry, now: Option<f64>) {
     let (was_open, was_loaded) = (e.is_open(), e.is_loaded());
+    if was_open {
+        e.closed_loaded = was_loaded;
+    }
     e.tab_id = None;
     e.window_id = None;
     e.discarded = false;
@@ -927,6 +931,35 @@ mod tests {
         assert_eq!(s.active().last_closed, g2);
         s.on_tab_upsert(&tab(12, "https://e.com"), 7.0);
         assert!(s.entry_for_tab(12).unwrap().last_closed.is_empty());
+    }
+
+    #[test]
+    fn closed_tabs_remember_whether_they_were_loaded() {
+        let mut s = AppState::default();
+        let sid = s.active_session;
+        s.on_tab_upsert(&tab(1, "https://a.com"), 1.0);
+        s.on_tab_upsert(&BrowserTab { discarded: true, ..tab(2, "https://b.com") }, 1.0);
+        // the browser quits: a.com was loaded, b.com hibernated
+        s.reconcile(&[], 2.0);
+        let loaded = |s: &AppState, url: &str| s.active().entries.iter().find(|e| e.url == url).unwrap().closed_loaded;
+        assert!(loaded(&s, "https://a.com"));
+        assert!(!loaded(&s, "https://b.com"));
+        assert_eq!(s.last_closed_refs(sid).len(), 2);
+        // reopened unloaded, then closed with its window: now remembered as unloaded
+        let a = s.active().entries.iter().find(|e| e.url == "https://a.com").unwrap().id;
+        s.link_tab(EntryRef { session: sid, entry: a }, &BrowserTab { discarded: true, ..tab(3, "https://a.com") }, 3.0);
+        s.reconcile(&[], 4.0);
+        assert!(!loaded(&s, "https://a.com"));
+        // closing an already closed entry again changes nothing
+        s.on_tab_upsert(&tab(4, "https://c.com"), 5.0);
+        s.reconcile(&[], 6.0);
+        s.reconcile(&[], 7.0);
+        assert!(loaded(&s, "https://c.com"));
+        // it is saved with the entry (and left out when false)
+        let json = serde_json::to_string(s.active().entries.iter().find(|e| e.url == "https://c.com").unwrap()).unwrap();
+        assert!(json.contains("\"closed_loaded\":true"));
+        let json = serde_json::to_string(s.active().entries.iter().find(|e| e.url == "https://b.com").unwrap()).unwrap();
+        assert!(!json.contains("closed_loaded"));
     }
 
     #[test]

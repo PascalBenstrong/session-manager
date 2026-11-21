@@ -1236,7 +1236,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
             }
             let (mut opened, mut errors) = (0, Vec::new());
             for (session, ids) in by_session {
-                let (n, e) = open_entries(session, Some(&ids), discarded, false).await?;
+                let (n, e) = open_entries(session, Some(&ids), Some(discarded), false).await?;
                 opened += n;
                 errors.extend(e);
             }
@@ -1259,7 +1259,12 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
                 with_state(|s| s.renew_last_closed(session));
                 persist().await;
             }
-            let mut info = format!("Restored {opened} tab(s) {}", if discarded { "unloaded" } else { "loaded" });
+            let how = match discarded {
+                Some(true) => "unloaded",
+                Some(false) => "loaded",
+                None => "as they were",
+            };
+            let mut info = format!("Restored {opened} tab(s) {how}");
             if !errors.is_empty() {
                 info.push_str(&format!("; {} failed (e.g. {})", errors.len(), errors[0]));
             }
@@ -1561,7 +1566,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
                 RestoreMode::NewSession => "Snapshot opened as a new session".to_string(),
             };
             if open && !added.is_empty() {
-                let (opened, _) = open_entries(target, Some(&added), true, false).await?;
+                let (opened, _) = open_entries(target, Some(&added), Some(true), false).await?;
                 if opened > 0 {
                     with_state(|s| s.renew_last_closed(target));
                     persist().await;
@@ -1597,7 +1602,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
                 info.push_str(&format!(" ({skipped} already in the session)"));
             }
             if open && !added.is_empty() {
-                let (opened, errors) = open_entries(session, Some(&added), true, false).await?;
+                let (opened, errors) = open_entries(session, Some(&added), Some(true), false).await?;
                 info.push_str(&format!("; opened {opened} unloaded"));
                 if !errors.is_empty() {
                     info.push_str(&format!(", {} failed", errors.len()));
@@ -1682,7 +1687,7 @@ async fn run_command(cmd: Command) -> Result<Response, String> {
 async fn load_session(id: Id, discarded: bool, new_window: bool) -> Result<Response, String> {
     // De-duplicate first, so only one copy of each page gets opened.
     let deduped = if with_state(|s| s.settings.dedupe_on_session_load) { remove_duplicates_in(&[id], None).await? } else { 0 };
-    let (opened, errors) = open_entries(id, None, discarded, new_window).await?;
+    let (opened, errors) = open_entries(id, None, Some(discarded), new_window).await?;
     if opened > 0 {
         // A restored session starts a new generation of open tabs.
         with_state(|s| s.renew_last_closed(id));
@@ -1702,15 +1707,17 @@ async fn load_session(id: Id, discarded: bool, new_window: bool) -> Result<Respo
 
 /// Opens the session's closed entries (all, or only `only`). Returns how many were
 /// opened and the errors.
-async fn open_entries(id: Id, only: Option<&[Id]>, discarded: bool, new_window: bool) -> Result<(usize, Vec<String>), String> {
-    let closed: Vec<(Id, String, String, bool)> = with_state(|s| {
+/// Opens a session's closed entries (`only` these, if given). `discarded`: open them all
+/// unloaded or loaded, or (`None`) each as it was when closed (`TabEntry::closed_loaded`).
+async fn open_entries(id: Id, only: Option<&[Id]>, discarded: Option<bool>, new_window: bool) -> Result<(usize, Vec<String>), String> {
+    let closed: Vec<(Id, String, String, bool, bool)> = with_state(|s| {
         let ignore_internal = s.settings.ignore_internal_urls;
         s.session(id).map(|s| {
             s.entries
                 .iter()
                 .filter(|e| only.is_none_or(|ids| ids.contains(&e.id)))
                 .filter(|e| !e.is_open() && trackable(&e.url, ignore_internal))
-                .map(|e| (e.id, e.url.clone(), e.title.clone(), e.pinned))
+                .map(|e| (e.id, e.url.clone(), e.title.clone(), e.pinned, discarded.unwrap_or(!e.closed_loaded)))
                 .collect()
         })
     })
@@ -1723,8 +1730,15 @@ async fn open_entries(id: Id, only: Option<&[Id]>, discarded: bool, new_window: 
     let window = if new_window { Some(pf::create_window().await?) } else { None };
     let mut opened = 0;
     let mut errors = Vec::new();
-    for (entry, url, title, pinned) in &closed {
-        let opts = CreateTab { url, title, active: false, discarded, pinned: *pinned, window_id: window.as_ref().map(|w| w.window_id) };
+    for (entry, url, title, pinned, discarded) in &closed {
+        let opts = CreateTab {
+            url,
+            title,
+            active: false,
+            discarded: *discarded,
+            pinned: *pinned,
+            window_id: window.as_ref().map(|w| w.window_id),
+        };
         match pf::create_tab(&opts).await {
             Ok(tab) => {
                 with_state(|s| s.link_tab(EntryRef { session: id, entry: *entry }, &tab, pf::now()));

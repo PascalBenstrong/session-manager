@@ -797,17 +797,25 @@ impl App {
 
         // The tabs that were open when the session's tabs were last closed (browser quit,
         // window closed): one click brings them back.
-        let previous = session.last_closed_entries().count();
+        let (previous, was_loaded) = session.last_closed_entries().fold((0, 0), |(n, l), e| (n + 1, l + e.closed_loaded as usize));
         if previous > 0 && state.settings.tracking.last_closed {
             let label = if labels { format!("↺  Restore {previous}") } else { format!("↺ {previous}") };
             ui.menu_button(label, |ui| {
                 ui.set_min_width(220.0);
+                if ui
+                    .button(format!("Restore as they were ({was_loaded} loaded, {} unloaded)", previous - was_loaded))
+                    .on_hover_text("Tabs that were loaded when closed load again; hibernated ones come back unloaded")
+                    .clicked()
+                {
+                    self.send(Command::RestoreLastClosed { session: session.id, discarded: None });
+                    ui.close();
+                }
                 if ui.button("Restore unloaded (lazy)").on_hover_text("Tabs come back but only load when clicked").clicked() {
-                    self.send(Command::RestoreLastClosed { session: session.id, discarded: true });
+                    self.send(Command::RestoreLastClosed { session: session.id, discarded: Some(true) });
                     ui.close();
                 }
                 if ui.button("Restore and load all").clicked() {
-                    self.send(Command::RestoreLastClosed { session: session.id, discarded: false });
+                    self.send(Command::RestoreLastClosed { session: session.id, discarded: Some(false) });
                     ui.close();
                 }
             })

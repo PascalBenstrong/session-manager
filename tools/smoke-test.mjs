@@ -1072,7 +1072,8 @@ await step('restore the tabs open when a session was last closed; tabs closed by
   const win = 77;
   const made = [];
   for (const url of ['https://r1.example/', 'https://r2.example/', 'https://r3.example/']) {
-    made.push(await api.tabs.create({ url, windowId: win }));
+    // r2 is hibernated when the window closes: "as they were" brings it back unloaded.
+    made.push(await api.tabs.create({ url, windowId: win, discarded: url.includes('r2') }));
   }
   await tick();
   // r3 is closed by hand (removed); then the window closes with r1 and r2.
@@ -1086,8 +1087,11 @@ await step('restore the tabs open when a session was last closed; tabs closed by
   const session = stored().sessions.find((s) => s.id === sid);
   assert.deepEqual(session.entries.map((e) => e.url).sort(), ['https://r1.example/', 'https://r2.example/']);
   assert.ok(session.entries.every((e) => e.last_closed === session.last_closed && e.tab_id === null));
-  const back = await send({ cmd: 'RestoreLastClosed', session: sid, discarded: true });
-  assert.match(back.info, /Restored 2 tab/);
+  assert.deepEqual(session.entries.map((e) => [e.url, !!e.closed_loaded]).sort(), [['https://r1.example/', true], ['https://r2.example/', false]]);
+  const back = await send({ cmd: 'RestoreLastClosed', session: sid, discarded: null });
+  assert.match(back.info, /Restored 2 tab\(s\) as they were/);
+  const reopened = Object.fromEntries([...tabs.values()].filter((t) => /r[12]\.example/.test(t.url)).map((t) => [t.url, t.discarded]));
+  assert.deepEqual(reopened, { 'https://r1.example/': false, 'https://r2.example/': true });
   const after = stored().sessions.find((s) => s.id === sid);
   assert.notEqual(after.last_closed, session.last_closed, 'a new generation');
   assert.ok(after.entries.every((e) => e.tab_id !== null && e.last_closed === after.last_closed));

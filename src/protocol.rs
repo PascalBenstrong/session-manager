@@ -109,9 +109,11 @@ pub enum Command {
     },
     /// Reopen the tabs that were open when the session's tabs were last closed (window
     /// closed, browser quit), then start a new generation (see `Session::last_closed`).
+    /// `discarded`: open them all unloaded (`Some(true)`) or loaded (`Some(false)`), or each
+    /// as it was when closed (`None`: see `TabEntry::closed_loaded`).
     RestoreLastClosed {
         session: Id,
-        discarded: bool,
+        discarded: Option<bool>,
     },
     /// Write AI summaries (descriptions) of these entries' pages (open tabs only).
     Summarize {
